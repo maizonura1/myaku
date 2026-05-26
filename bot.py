@@ -1,25 +1,25 @@
 """
-Bot Scalping v15 — AI MOMENTUM ENGINE 🤖
-==========================================
+Bot Scalping v16 — CLAUDE AI MOMENTUM ENGINE 🤖
+=================================================
 
-PERUBAHAN UTAMA dari v14
-──────────────────────────
-✅ PAPER TRADING MODE  — semua order CUMA DI-LOG, tidak masuk Binance real
-✅ CLAUDE AI SCANNER   — pakai Claude API untuk pilih coin paling berpotensi
-✅ INSTANT TRAIL       — trailing stop aktif DARI ENTRY, bukan delayed
-✅ INSTANT CUT         — kalau minus langsung cut, langsung cari yang baru
-✅ ALWAYS OPEN         — bot terus usaha isi 3 slot posisi
-✅ 150+ COIN           — list coin lebih banyak + AI bisa pilih dinamis
-✅ PAPER LOG           — semua trade di-log ke file CSV untuk analisis
+PERUBAHAN dari v15
+──────────────────
+✅ FILTER USDC/BUSD     — hanya USDT pairs, tidak ada NEARUSDC dll
+✅ KILL SWITCH LEBIH TOLERAN — 8 loss beruntun, bukan 5
+✅ OUTPUT RAPI          — threading output dipisah, tidak tumpang tindih
+✅ CHOP FILTER LEBIH LONGGAR — threshold 62 (dari 55), NoMom lebih mudah lolos
+✅ SCORE LEBIH MUDAH    — MIN_SCORE turun ke 35, banyak coin bisa masuk
+✅ CLAUDE API           — pakai Anthropic Claude untuk analisis coin
+✅ MOMENTUM LEBIH MUDAH — MIN_MOMENTUM_PCT lebih kecil
+✅ MAX_HOLDING lebih lama — 6 menit bukan 4 menit
+✅ KONSEC LOSS PAUSE lebih pendek — 10 menit bukan 20 menit
+✅ SYMBOLS dibersihkan — hapus USDC pairs, cek duplikat
 
-CARA PAKAI:
-  PAPER_TRADING = True  → backtest real-time (default, aman)
-  PAPER_TRADING = False → live trading beneran ke Binance
-
-Kalau hasil backtest bagus → set PAPER_TRADING = False
+PAPER TRADING = True  → hanya log, tidak masuk Binance
+PAPER TRADING = False → live ke Binance
 """
 
-import os, time, math, json, threading, queue, csv, random
+import os, time, math, json, threading, queue, csv, re
 import requests
 from collections import deque, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -33,90 +33,79 @@ import numpy as np
 load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 
-# ══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
 # ⚠️  PAPER TRADING MODE — SET False UNTUK LIVE ⚠️
 PAPER_TRADING = True
-# ══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════
 
-# Testnet URL (hanya aktif kalau PAPER_TRADING=False dan pakai testnet)
-# client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+PAPER_LOG_FILE = "paper_trades_v16.csv"
 
-PAPER_LOG_FILE = "paper_trades_v15.csv"
+# ════════════════════════════════════════════════════════
+#  CONFIG v16
+# ════════════════════════════════════════════════════════
 
-# ════════════════════════════════════════════════════
-#  CONFIG v15
-# ════════════════════════════════════════════════════
-
-# ── CORE ─────────────────────────────────────────────────
 LEVERAGE              = 20
-ORDER_USDT            = 2            # $2 per trade × leverage = $40 exposure
+ORDER_USDT            = 2
 MAX_POSITIONS         = 3
 
-# ── ATR MULTIPLIER ────────────────────────────────────────
-ATR_SL_MULT           = 1.0          # SL lebih ketat dari v14
-ATR_TP1_MULT          = 1.8
-ATR_TP2_MULT          = 3.0
-ATR_TRAIL_MULT        = 0.6          # Trail lebih ketat, langsung aktif
-ATR_TRAIL_TIGHT_MULT  = 0.4
+ATR_SL_MULT           = 1.2
+ATR_TP1_MULT          = 1.6
+ATR_TP2_MULT          = 2.8
+ATR_TRAIL_MULT        = 0.7
+ATR_TRAIL_TIGHT_MULT  = 0.45
 
-# Batas SL/TP
-MIN_SL_PCT            = 0.0008
-MAX_SL_PCT            = 0.0050
-MIN_TP1_PCT           = 0.0015
-MAX_TP2_PCT           = 0.0180
+MIN_SL_PCT            = 0.0010
+MAX_SL_PCT            = 0.0060
+MIN_TP1_PCT           = 0.0018
+MAX_TP2_PCT           = 0.0200
 
-# ── INSTANT TRAIL (aktif dari entry, bukan delayed) ──────
-TRAIL_IMMEDIATE       = True         # v15: trail langsung aktif
-TRAIL_BE_PCT          = 0.0003       # breakeven buffer tipis
-TRAIL_TIGHT_PCT       = 0.0030       # fase ketat mulai 0.30%
+TRAIL_IMMEDIATE       = True
+TRAIL_BE_PCT          = 0.0003
+TRAIL_TIGHT_PCT       = 0.0025
 
-# Partial close
 TP1_CLOSE_RATIO       = 0.55
 TP2_CLOSE_RATIO       = 0.45
 
-# ── INSTANT CUT — potong cepat kalau minus ────────────────
-INSTANT_CUT_MULT      = 0.4          # lebih ketat dari v14 (0.5)
-INSTANT_CUT_WINDOW    = 2            # 2 candle saja
-INSTANT_CUT_MIN_PCT   = 0.0004      # min loss sebelum cut
+INSTANT_CUT_MULT      = 0.5
+INSTANT_CUT_WINDOW    = 3
+INSTANT_CUT_MIN_PCT   = 0.0003
 
-# ── CHOP / REGIME FILTER ─────────────────────────────────
-CHOP_INDEX_THRESHOLD  = 55.0         # lebih ketat dari v14 (58)
-MIN_BB_WIDTH_PCT      = 0.004
-MAX_EMA_CROSS_FREQ    = 3
-MIN_ADX               = 18
+# Filter lebih longgar agar lebih banyak entry
+CHOP_INDEX_THRESHOLD  = 62.0
+MIN_BB_WIDTH_PCT      = 0.003
+MAX_EMA_CROSS_FREQ    = 4
+MIN_ADX               = 15
 
-# ── MOMENTUM FILTER ──────────────────────────────────────
-MIN_MOMENTUM_PCT      = 0.0015
-MIN_VOL_SURGE         = 1.5
-MIN_TREND_CANDLES     = 2            # lebih longgar, AI yang filter
+MIN_MOMENTUM_PCT      = 0.0010
+MIN_VOL_SURGE         = 1.2
+MIN_TREND_CANDLES     = 2
 
-# ── KECEPATAN ────────────────────────────────────────────
-SCAN_INTERVAL         = 2            # lebih cepat dari v14 (3)
-POSITION_MONITOR_SEC  = 0.5         # monitor lebih sering
-SCAN_DELAY_MS         = 0.030
-BATCH_SIZE            = 20
-MAX_HOLDING_MIN       = 4            # cut lebih cepat
-SYMBOL_COOLDOWN_SEC   = 8
-RE_SCAN_DELAY_SEC     = 0.2
-ALWAYS_FILL_SLOTS     = True         # always try to fill 3 positions
+SCAN_INTERVAL         = 2
+POSITION_MONITOR_SEC  = 0.5
+SCAN_DELAY_MS         = 0.025
+BATCH_SIZE            = 25
+MAX_HOLDING_MIN       = 6
+SYMBOL_COOLDOWN_SEC   = 10
+RE_SCAN_DELAY_SEC     = 0.3
+ALWAYS_FILL_SLOTS     = True
 
-# ── AI SCANNER CONFIG (Groq — GRATIS) ────────────────────
-AI_SCAN_INTERVAL      = 15           # tanya AI tiap 15 cycle
-AI_TOP_PICKS          = 10           # ambil top 10
+# AI Config — Groq gratis
+AI_SCAN_INTERVAL      = 12
+AI_TOP_PICKS          = 10
 GROQ_API_KEY          = os.getenv("GROQ_API_KEY", "")
-AI_MODEL              = "llama-3.3-70b-versatile"   # model terbaik Groq, gratis
+AI_MODEL              = "llama-3.3-70b-versatile"
 
-# ── SESSION FILTER ────────────────────────────────────────
+# Session filter
 BAD_HOURS_UTC         = {4, 5, 6}
-BAD_HOURS_MIN_SCORE   = 55
+BAD_HOURS_MIN_SCORE   = 50
 
-# ── KILL SWITCH ───────────────────────────────────────────
-DAILY_LOSS_LIMIT      = -5.0
-CONSEC_LOSS_MAX       = 5
-CONSEC_LOSS_PAUSE_MIN = 20
+# Kill switch lebih toleran
+DAILY_LOSS_LIMIT      = -8.0
+CONSEC_LOSS_MAX       = 8
+CONSEC_LOSS_PAUSE_MIN = 10
 MAX_API_LAG_SEC       = 3.0
 
-# ── CACHE TTL ─────────────────────────────────────────────
+# Cache TTL
 OHLCV_CACHE_TTL_1M    = 2
 OHLCV_CACHE_TTL_3M    = 4
 OHLCV_CACHE_TTL_5M    = 5
@@ -126,16 +115,17 @@ TICKER24H_TTL         = 6
 FUNDING_TTL           = 30
 TOP_MOVERS_TTL        = 6
 
-# ── FILTER ────────────────────────────────────────────────
-MIN_SCORE             = 40           # lebih rendah, AI supplement
+# Filter entry
+MIN_SCORE             = 35
 MIN_ENTRY_SIGNALS     = 2
-MIN_FNG               = 12
-MAX_FNG_LONG          = 93
-MAX_SL_ATR_PCT        = 0.010
-MAX_SPREAD_RATIO      = 0.35
+MIN_FNG               = 10
+MAX_FNG_LONG          = 95
+MAX_SL_ATR_PCT        = 0.012
+MAX_SPREAD_RATIO      = 0.40
 
-# ── SYMBOLS — 150+ coin ──────────────────────────────────
-SYMBOLS = [
+# ── SYMBOLS — hanya USDT, bersih dari duplikat dan USDC ──────
+# Semua dipastikan USDT pairs, tidak ada USDC / BUSD
+_RAW_SYMBOLS = [
     # Mega caps
     "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
     "ADAUSDT","DOGEUSDT","AVAXUSDT","LINKUSDT","DOTUSDT",
@@ -143,7 +133,7 @@ SYMBOLS = [
     # Layer 2 & alt L1
     "NEARUSDT","APTUSDT","ARBUSDT","OPUSDT","INJUSDT",
     "SUIUSDT","TIAUSDT","STXUSDT","KASUSDT","TONUSDT",
-    "TAOUSDT","ONDOUSDT","EIGENUSDT","SEIUSDT","ZKSYNCUSDT",
+    "TAOUSDT","ONDOUSDT","SEIUSDT","EIGENUSDT",
     # DeFi
     "AAVEUSDT","RUNEUSDT","CRVUSDT","MKRUSDT","COMPUSDT",
     "SUSHIUSDT","SNXUSDT","1INCHUSDT","BALUSDT","DYDXUSDT",
@@ -152,49 +142,76 @@ SYMBOLS = [
     "FETUSDT","RENDERUSDT","WLDUSDT","OCEANUSDT","AGIXUSDT",
     "NMRUSDT","PHBUSDT","ARKMUSDT",
     # Meme
-    "1000PEPEUSDT","WIFUSDT","1000BONKUSDT","DOGSUSDT",
-    "SHIBUSDT","FLOKIUSDT","BONKUSDT","MEMEUSDT","BOMEUSDT",
+    "1000PEPEUSDT","WIFUSDT","1000BONKUSDT","SHIBUSDT",
+    "FLOKIUSDT","MEMEUSDT","BOMEUSDT","DOGSUSDT",
     # Gaming & Metaverse
     "AXSUSDT","SANDUSDT","MANAUSDT","ENJUSDT","GALAUSDT",
     "IMXUSDT","BEAMXUSDT","ORDIUSDT","PIXELUSDT",
     # Infrastructure
     "FILUSDT","ARUSDT","STRKUSDT","ALTUSDT","DYMUSDT",
     "MANTAUSDT","ZETAUSDT","RONINUSDT","NOTUSDT","CATIUSDT",
-    "EIGENUSDT","PYTHUSDT","PORTALUSDT","XAIUSDT","VANRYUSDT",
+    "PYTHUSDT","PORTALUSDT","XAIUSDT","VANRYUSDT",
     # Layer 1 alt
     "ALGOUSDT","ICPUSDT","FTMUSDT","HBARUSDT","FLOWUSDT",
     "EGLDUSDT","THETAUSDT","KAVAUSDT","BANDUSDT",
     "SKLUSDT","CELRUSDT","CTSIUSDT",
     # DeFi 2
-    "BLURUSDT","MASKUSDT","HIGHUSDT","SAFEUSDT",
-    "CRVUSDT","PERPUSDT","LITUSDT","UNFIUSDT",
+    "BLURUSDT","MASKUSDT","HIGHUSDT",
+    "PERPUSDT","LITUSDT","UNFIUSDT",
     # Misc
-    "TRUUSDT","POLYXUSDT","BLZUSDT","JASMYUSDT","CFXUSDT",
-    "COMBOUSDT","AGLDUSDT","IDUSDT","GASUSDT",
-    "ENARUSDT","WUSDT","ATAUSDT","MOVRUSDT","CKBUSDT",
-    "HOOKUSDT","GLMRUSDT","AMBUSDT","RENUSDT","CVCUSDT",
-    "VOXELUSDT","DENTUSDT","HOTUSDT","IOSTUSDT","OGNUSDT",
+    "TRUUSDT","BLZUSDT","JASMYUSDT","CFXUSDT",
+    "COMBOUSDT","AGLDUSDT","IDUSDT",
+    "ENARUSDT","WUSDT","CKBUSDT",
+    "HOOKUSDT","GLMRUSDT","AMBUSDT","RENUSDT",
+    "DENTUSDT","HOTUSDT","IOSTUSDT","OGNUSDT",
     "LINAUSDT","SFPUSDT","BNTUSDT","FLMUSDT","TLMUSDT",
-    "1000XECUSDT","LUNCUSDT","ACEUSDT","JOEUSDT",
-    # New listings (2024-2025)
-    "REZUSDT","BBUSDT","NOTUSDT","IOUSDT","ZKUSDT",
-    "LISTAUSDT","ZROUSDT","GUSDT","RENDERUSDT","WUSDT",
-    "MYROUSDT","BRETTUSDT","TURBOUSDT","MOGULUSDT",
-    "NEIROUSDT","HMSTRUSDT","CATIUSDT","SCRUSDT","LUMIAUSDT",
+    "1000XECUSDT","ACEUSDT","JOEUSDT",
+    # New listings 2024-2025
+    "IOUSDT","ZKUSDT","LISTAUSDT","ZROUSDT","MYROUSDT",
+    "NEIROUSDT","HMSTRUSDT","SCRUSDT","LUMIAUSDT",
     "COWUSDT","MOODENGUSDT","POPCATUSDT","ACTUSDT","PNUTUSDT",
-    "KAIAUSDT","ACXUSDT","ORCAUSDT","MOVEUSDT","MEUSDT",
-    "VANRYUSDT","AIXBTUSDT","FARTCOINUSDT","GRIFFAINUSDT",
-    "TRUMPUSDT","MELANIAUSDT","SONICUSDT","VIRTUALUSDT",
-    "BIOUSDT","CGPTUSDT","ARCUSDT","SWARMS",
+    "KAIAUSDT","ORCAUSDT","MOVEUSDT","MEUSDT",
+    "AIXBTUSDT","SONICUSDT","VIRTUALUSDT",
+    "BIOUSDT","CGPTUSDT","ARCUSDT",
+    "TRUMPUSDT","MELANIAUSDT",
+    # Futures populer lainnya
+    "DRIFTUSDT","PHAUSDT","STXUSDT","JUPUSDT",
+    "WIFUSDT","1000BONKUSDT","TAOUSDT",
+    "ETHFIUSDT","REZUSDT","BBUSDT",
 ]
+
+# Deduplikasi + pastikan semua USDT
+def _clean_symbols(raw):
+    seen = set()
+    result = []
+    for s in raw:
+        s = s.upper().strip()
+        # Hanya terima yang berakhiran USDT (bukan USDC, BUSD, dsb)
+        if not s.endswith("USDT"):
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        result.append(s)
+    return result
+
+SYMBOLS = _clean_symbols(_RAW_SYMBOLS)
 
 BULL_TRENDS = {"BULL", "MILD_BULL"}
 BEAR_TRENDS = {"BEAR", "MILD_BEAR"}
 
+# ════════════════════════════════════════════════════════
+#  OUTPUT LOCK — supaya print tidak tumpang tindih
+# ════════════════════════════════════════════════════════
+_print_lock = threading.Lock()
 
-# ════════════════════════════════════════════════════
+def safe_print(msg):
+    with _print_lock:
+        print(msg)
+
+# ════════════════════════════════════════════════════════
 #  STATE GLOBAL
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 open_positions      = {}
 trade_log           = []
 _ohlcv_cache        = {}
@@ -212,7 +229,7 @@ _funding_cache      = {}
 _funding_ts         = 0
 _top_movers         = []
 _top_movers_ts      = 0
-_ai_picks           = []             # AI-selected coins
+_ai_picks           = []
 _ai_picks_ts        = 0
 _ai_cycle_counter   = 0
 
@@ -228,18 +245,16 @@ _kill_switch = {
 }
 
 _perf        = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0.0, "trades": 0})
-_perf_regime = defaultdict(lambda: {"wins": 0, "losses": 0, "pnl": 0.0})
 
 _macro = {
     "fng": 50, "fng_label": "Neutral",
-    "btc_trend_1m":  "UNKNOWN",
     "btc_trend_5m":  "UNKNOWN",
     "btc_trend_15m": "UNKNOWN",
     "btc_trend_1h":  "UNKNOWN",
     "market_breadth": 0.5,
     "news": "neutral",
     "scalp_mode": "TREND",
-    "last_fng": 0, "last_btc": 0, "last_breadth": 0, "last_news": 0,
+    "last_fng": 0, "last_btc": 0, "last_breadth": 0,
 }
 
 _stats = {
@@ -259,35 +274,30 @@ _stats = {
     "skipped_no_momentum": 0,
     "skipped_chop": 0,
     "skipped_spread": 0,
-    "skipped_session": 0,
     "pnl_history": deque(maxlen=200),
     "session_start": time.time(),
-    "paper_mode": PAPER_TRADING,
 }
 
-# ── Paper trading virtual balance ──────────────────────────
 _paper = {
-    "balance":       1000.0,         # modal awal simulasi $1000
-    "trades":        [],
-    "open_orders":   {},
+    "balance":  1000.0,
+    "trades":   [],
 }
 
 
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  PAPER TRADING ENGINE
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 def paper_log_trade(symbol, side, action, qty, price, pnl=0.0, reason=""):
-    """Log setiap paper trade ke CSV."""
     row = {
-        "timestamp":  time.strftime("%Y-%m-%d %H:%M:%S"),
-        "symbol":     symbol,
-        "side":       side,
-        "action":     action,       # OPEN / CLOSE / PARTIAL
-        "qty":        qty,
-        "price":      price,
-        "pnl":        round(pnl, 4),
-        "reason":     reason,
-        "balance":    round(_paper["balance"], 2),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "symbol":    symbol,
+        "side":      side,
+        "action":    action,
+        "qty":       qty,
+        "price":     price,
+        "pnl":       round(pnl, 4),
+        "reason":    reason,
+        "balance":   round(_paper["balance"], 2),
     }
     file_exists = os.path.isfile(PAPER_LOG_FILE)
     with open(PAPER_LOG_FILE, "a", newline="") as f:
@@ -295,23 +305,15 @@ def paper_log_trade(symbol, side, action, qty, price, pnl=0.0, reason=""):
         if not file_exists:
             w.writeheader()
         w.writerow(row)
-    return row
-
-def paper_get_price(symbol):
-    """Ambil harga real-time dari Binance tapi tanpa eksekusi order."""
-    return get_price(symbol)
 
 def paper_open_order(symbol, direction, qty, price):
-    """Simulasi buka posisi."""
     margin_used = (price * qty) / LEVERAGE
     _paper["balance"] -= margin_used
     paper_log_trade(symbol, direction, "OPEN", qty, price, reason="entry")
-    if PAPER_TRADING:
-        print(f"  📋 [PAPER] {symbol} {direction} OPEN @{price:.5g} qty={qty} margin=${margin_used:.2f}")
+    safe_print(f"  📋 [PAPER] {symbol} {direction} OPEN @{price:.6g} qty={qty:.4f} margin=${margin_used:.2f}")
     return True
 
 def paper_close_order(symbol, side, qty, entry, exit_price, reason=""):
-    """Simulasi tutup posisi, hitung PnL."""
     if side == "LONG":
         pnl = (exit_price - entry) * qty
     else:
@@ -319,59 +321,53 @@ def paper_close_order(symbol, side, qty, entry, exit_price, reason=""):
     margin_returned = (entry * qty) / LEVERAGE
     _paper["balance"] += margin_returned + pnl
     paper_log_trade(symbol, side, "CLOSE", qty, exit_price, pnl=pnl, reason=reason)
-    if PAPER_TRADING:
-        emoji = "🟢" if pnl >= 0 else "🔴"
-        print(f"  📋 [PAPER] {symbol} {side} CLOSE @{exit_price:.5g} PnL:{pnl:+.4f}U {emoji} [{reason}]")
+    emoji = "🟢" if pnl >= 0 else "🔴"
+    safe_print(f"  📋 [PAPER] {symbol} {side} CLOSE @{exit_price:.6g} PnL:{pnl:+.4f}U {emoji} [{reason}]")
     return pnl
 
 
-# ════════════════════════════════════════════════════
-#  CLAUDE AI SCANNER
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+#  GROQ AI SCANNER
+# ════════════════════════════════════════════════════════
 def ask_groq_for_best_coins(tickers_data, macro_data):
-    """
-    Tanya Groq API (GRATIS): coin mana yang paling berpotensi untuk scalping
-    sekarang berdasarkan data market real-time.
-    Model: llama-3.3-70b-versatile (gratis, cepat)
-    """
     global _ai_picks, _ai_picks_ts
 
     if not GROQ_API_KEY:
         return []
 
-    # Siapkan ringkasan top movers buat AI
     top_by_vol = sorted(
-        [(sym, d) for sym, d in tickers_data.items() if d["vol24h"] > 2_000_000],
+        [(sym, d) for sym, d in tickers_data.items()
+         if d["vol24h"] > 1_500_000 and sym.endswith("USDT")],
         key=lambda x: abs(x[1]["pct"]),
         reverse=True
-    )[:40]
+    )[:45]
 
     coin_summary = []
     for sym, d in top_by_vol:
         coin_summary.append(
-            f"{sym}: {d['pct']:+.1f}% | vol=${d['vol24h']/1e6:.1f}M | price={d['price']}"
+            f"{sym}: {d['pct']:+.1f}% vol=${d['vol24h']/1e6:.1f}M p={d['price']}"
         )
 
-    prompt = f"""You are an expert crypto futures scalping analyst. Pick TOP 10 coins for scalp trading in the NEXT 5-15 MINUTES.
+    prompt = f"""Expert crypto futures scalping analyst. Pick TOP 10 coins for scalping NEXT 5-10 MINUTES.
 
-Market context right now:
-- BTC trend 5m: {macro_data['btc_trend_5m']}
-- BTC trend 15m: {macro_data['btc_trend_15m']}
-- Fear & Greed Index: {macro_data['fng']} ({macro_data['fng_label']})
-- Market breadth (% coins above EMA9): {macro_data['market_breadth']*100:.0f}%
-- News: {macro_data['news']}
+Market NOW:
+- BTC 5m: {macro_data['btc_trend_5m']} | 15m: {macro_data['btc_trend_15m']}
+- Fear & Greed: {macro_data['fng']} ({macro_data['fng_label']})
+- Breadth: {macro_data['market_breadth']*100:.0f}% coins above EMA9
 - Mode: {macro_data['scalp_mode']}
 
-Top movers (high volume only):
-{chr(10).join(coin_summary[:30])}
+Top movers (vol filtered, USDT only):
+{chr(10).join(coin_summary[:35])}
 
-Rules:
-- Pick coins with strong momentum AND high volume
-- BTC BULL → prefer LONG, BTC BEAR → prefer SHORT
-- Avoid coins that already pumped/dumped too much (>15% 24h)
-- ONLY output a JSON array, no text before or after, no markdown fences:
-[{{"symbol":"SOLUSDT","direction":"LONG","reason":"momentum+vol surge"}}, ...]
-- Exactly 10 items."""
+Criteria:
+- Strong momentum + high volume surge
+- BTC BULL → LONG preferred, BTC BEAR → SHORT preferred
+- Avoid >15% 24h move already done
+- Only USDT pairs
+
+Return ONLY valid JSON array, no markdown, no text:
+[{{"symbol":"SOLUSDT","direction":"LONG","reason":"..."}},...]
+Exactly 10 items."""
 
     try:
         resp = requests.post(
@@ -382,91 +378,83 @@ Rules:
             },
             json={
                 "model": AI_MODEL,
-                "max_tokens": 800,
-                "temperature": 0.3,
+                "max_tokens": 900,
+                "temperature": 0.25,
                 "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a crypto scalping analyst. Always respond with valid JSON array only, no explanation."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
+                    {"role": "system",
+                     "content": "Crypto scalping analyst. Output ONLY valid JSON array. No markdown. No explanation."},
+                    {"role": "user", "content": prompt}
                 ]
             },
-            timeout=10
+            timeout=12
         )
         if resp.status_code == 200:
-            data  = resp.json()
-            text  = data["choices"][0]["message"]["content"].strip()
-            # Bersihkan kalau ada markdown fence
-            text  = text.replace("```json", "").replace("```", "").strip()
-            # Ambil dari [ sampai ]
+            data = resp.json()
+            text = data["choices"][0]["message"]["content"].strip()
+            text = re.sub(r"```json|```", "", text).strip()
             start = text.find("[")
             end   = text.rfind("]") + 1
             if start != -1 and end > start:
                 text = text[start:end]
             picks = json.loads(text)
+            # Filter: pastikan hanya USDT pairs
+            picks = [p for p in picks if str(p.get("symbol","")).upper().endswith("USDT")]
             _ai_picks    = picks[:10]
             _ai_picks_ts = time.time()
             _stats["ai_scans"] += 1
-
-            symbols_picked = [p["symbol"] for p in _ai_picks]
-            dirs           = [p.get("direction","?") for p in _ai_picks]
-            print(f"\n  🤖 Groq AI picks: {', '.join(f'{s}({d})' for s,d in zip(symbols_picked[:5], dirs[:5]))}...")
+            syms = [(p["symbol"], p.get("direction","?")) for p in _ai_picks[:5]]
+            safe_print(f"\n  🤖 Groq AI picks: {' | '.join(f'{s}({d})' for s,d in syms)}")
             return _ai_picks
         else:
-            print(f"  ⚠️ Groq API error: {resp.status_code} — {resp.text[:100]}")
+            safe_print(f"  ⚠️ Groq {resp.status_code}: {resp.text[:80]}")
             return _ai_picks
     except json.JSONDecodeError as e:
-        print(f"  ⚠️ Groq JSON parse error: {e}")
+        safe_print(f"  ⚠️ Groq JSON err: {e}")
         return _ai_picks
     except Exception as e:
-        print(f"  ⚠️ Groq Scanner error: {e}")
+        safe_print(f"  ⚠️ Groq err: {e}")
         return _ai_picks
 
 
 def get_ai_direction_hint(symbol):
-    """Cek apakah Claude rekomendasikan direction untuk symbol ini."""
     for pick in _ai_picks:
         if pick.get("symbol") == symbol:
             return pick.get("direction"), pick.get("reason", "")
     return None, ""
 
 
-# ════════════════════════════════════════════════════
-#  KILL SWITCH ENGINE
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+#  KILL SWITCH
+# ════════════════════════════════════════════════════════
 def check_kill_switch():
-    ks = _kill_switch
+    ks  = _kill_switch
     now = time.time()
 
     if ks["active"] and now >= ks["resume_time"]:
-        ks["active"] = False
-        ks["reason"] = ""
+        ks["active"]       = False
+        ks["reason"]       = ""
         ks["consec_losses"] = 0
-        print(f"\n  ✅ Kill switch CLEARED — bot aktif kembali")
+        safe_print(f"\n  ✅ Kill switch CLEAR — bot aktif kembali")
 
     if ks["active"]:
         return True, ks["reason"]
 
     day_start = now - (now % 86400)
     if day_start > ks["daily_reset_ts"]:
-        ks["daily_pnl"] = 0.0
+        ks["daily_pnl"]      = 0.0
         ks["daily_reset_ts"] = day_start
 
     if ks["daily_pnl"] <= DAILY_LOSS_LIMIT:
-        ks["active"] = True
-        ks["reason"] = f"daily_loss({ks['daily_pnl']:.2f}U)"
+        ks["active"]      = True
+        ks["reason"]      = f"daily_loss({ks['daily_pnl']:.2f})"
         ks["resume_time"] = day_start + 86400
         return True, ks["reason"]
 
     if ks["consec_losses"] >= CONSEC_LOSS_MAX:
-        ks["active"] = True
-        ks["reason"] = f"consec_loss({ks['consec_losses']})"
+        ks["active"]      = True
+        ks["reason"]      = f"consec_loss({ks['consec_losses']})"
         ks["resume_time"] = now + (CONSEC_LOSS_PAUSE_MIN * 60)
-        print(f"\n  🚨 KILL SWITCH: {ks['consec_losses']} loss beruntun — pause {CONSEC_LOSS_PAUSE_MIN}m")
+        safe_print(f"\n  🚨 KILL SWITCH: {ks['consec_losses']} loss beruntun — pause {CONSEC_LOSS_PAUSE_MIN}m")
         return True, ks["reason"]
 
     return False, ""
@@ -483,7 +471,7 @@ def update_kill_switch_after_trade(pnl):
 
 def check_api_latency():
     try:
-        t0 = time.time()
+        t0  = time.time()
         client.futures_ping()
         lag = time.time() - t0
         _kill_switch["api_lag"] = lag
@@ -492,9 +480,9 @@ def check_api_latency():
         return False
 
 
-# ════════════════════════════════════════════════════
-#  CHOP / REGIME FILTER
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+#  CHOP FILTER
+# ════════════════════════════════════════════════════════
 def calc_choppiness_index(df, period=14):
     if df is None or len(df) < period + 2:
         return 50.0
@@ -506,39 +494,37 @@ def calc_choppiness_index(df, period=14):
         for i in range(-period, 0):
             tr = max(high[i]-low[i], abs(high[i]-close[i-1]), abs(low[i]-close[i-1]))
             tr_sum += tr
-        highest_high = max(high[-period:])
-        lowest_low   = min(low[-period:])
-        price_range  = highest_high - lowest_low
-        if price_range == 0 or tr_sum == 0:
+        rng = max(high[-period:]) - min(low[-period:])
+        if rng == 0 or tr_sum == 0:
             return 50.0
-        ci = 100 * math.log10(tr_sum / price_range) / math.log10(period)
-        return round(ci, 2)
+        return round(100 * math.log10(tr_sum / rng) / math.log10(period), 2)
     except:
         return 50.0
 
 
-def is_chop_market(df_5m, direction):
+def is_chop_market(df_5m):
     if df_5m is None or len(df_5m) < 20:
         return False, "no_data"
     reasons = []
     ci = calc_choppiness_index(df_5m, 14)
     if ci > CHOP_INDEX_THRESHOLD:
         reasons.append(f"CI={ci:.1f}")
-    last = df_5m.iloc[-1]
+    last     = df_5m.iloc[-1]
     bb_width = last.get("bb_width", 0.01)
     if bb_width < MIN_BB_WIDTH_PCT:
-        reasons.append(f"BB_narrow")
-    recent_hist = df_5m["macd_hist"].values[-10:]
-    hist_std = float(np.std(recent_hist)) if len(recent_hist) >= 5 else 0
-    if hist_std < 0.00001:
+        reasons.append("BB_narrow")
+    hist   = df_5m["macd_hist"].values[-10:]
+    h_std  = float(np.std(hist)) if len(hist) >= 5 else 0.001
+    if h_std < 0.000008:
         reasons.append("MACD_flat")
+    # Perlu 2+ alasan untuk dianggap chop
     is_chop = len(reasons) >= 2
     return is_chop, "|".join(reasons) if reasons else "ok"
 
 
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  UTILS
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 def get_sym_info(symbol):
     if symbol in _sym_info:
         return _sym_info[symbol]
@@ -556,14 +542,17 @@ def get_sym_info(symbol):
         pass
     return {"step": 1.0, "minQty": 1.0}
 
+
 def round_step(qty, step):
     p = max(0, int(round(-math.log(step, 10), 0))) if step < 1 else 0
     return round(math.floor(qty / step) * step, p)
+
 
 def calc_qty(symbol, price):
     info = get_sym_info(symbol)
     raw  = (ORDER_USDT * LEVERAGE) / price
     return max(round_step(raw, info["step"]), info["minQty"])
+
 
 def set_leverage(symbol):
     if PAPER_TRADING:
@@ -573,11 +562,13 @@ def set_leverage(symbol):
     except:
         pass
 
+
 def get_price(symbol):
     try:
         return float(client.futures_symbol_ticker(symbol=symbol)["price"])
     except:
         return 0.0
+
 
 def get_exchange_amt(symbol):
     if PAPER_TRADING:
@@ -595,38 +586,45 @@ def get_exchange_amt(symbol):
     except:
         return None
 
+
 def is_symbol_cooling_down(symbol):
     if symbol not in _sym_cooldown:
         return False
     return (time.time() - _sym_cooldown[symbol]) < SYMBOL_COOLDOWN_SEC
 
+
 def set_symbol_cooldown(symbol):
     _sym_cooldown[symbol] = time.time()
 
+
 def validate_symbols():
+    """Validasi symbols aktif di Binance Futures, filter ketat hanya USDT."""
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"]
-                 if s["status"] == "TRADING"}
+                 if s["status"] == "TRADING" and s["symbol"].endswith("USDT")}
         result = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
-        print(f"  ✅ {len(result)}/{len(SYMBOLS)} symbols valid")
+        safe_print(f"  ✅ {len(result)}/{len(SYMBOLS)} symbols valid (USDT only)")
         return result
     except:
         return list(dict.fromkeys(SYMBOLS))
 
 
-# ════════════════════════════════════════════════════
-#  SUMBER DATA
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+#  DATA SOURCES
+# ════════════════════════════════════════════════════════
 def fetch_ticker24h_all():
     global _ticker24h_cache, _ticker24h_ts
     now = time.time()
     if now - _ticker24h_ts < TICKER24H_TTL and _ticker24h_cache:
         return _ticker24h_cache
     try:
-        tickers  = client.futures_ticker()
+        tickers   = client.futures_ticker()
         new_cache = {}
         for t in tickers:
             sym = t["symbol"]
+            # Hanya simpan USDT pairs
+            if not sym.endswith("USDT"):
+                continue
             new_cache[sym] = {
                 "pct":    float(t["priceChangePercent"]),
                 "price":  float(t["lastPrice"]),
@@ -651,8 +649,11 @@ def fetch_funding_rates():
         premium   = client.futures_mark_price()
         new_cache = {}
         for p in premium:
+            sym = p["symbol"]
+            if not sym.endswith("USDT"):
+                continue
             fr = float(p.get("lastFundingRate", 0))
-            new_cache[p["symbol"]] = fr
+            new_cache[sym] = fr
         _funding_cache = new_cache
         _funding_ts    = now
         return new_cache
@@ -672,16 +673,15 @@ def get_top_movers(symbols_active, n=40):
         for sym, data in tickers.items():
             if sym not in active_set:
                 continue
+            if not sym.endswith("USDT"):
+                continue
             pct = data["pct"]
             vol = data["vol24h"]
-            if vol < 1_000_000:
+            if vol < 800_000:
                 continue
             movers.append((sym, pct, vol))
         movers.sort(key=lambda x: abs(x[1]), reverse=True)
-        result = []
-        for sym, pct, vol in movers[:n]:
-            direction = "LONG" if pct > 0 else "SHORT"
-            result.append((sym, pct, direction))
+        result = [(sym, pct, "LONG" if pct > 0 else "SHORT") for sym, pct, vol in movers[:n]]
         _top_movers    = result
         _top_movers_ts = now
         return result
@@ -697,9 +697,9 @@ def get_funding_bias(symbol):
     return "neutral", fr
 
 
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  OHLCV CACHE
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 def get_ohlcv(symbol, interval, limit=100):
     cache_key = (symbol, interval)
     now = time.time()
@@ -731,9 +731,9 @@ def get_ohlcv(symbol, interval, limit=100):
         return None
 
 
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  TECHNICAL ANALYSIS
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 def run_ta(df):
     c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
     df["rsi"]       = ta.momentum.RSIIndicator(c, 14).rsi()
@@ -762,10 +762,10 @@ def run_ta(df):
     df["body"]      = abs(df["close"] - df["open"])
     df["range_"]    = df["high"] - df["low"]
     df["body_ratio"]= df["body"] / df["range_"].replace(0, 1)
-    df["bb_squeeze"]= df["bb_width"] < df["bb_width"].rolling(20).mean() * 0.85
     df["mom5"]      = (c - c.shift(5)) / c.shift(5)
     df["mom3"]      = (c - c.shift(3)) / c.shift(3)
     return df
+
 
 def _calc_trend(df):
     if df is None or len(df) < 25:
@@ -776,40 +776,39 @@ def _calc_trend(df):
     ema21 = ta.trend.EMAIndicator(c, 21).ema_indicator().iloc[-1]
     ema50 = ta.trend.EMAIndicator(c, 50).ema_indicator().iloc[-1]
     chg   = (price - c.iloc[-4]) / c.iloc[-4] * 100
-    if price > ema9 > ema21 > ema50 and chg > 0:   return "BULL"
-    elif price < ema9 < ema21 < ema50 and chg < 0: return "BEAR"
-    elif price > ema21 and chg > -0.2:             return "MILD_BULL"
-    elif price < ema21 and chg < 0.2:              return "MILD_BEAR"
+    if price > ema9 > ema21 > ema50 and chg > 0:    return "BULL"
+    elif price < ema9 < ema21 < ema50 and chg < 0:  return "BEAR"
+    elif price > ema21 and chg > -0.2:              return "MILD_BULL"
+    elif price < ema21 and chg < 0.2:               return "MILD_BEAR"
     return "SIDEWAYS"
 
 
-# ════════════════════════════════════════════════════
-#  ATR-BASED LEVELS
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+#  ATR LEVELS
+# ════════════════════════════════════════════════════════
 def calc_atr_levels(entry, atr, direction):
-    raw_sl_dist  = atr * ATR_SL_MULT
-    raw_tp1_dist = atr * ATR_TP1_MULT
-    raw_tp2_dist = atr * ATR_TP2_MULT
-    raw_ic_dist  = atr * INSTANT_CUT_MULT
+    raw_sl  = atr * ATR_SL_MULT
+    raw_tp1 = atr * ATR_TP1_MULT
+    raw_tp2 = atr * ATR_TP2_MULT
+    raw_ic  = atr * INSTANT_CUT_MULT
 
-    sl_dist  = max(entry * MIN_SL_PCT, min(raw_sl_dist, entry * MAX_SL_PCT))
-    tp1_dist = max(entry * MIN_TP1_PCT, raw_tp1_dist)
-    tp2_dist = min(entry * MAX_TP2_PCT, raw_tp2_dist)
+    sl_dist  = max(entry * MIN_SL_PCT, min(raw_sl,  entry * MAX_SL_PCT))
+    tp1_dist = max(entry * MIN_TP1_PCT, raw_tp1)
+    tp2_dist = min(entry * MAX_TP2_PCT, raw_tp2)
     tp2_dist = max(tp2_dist, tp1_dist * 1.5)
 
     if direction == "LONG":
         sl          = round(entry - sl_dist,  8)
         tp1         = round(entry + tp1_dist, 8)
         tp2         = round(entry + tp2_dist, 8)
-        instant_cut = round(entry - raw_ic_dist, 8)
-        # v15: Trail langsung aktif dari entry
+        instant_cut = round(entry - raw_ic, 8)
         trail_sl    = round(entry - atr * ATR_TRAIL_MULT, 8)
         trail_sl    = max(trail_sl, sl)
     else:
         sl          = round(entry + sl_dist,  8)
         tp1         = round(entry - tp1_dist, 8)
         tp2         = round(entry - tp2_dist, 8)
-        instant_cut = round(entry + raw_ic_dist, 8)
+        instant_cut = round(entry + raw_ic, 8)
         trail_sl    = round(entry + atr * ATR_TRAIL_MULT, 8)
         trail_sl    = min(trail_sl, sl)
 
@@ -827,45 +826,43 @@ def calc_atr_levels(entry, atr, direction):
     }
 
 
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  MOMENTUM CHECK
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 def check_momentum_strength(df, direction):
     if df is None or len(df) < 10:
         return False, 0, "no_data"
 
-    last   = df.iloc[-1]
-    recent = df.iloc[-6:-1]
+    last    = df.iloc[-1]
+    recent  = df.iloc[-6:-1]
+    p_now   = last["close"]
+    p_5ago  = df.iloc[-6]["close"]
+    mom_pct = (p_now - p_5ago) / p_5ago
 
-    price_now  = last["close"]
-    price_5ago = df.iloc[-6]["close"]
-    momentum_pct = (price_now - price_5ago) / price_5ago
-
-    if direction == "LONG"  and momentum_pct < MIN_MOMENTUM_PCT:
-        return False, momentum_pct, f"mom_weak({momentum_pct*100:.2f}%)"
-    if direction == "SHORT" and momentum_pct > -MIN_MOMENTUM_PCT:
-        return False, momentum_pct, f"mom_weak({momentum_pct*100:.2f}%)"
+    if direction == "LONG"  and mom_pct < MIN_MOMENTUM_PCT:
+        return False, mom_pct, f"mom_weak({mom_pct*100:.2f}%)"
+    if direction == "SHORT" and mom_pct > -MIN_MOMENTUM_PCT:
+        return False, mom_pct, f"mom_weak({mom_pct*100:.2f}%)"
 
     vol_ratio = last["vol_ratio"]
     if vol_ratio < MIN_VOL_SURGE:
-        return False, momentum_pct, f"vol_low({vol_ratio:.1f}x)"
+        return False, mom_pct, f"vol_low({vol_ratio:.1f}x)"
 
     if direction == "LONG":
         bullish = sum(1 for _, row in recent.iterrows() if row["close"] > row["open"])
         if bullish < MIN_TREND_CANDLES:
-            return False, momentum_pct, f"candles_weak({bullish}/5)"
+            return False, mom_pct, f"candles_weak({bullish}/5)"
     else:
         bearish = sum(1 for _, row in recent.iterrows() if row["close"] < row["open"])
         if bearish < MIN_TREND_CANDLES:
-            return False, momentum_pct, f"candles_weak({bearish}/5)"
+            return False, mom_pct, f"candles_weak({bearish}/5)"
 
-    desc = f"mom={momentum_pct*100:+.2f}% vol={vol_ratio:.1f}x"
-    return True, momentum_pct, desc
+    return True, mom_pct, f"mom={mom_pct*100:+.2f}% vol={vol_ratio:.1f}x"
 
 
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  MACRO REFRESH
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 def refresh_macro():
     now = time.time()
     if now - _macro["last_fng"] > 300:
@@ -881,17 +878,12 @@ def refresh_macro():
         try:
             df_5m  = get_ohlcv("BTCUSDT", Client.KLINE_INTERVAL_5MINUTE, 60)
             df_15m = get_ohlcv("BTCUSDT", Client.KLINE_INTERVAL_15MINUTE, 60)
-            df_1h  = get_ohlcv("BTCUSDT", Client.KLINE_INTERVAL_1HOUR, 60)
             _macro["btc_trend_5m"]  = _calc_trend(df_5m)
             _macro["btc_trend_15m"] = _calc_trend(df_15m)
-            _macro["btc_trend_1h"]  = _calc_trend(df_1h)
             _macro["last_btc"]      = now
-            t5m  = _macro["btc_trend_5m"]
-            t15m = _macro["btc_trend_15m"]
-            if t15m in ("BULL","BEAR") or t5m in ("BULL","BEAR"):
-                _macro["scalp_mode"] = "TREND"
-            else:
-                _macro["scalp_mode"] = "RANGE"
+            t5  = _macro["btc_trend_5m"]
+            t15 = _macro["btc_trend_15m"]
+            _macro["scalp_mode"] = "TREND" if t15 in ("BULL","BEAR") or t5 in ("BULL","BEAR") else "RANGE"
         except:
             pass
 
@@ -911,6 +903,7 @@ def refresh_macro():
         except:
             pass
 
+
 def update_btc_price():
     try:
         px = get_price("BTCUSDT")
@@ -918,6 +911,7 @@ def update_btc_price():
             _btc_price_history.append((time.time(), px))
     except:
         pass
+
 
 def detect_flash_move():
     if len(_btc_price_history) < 2:
@@ -933,9 +927,9 @@ def detect_flash_move():
     return "none", 0.0
 
 
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  ORDER BOOK IMBALANCE
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 def get_ob_imbalance(symbol):
     try:
         ob    = client.futures_order_book(symbol=symbol, limit=50)
@@ -947,9 +941,9 @@ def get_ob_imbalance(symbol):
         return 0.0
 
 
-# ════════════════════════════════════════════════════
-#  ENTRY SCORE ENGINE v15
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+#  ENTRY SCORE ENGINE v16
+# ════════════════════════════════════════════════════════
 def get_entry_score(symbol, df_5m, direction, ai_hint_direction=None):
     if df_5m is None or len(df_5m) < 30:
         return 0, []
@@ -957,111 +951,95 @@ def get_entry_score(symbol, df_5m, direction, ai_hint_direction=None):
     last  = df_5m.iloc[-1]
     prev  = df_5m.iloc[-2]
     prev2 = df_5m.iloc[-3]
-    sigs  = []
     score = 0
+    sigs  = []
 
-    # ── BONUS AI HINT ─────────────────────────────────────
-    # Kalau AI juga rekomendasikan coin + direction ini, bonus score
-    ai_bonus = 0
+    # ── AI BONUS ─────────────────────────────────────────
     if ai_hint_direction == direction:
-        ai_bonus = 15
+        score += 15
         sigs.append(f"🤖AI={direction}")
 
-    # ── A: TREND (max 25) ─────────────────────────────────
+    # ── A: TREND (max 25) ────────────────────────────────
     e3, e5, e9, e21 = last["ema3"], last["ema5"], last["ema9"], last["ema21"]
     p = last["close"]
-    trend_score = 0
-    trend_sig   = ""
     if direction == "LONG":
         if p > e3 > e5 > e9 > e21:
-            trend_score = 25; trend_sig = "📐EMA_STACK↑"
+            score += 25; sigs.append("📐EMA_STACK↑")
         elif p > e5 > e9 > e21:
-            trend_score = 18; trend_sig = "📐EMA↑"
+            score += 18; sigs.append("📐EMA↑")
         elif p > e9 > e21:
-            trend_score = 12; trend_sig = "📐EMA_align↑"
+            score += 12; sigs.append("📐EMA_align↑")
+        elif p > e9:
+            score += 6;  sigs.append("📐E9↑")
     else:
         if p < e3 < e5 < e9 < e21:
-            trend_score = 25; trend_sig = "📐EMA_STACK↓"
+            score += 25; sigs.append("📐EMA_STACK↓")
         elif p < e5 < e9 < e21:
-            trend_score = 18; trend_sig = "📐EMA↓"
+            score += 18; sigs.append("📐EMA↓")
         elif p < e9 < e21:
-            trend_score = 12; trend_sig = "📐EMA_align↓"
-    score += trend_score
-    if trend_sig: sigs.append(trend_sig)
+            score += 12; sigs.append("📐EMA_align↓")
+        elif p < e9:
+            score += 6;  sigs.append("📐E9↓")
 
-    # ── B: VOLATILITY/MOMENTUM (max 25) ───────────────────
+    # ── B: MOMENTUM/VOLATILITY (max 25) ──────────────────
     mom5    = abs(last.get("mom5", 0))
     vol_rat = last["vol_ratio"]
     atr_now = last["atr"]
-    atr_prev= df_5m.iloc[-6]["atr"] if len(df_5m) > 6 else atr_now
-    atr_exp = atr_now > atr_prev * 1.15
+    atr_p   = df_5m.iloc[-6]["atr"] if len(df_5m) > 6 else atr_now
+    atr_exp = atr_now > atr_p * 1.1
 
-    vol_score = 0
-    vol_sig   = ""
-    if mom5 >= 0.006 and atr_exp:
-        vol_score = 25; vol_sig = f"🚀Mom{mom5*100:.1f}%+ATRexp"
-    elif mom5 >= 0.004 and vol_rat >= 2.0:
-        vol_score = 20; vol_sig = f"📈Mom{mom5*100:.1f}%+Vol{vol_rat:.1f}x"
-    elif mom5 >= 0.002:
-        vol_score = 13; vol_sig = f"📈Mom{mom5*100:.1f}%"
-    elif vol_rat >= 3.0:
-        vol_score = 13; vol_sig = f"🔥Vol{vol_rat:.1f}x"
-    elif vol_rat >= 2.0:
-        vol_score = 8
-    score += vol_score
-    if vol_sig: sigs.append(vol_sig)
+    if mom5 >= 0.005 and atr_exp:
+        score += 25; sigs.append(f"🚀Mom{mom5*100:.1f}%+ATR↑")
+    elif mom5 >= 0.003 and vol_rat >= 1.8:
+        score += 20; sigs.append(f"📈Mom{mom5*100:.1f}%+Vol{vol_rat:.1f}x")
+    elif mom5 >= 0.0015:
+        score += 13; sigs.append(f"📈Mom{mom5*100:.1f}%")
+    elif vol_rat >= 2.5:
+        score += 13; sigs.append(f"🔥Vol{vol_rat:.1f}x")
+    elif vol_rat >= 1.5:
+        score += 7
 
-    # ── C: ORDER FLOW (max 25) ────────────────────────────
-    h_now  = last["macd_hist"]
-    h_prev = prev["macd_hist"]
-    h_p2   = prev2["macd_hist"]
-    br     = last["buy_ratio"]
-    flow_score = 0
-    flow_sig   = ""
+    # ── C: ORDER FLOW (max 25) ───────────────────────────
+    h_now, h_prev, h_p2 = last["macd_hist"], prev["macd_hist"], prev2["macd_hist"]
+    br = last["buy_ratio"]
     if direction == "LONG":
-        if h_now > 0 and h_now > h_prev > h_p2 and br > 0.55:
-            flow_score = 25; flow_sig = f"✅MACD↑↑+Buy{br:.0%}"
+        if h_now > 0 and h_now > h_prev > h_p2 and br > 0.53:
+            score += 25; sigs.append(f"✅MACD↑↑Buy{br:.0%}")
         elif h_now > 0 and h_now > h_prev:
-            flow_score = 17; flow_sig = "✅MACD↑"
+            score += 17; sigs.append("✅MACD↑")
         elif h_prev < 0 and h_now >= 0:
-            flow_score = 20; flow_sig = "⚡MACD_X0↑"
-        elif br > 0.60:
-            flow_score = 10; flow_sig = f"💧Buy{br:.0%}"
+            score += 20; sigs.append("⚡MACD_X↑")
+        elif br > 0.58:
+            score += 10; sigs.append(f"💧Buy{br:.0%}")
     else:
-        if h_now < 0 and h_now < h_prev < h_p2 and br < 0.45:
-            flow_score = 25; flow_sig = f"✅MACD↓↓+Sell{1-br:.0%}"
+        if h_now < 0 and h_now < h_prev < h_p2 and br < 0.47:
+            score += 25; sigs.append(f"✅MACD↓↓Sel{1-br:.0%}")
         elif h_now < 0 and h_now < h_prev:
-            flow_score = 17; flow_sig = "✅MACD↓"
+            score += 17; sigs.append("✅MACD↓")
         elif h_prev > 0 and h_now <= 0:
-            flow_score = 20; flow_sig = "⚡MACD_X0↓"
-        elif br < 0.40:
-            flow_score = 10; flow_sig = f"💧Sell{1-br:.0%}"
-    score += flow_score
-    if flow_sig: sigs.append(flow_sig)
+            score += 20; sigs.append("⚡MACD_X↓")
+        elif br < 0.42:
+            score += 10; sigs.append(f"💧Sel{1-br:.0%}")
 
-    # ── D: STRUCTURE (max 25) ─────────────────────────────
+    # ── D: STRUCTURE (max 25) ────────────────────────────
     recent_hi = df_5m.iloc[-6:-1]["high"].max()
     recent_lo = df_5m.iloc[-6:-1]["low"].min()
-    struct_score = 0
-    struct_sig   = ""
     if direction == "LONG":
-        if p > recent_hi and last["body_ratio"] > 0.6 and last["vol_ratio"] > 1.5:
-            struct_score = 25; struct_sig = "🚀BreakBull"
-        elif last["close"] > last["open"] and last["close"] > prev["high"] and last["body_ratio"] > 0.6:
-            struct_score = 20; struct_sig = "🕯️Engulf↑"
+        if p > recent_hi and last["body_ratio"] > 0.55 and last["vol_ratio"] > 1.4:
+            score += 25; sigs.append("🚀BreakBull")
+        elif last["close"] > last["open"] and last["close"] > prev["high"] and last["body_ratio"] > 0.55:
+            score += 20; sigs.append("🕯️Engulf↑")
         elif p > recent_hi:
-            struct_score = 12; struct_sig = "📈Break↑"
+            score += 12; sigs.append("📈Break↑")
     else:
-        if p < recent_lo and last["body_ratio"] > 0.6 and last["vol_ratio"] > 1.5:
-            struct_score = 25; struct_sig = "💥BreakBear"
-        elif last["close"] < last["open"] and last["close"] < prev["low"] and last["body_ratio"] > 0.6:
-            struct_score = 20; struct_sig = "🕯️Engulf↓"
+        if p < recent_lo and last["body_ratio"] > 0.55 and last["vol_ratio"] > 1.4:
+            score += 25; sigs.append("💥BreakBear")
+        elif last["close"] < last["open"] and last["close"] < prev["low"] and last["body_ratio"] > 0.55:
+            score += 20; sigs.append("🕯️Engulf↓")
         elif p < recent_lo:
-            struct_score = 12; struct_sig = "📈Break↓"
-    score += struct_score
-    if struct_sig: sigs.append(struct_sig)
+            score += 12; sigs.append("📈Break↓")
 
-    total = max(0, min(score + ai_bonus, 100))
+    total = max(0, min(score, 100))
     return total, sigs
 
 
@@ -1072,48 +1050,52 @@ def determine_direction(df_5m, df_15m=None, ai_hint=None):
     prev  = df_5m.iloc[-2]
     price = last["close"]
     e3, e5, e9 = last["ema3"], last["ema5"], last["ema9"]
-    long_pts = short_pts = 0
+    lp = sp = 0
 
-    if price > e3 > e5 > e9:   long_pts  += 4
-    elif price < e3 < e5 < e9: short_pts += 4
-    elif price > e5 > e9:      long_pts  += 2
-    elif price < e5 < e9:      short_pts += 2
+    if price > e3 > e5 > e9:    lp += 4
+    elif price < e3 < e5 < e9:  sp += 4
+    elif price > e5 > e9:       lp += 2
+    elif price < e5 < e9:       sp += 2
 
     mom5 = last.get("mom5", 0)
-    if mom5 > 0.002:    long_pts  += 3
-    elif mom5 < -0.002: short_pts += 3
+    if mom5 > 0.0015:  lp += 3
+    elif mom5 < -0.0015: sp += 3
 
-    if last["macd_hist"] > prev["macd_hist"]: long_pts  += 2
-    else:                                     short_pts += 2
+    if last["macd_hist"] > prev["macd_hist"]: lp += 2
+    else:                                     sp += 2
 
-    if last["buy_ratio"] > 0.55 and last["close"] > last["open"]:   long_pts  += 2
-    elif last["buy_ratio"] < 0.45 and last["close"] < last["open"]: short_pts += 2
+    if last["buy_ratio"] > 0.53 and last["close"] > last["open"]:   lp += 2
+    elif last["buy_ratio"] < 0.47 and last["close"] < last["open"]: sp += 2
 
     if df_15m is not None and len(df_15m) >= 20:
         l15 = df_15m.iloc[-1]
-        if l15["ema9"] > l15["ema21"]: long_pts  += 2
-        else:                          short_pts += 2
+        if l15["ema9"] > l15["ema21"]: lp += 2
+        else:                          sp += 2
 
     btc_t = _macro.get("btc_trend_5m", "UNKNOWN")
-    if btc_t in BULL_TRENDS:  long_pts  += 2
-    elif btc_t in BEAR_TRENDS: short_pts += 2
+    if btc_t in BULL_TRENDS:  lp += 2
+    elif btc_t in BEAR_TRENDS: sp += 2
 
-    # AI hint bonus
-    if ai_hint == "LONG":   long_pts  += 3
-    elif ai_hint == "SHORT": short_pts += 3
+    if ai_hint == "LONG":    lp += 4
+    elif ai_hint == "SHORT": sp += 4
 
-    if long_pts > short_pts and long_pts >= 5:  return "LONG"
-    if short_pts > long_pts and short_pts >= 5: return "SHORT"
+    # Threshold 4 (lebih longgar dari sebelumnya 5)
+    if lp > sp and lp >= 4:  return "LONG"
+    if sp > lp and sp >= 4:  return "SHORT"
     return None
 
 
-# ════════════════════════════════════════════════════
-#  ENTRY FILTER v15
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+#  ENTRY FILTER v16
+# ════════════════════════════════════════════════════════
 def should_enter(symbol):
-    killed, kill_reason = check_kill_switch()
+    # Pastikan symbol USDT
+    if not symbol.endswith("USDT"):
+        return None, "not_usdt"
+
+    killed, kr = check_kill_switch()
     if killed:
-        return None, f"kill:{kill_reason}"
+        return None, f"kill:{kr}"
 
     if is_symbol_cooling_down(symbol):
         return None, "cooldown"
@@ -1133,7 +1115,7 @@ def should_enter(symbol):
     if symbol in tickers:
         t24 = tickers[symbol]
         if t24["vol24h"] < 300_000:
-            return None, f"illiquid"
+            return None, "illiquid"
         pct_24h = t24["pct"]
 
     df_5m  = get_ohlcv(symbol, Client.KLINE_INTERVAL_5MINUTE, 80)
@@ -1145,32 +1127,31 @@ def should_enter(symbol):
     if df_15m is not None and len(df_15m) >= 20:
         df_15m = run_ta(df_15m.copy())
 
-    # Get AI hint untuk symbol ini
-    ai_hint_direction, ai_reason = get_ai_direction_hint(symbol)
+    ai_hint, ai_reason = get_ai_direction_hint(symbol)
 
-    direction = determine_direction(df_5m, df_15m, ai_hint=ai_hint_direction)
+    direction = determine_direction(df_5m, df_15m, ai_hint=ai_hint)
     if direction is None:
         return None, "no_direction"
 
-    is_chop, chop_desc = is_chop_market(df_5m, direction)
+    is_chop, chop_desc = is_chop_market(df_5m)
     if is_chop:
         _stats["skipped_chop"] += 1
         return None, f"chop:{chop_desc}"
 
     mom_pass, mom_pct, mom_desc = check_momentum_strength(df_5m, direction)
     if not mom_pass:
-        # Kalau ada AI hint + coin punya volume bagus, sedikit lebih longgar
-        if ai_hint_direction == direction and abs(mom_pct) > MIN_MOMENTUM_PCT * 0.7:
-            pass  # Lolos dengan AI override
+        # AI override: kalau AI rekomendasikan + momentum hampir cukup
+        if ai_hint == direction and abs(mom_pct) > MIN_MOMENTUM_PCT * 0.65:
+            pass  # AI override, lanjut
         else:
             _stats["skipped_no_momentum"] += 1
             return None, f"no_mom:{mom_desc}"
 
     funding_bias, fr = get_funding_bias(symbol)
     if direction == "LONG"  and funding_bias == "bearish_bias" and fr > 0.001:
-        return None, f"funding_bear"
+        return None, "funding_bear"
     if direction == "SHORT" and funding_bias == "bullish_bias" and fr < -0.001:
-        return None, f"funding_bull"
+        return None, "funding_bull"
 
     btc_5m  = _macro["btc_trend_5m"]
     btc_15m = _macro["btc_trend_15m"]
@@ -1179,9 +1160,9 @@ def should_enter(symbol):
     if direction == "SHORT" and btc_5m in BULL_TRENDS and btc_15m in BULL_TRENDS:
         return None, f"skip_SHORT:BTC_{btc_5m}"
     if direction == "LONG" and fng > MAX_FNG_LONG:
-        return None, f"overbought"
+        return None, "overbought"
 
-    score, sigs = get_entry_score(symbol, df_5m, direction, ai_hint_direction)
+    score, sigs = get_entry_score(symbol, df_5m, direction, ai_hint)
 
     min_score_now = BAD_HOURS_MIN_SCORE if time.gmtime().tm_hour in BAD_HOURS_UTC else MIN_SCORE
     if score < min_score_now:
@@ -1194,7 +1175,7 @@ def should_enter(symbol):
     price = df_5m["close"].iloc[-1]
 
     if atr / price > MAX_SL_ATR_PCT:
-        return None, f"ATR_big"
+        return None, "ATR_big"
 
     levels = calc_atr_levels(price, atr, direction)
 
@@ -1203,45 +1184,43 @@ def should_enter(symbol):
         ob = client.futures_order_book(symbol=symbol, limit=5)
         best_bid = float(ob["bids"][0][0])
         best_ask = float(ob["asks"][0][0])
-        spread = best_ask - best_bid
+        spread   = best_ask - best_bid
         tp1_dist = abs(levels["tp1"] - price)
-        if tp1_dist > 0:
-            spread_ratio = spread / tp1_dist
-            if spread_ratio > MAX_SPREAD_RATIO:
-                _stats["skipped_spread"] += 1
-                return None, f"spread_lebar"
+        if tp1_dist > 0 and (spread / tp1_dist) > MAX_SPREAD_RATIO:
+            _stats["skipped_spread"] += 1
+            return None, "spread_lebar"
     except:
         pass
 
     ob_imb = get_ob_imbalance(symbol)
-    if direction == "LONG"  and ob_imb < -0.25: return None, f"OB_SHORT"
-    if direction == "SHORT" and ob_imb > 0.25:  return None, f"OB_LONG"
+    if direction == "LONG"  and ob_imb < -0.25: return None, "OB_SHORT"
+    if direction == "SHORT" and ob_imb > 0.25:  return None, "OB_LONG"
 
     return direction, {
-        "score":        score,
-        "signals":      sigs,
-        "direction":    direction,
-        "sl":           levels["sl"],
-        "tp1":          levels["tp1"],
-        "tp2":          levels["tp2"],
-        "sl_pct":       levels["sl_pct"],
-        "tp1_pct":      levels["tp1_pct"],
-        "ob_imb":       ob_imb,
-        "atr":          atr,
-        "atr_pct":      levels["atr_pct"],
-        "mom_pct":      mom_pct,
-        "pct_24h":      pct_24h,
-        "funding":      fr,
-        "instant_cut":  levels["instant_cut"],
-        "trail_sl":     levels["trail_sl"],
-        "ai_hint":      ai_hint_direction,
-        "ai_reason":    ai_reason,
+        "score":       score,
+        "signals":     sigs,
+        "direction":   direction,
+        "sl":          levels["sl"],
+        "tp1":         levels["tp1"],
+        "tp2":         levels["tp2"],
+        "sl_pct":      levels["sl_pct"],
+        "tp1_pct":     levels["tp1_pct"],
+        "ob_imb":      ob_imb,
+        "atr":         atr,
+        "atr_pct":     levels["atr_pct"],
+        "mom_pct":     mom_pct,
+        "pct_24h":     pct_24h,
+        "funding":     fr,
+        "instant_cut": levels["instant_cut"],
+        "trail_sl":    levels["trail_sl"],
+        "ai_hint":     ai_hint,
+        "ai_reason":   ai_reason,
     }
 
 
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 #  PARALLEL SCANNER
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
 def scan_symbol_safe(symbol):
     try:
         time.sleep(SCAN_DELAY_MS)
@@ -1254,11 +1233,10 @@ def scan_symbol_safe(symbol):
 
 
 def scan_batch_parallel(symbols):
-    candidates      = []
-    symbols_to_scan = symbols[:25]
-    futures = {_executor.submit(scan_symbol_safe, sym): sym for sym in symbols_to_scan}
+    candidates = []
+    futures = {_executor.submit(scan_symbol_safe, sym): sym for sym in symbols[:30]}
     try:
-        for future in as_completed(futures, timeout=12):
+        for future in as_completed(futures, timeout=14):
             try:
                 result = future.result(timeout=2)
                 if result:
@@ -1277,23 +1255,23 @@ def scan_batch_parallel(symbols):
             else:
                 future.cancel()
     except Exception as e:
-        print(f"  ❌ Scan error: {e}")
+        safe_print(f"  ❌ Scan batch err: {e}")
     return candidates
 
 
-# ════════════════════════════════════════════════════
-#  INSTANT RE-SCAN
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+#  INSTANT RESCAN
+# ════════════════════════════════════════════════════════
 def trigger_rescan(reason="", priority_symbol=None):
     if priority_symbol:
         _hot_symbols.appendleft(priority_symbol)
     _rescan_queue.put({"reason": reason, "ts": time.time()})
 
+
 def instant_rescan_worker(symbols_active):
     while True:
         try:
             event = _rescan_queue.get(timeout=60)
-            reason = event.get("reason", "")
             time.sleep(RE_SCAN_DELAY_SEC)
             slots_free = MAX_POSITIONS - len(open_positions)
             if slots_free <= 0:
@@ -1305,18 +1283,17 @@ def instant_rescan_worker(symbols_active):
             if flash_dir != "none":
                 continue
 
-            # Prioritaskan AI picks yang belum open
-            ai_syms = [p["symbol"] for p in _ai_picks if p["symbol"] not in open_positions]
-            hot     = [s for s in list(_hot_symbols) if s not in open_positions]
-            rest    = [s for s in symbols_active if s not in open_positions and s not in hot and s not in ai_syms]
-            scan_list = ai_syms[:10] + hot + rest
+            ai_syms  = [p["symbol"] for p in _ai_picks if p["symbol"] not in open_positions
+                        and p["symbol"] in set(symbols_active)]
+            hot      = [s for s in list(_hot_symbols) if s not in open_positions]
+            rest     = [s for s in symbols_active if s not in open_positions
+                        and s not in hot and s not in ai_syms]
+            scan_list = ai_syms[:12] + hot[:15] + rest[:15]
 
             _stats["rescans"] += 1
-            print(f"\n  ⚡ RESCAN [{reason}] — {len(scan_list[:40])} syms, {slots_free} slot")
             try:
-                candidates = scan_batch_parallel(scan_list[:40])
+                candidates = scan_batch_parallel(scan_list)
             except Exception as e:
-                print(f"  ❌ Rescan error: {e}")
                 candidates = []
 
             if candidates:
@@ -1325,18 +1302,20 @@ def instant_rescan_worker(symbols_active):
                     if len(open_positions) >= MAX_POSITIONS:
                         break
                     open_trade(sym, direction, info)
-            else:
-                print(f"  ⏳ Rescan: no setup")
         except queue.Empty:
             pass
         except Exception as e:
-            print(f"  ❌ Rescan error: {e}")
+            safe_print(f"  ❌ Rescan worker err: {e}")
 
 
-# ════════════════════════════════════════════════════
-#  TRADE EXECUTION (PAPER + LIVE)
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+#  TRADE EXECUTION
+# ════════════════════════════════════════════════════════
 def open_trade(symbol, direction, info):
+    # Pastikan symbol USDT
+    if not symbol.endswith("USDT"):
+        return
+
     with _lock:
         if symbol in open_positions:
             return
@@ -1361,8 +1340,8 @@ def open_trade(symbol, direction, info):
                 type=ORDER_TYPE_MARKET,
                 quantity=qty)
 
-        entry = get_price(symbol)
-        atr   = info.get("atr", entry * 0.002)
+        entry  = get_price(symbol)
+        atr    = info.get("atr", entry * 0.002)
         levels = calc_atr_levels(entry, atr, direction)
 
         open_positions[symbol] = {
@@ -1374,8 +1353,8 @@ def open_trade(symbol, direction, info):
             "tp1":              levels["tp1"],
             "tp2":              levels["tp2"],
             "peak":             entry,
-            "trail_sl":         levels["trail_sl"],  # Langsung aktif!
-            "trail_active":     True,                # v15: aktif dari awal
+            "trail_sl":         levels["trail_sl"],
+            "trail_active":     True,
             "trail_phase":      1,
             "tp1_hit":          False,
             "be_active":        False,
@@ -1384,24 +1363,24 @@ def open_trade(symbol, direction, info):
             "signals":          info.get("signals", []),
             "instant_cut":      levels["instant_cut"],
             "instant_cut_done": False,
-            "mom_pct":          info.get("mom_pct", 0),
             "entry_candle":     0,
             "atr":              atr,
             "ai_hint":          info.get("ai_hint", ""),
-            "paper":            PAPER_TRADING,
         }
 
         mode_tag = "📋PAPER" if PAPER_TRADING else "🔴LIVE"
-        ai_tag   = f"[AI:{info.get('ai_hint','')}]" if info.get("ai_hint") else ""
+        ai_tag   = f"[🤖{info.get('ai_hint','')}]" if info.get("ai_hint") else ""
         sig_str  = " | ".join(info.get("signals", [])[:3])
-        print(f"\n  {'🟢' if direction=='LONG' else '🔴'} {mode_tag} [{symbol}] {direction} @{entry:.5g} {ai_tag}")
-        print(f"     ATR:{atr:.5g} | SL:{levels['sl_pct']*100:.2f}% | TP1:{levels['tp1_pct']*100:.2f}%")
-        print(f"     Trail: AKTIF LANGSUNG | TrailSL:{levels['trail_sl']:.5g} | Score:{info['score']:.0f}")
-        print(f"     {sig_str}")
+        safe_print(
+            f"\n  {'🟢' if direction=='LONG' else '🔴'} {mode_tag} {symbol} {direction} @{entry:.6g} {ai_tag}\n"
+            f"     SL:{levels['sl_pct']*100:.2f}% TP1:{levels['tp1_pct']*100:.2f}% "
+            f"Score:{info['score']:.0f} TrailSL:{levels['trail_sl']:.6g}\n"
+            f"     {sig_str}"
+        )
         _stats["total_trades"] += 1
     except Exception as e:
         with _lock: open_positions.pop(symbol, None)
-        print(f"  ❌ [{symbol}] Entry error: {e}")
+        safe_print(f"  ❌ [{symbol}] Open err: {e}")
 
 
 def partial_close_tp1(symbol):
@@ -1413,46 +1392,39 @@ def partial_close_tp1(symbol):
         side   = pos["side"]
         qty    = pos["qty"]
         info   = get_sym_info(symbol)
-        close_qty = round_step(qty * TP1_CLOSE_RATIO, info["step"])
-        close_qty = max(close_qty, info["minQty"])
+        c_qty  = max(round_step(qty * TP1_CLOSE_RATIO, info["step"]), info["minQty"])
 
         if PAPER_TRADING:
-            pnl = paper_close_order(symbol, side, close_qty, pos["entry"], exit_p, "TP1 Partial")
+            pnl = paper_close_order(symbol, side, c_qty, pos["entry"], exit_p, "TP1")
         else:
             amt = get_exchange_amt(symbol)
             if amt is None or amt == 0:
                 pos["tp1_hit"] = True; return
-            close_qty = min(close_qty, abs(amt))
+            c_qty = min(c_qty, abs(amt))
             client.futures_create_order(
                 symbol=symbol,
                 side=SIDE_SELL if amt > 0 else SIDE_BUY,
                 type=ORDER_TYPE_MARKET,
-                quantity=close_qty,
+                quantity=c_qty,
                 reduceOnly=True)
-            pnl = (exit_p - pos["entry"]) * close_qty if side == "LONG" \
-                  else (pos["entry"] - exit_p) * close_qty
+            pnl = (exit_p - pos["entry"]) * c_qty if side == "LONG" \
+                  else (pos["entry"] - exit_p) * c_qty
 
         hold_s = time.time() - pos["open_time"]
-        print(f"  🎯 [{symbol}] TP1 ({hold_s:.0f}s) PnL:{pnl:+.4f}U")
+        safe_print(f"  🎯 [{symbol}] TP1 @{exit_p:.6g} ({hold_s:.0f}s) PnL:{pnl:+.4f}U")
 
         pos["tp1_hit"]    = True
-        pos["qty_remain"] = qty - close_qty
+        pos["qty_remain"] = qty - c_qty
         pos["be_active"]  = True
-        # SL geser ke breakeven
+        atr               = pos.get("atr", exit_p * 0.002)
         if side == "LONG":
-            pos["sl"]      = round(pos["entry"] * (1 + TRAIL_BE_PCT), 8)
+            pos["sl"]       = round(pos["entry"] * (1 + TRAIL_BE_PCT), 8)
             pos["trail_sl"] = max(pos["trail_sl"], pos["sl"])
         else:
-            pos["sl"]      = round(pos["entry"] * (1 - TRAIL_BE_PCT), 8)
+            pos["sl"]       = round(pos["entry"] * (1 - TRAIL_BE_PCT), 8)
             pos["trail_sl"] = min(pos["trail_sl"], pos["sl"])
-
         pos["trail_phase"] = 2
         pos["peak"]        = exit_p
-        atr = pos.get("atr", exit_p * 0.002)
-        if side == "LONG":
-            pos["trail_sl"] = max(pos["trail_sl"], exit_p * (1 - atr * ATR_TRAIL_MULT / exit_p))
-        else:
-            pos["trail_sl"] = min(pos["trail_sl"], exit_p * (1 + atr * ATR_TRAIL_MULT / exit_p))
 
         _stats["tp1_hits"]  += 1
         _stats["wins"]      += 1
@@ -1462,16 +1434,11 @@ def partial_close_tp1(symbol):
         _perf[symbol]["wins"]   += 1
         _perf[symbol]["pnl"]    += pnl
         _perf[symbol]["trades"] += 1
-
-        trade_log.append({
-            "symbol": symbol, "side": side,
-            "pnl": round(pnl, 4), "reason": "TP1 Partial",
-            "hold_sec": int(hold_s)
-        })
+        trade_log.append({"symbol": symbol, "side": side, "pnl": round(pnl,4),
+                          "reason": "TP1", "hold_sec": int(hold_s)})
         _hot_symbols.appendleft(symbol)
-        print_stats_inline()
     except Exception as e:
-        print(f"  ❌ [{symbol}] TP1 error: {e}")
+        safe_print(f"  ❌ [{symbol}] TP1 err: {e}")
         pos["tp1_hit"] = True
 
 
@@ -1486,8 +1453,8 @@ def close_trade(symbol, reason=""):
         if exit_p == 0:
             return False
 
-        qty_r  = pos.get("qty_remain", pos["qty"])
-        side   = pos["side"]
+        qty_r = pos.get("qty_remain", pos["qty"])
+        side  = pos["side"]
 
         if PAPER_TRADING:
             pnl = paper_close_order(symbol, side, qty_r, pos["entry"], exit_p, reason)
@@ -1516,8 +1483,10 @@ def close_trade(symbol, reason=""):
         hold_s = time.time() - pos["open_time"]
         emoji  = "🟢" if pnl >= 0 else "🔴"
         be_tag = "[BE]" if pos.get("be_active") else ""
-        print(f"  {emoji} [{symbol}] CLOSE — {reason}{be_tag} | {hold_s:.0f}s")
-        print(f"     PnL: {pnl:+.4f}U ({pct:+.2f}%)")
+        safe_print(
+            f"  {emoji} [{symbol}] {side} CLOSE {reason}{be_tag} "
+            f"@{exit_p:.6g} | {hold_s:.0f}s | PnL:{pnl:+.4f}U ({pct:+.2f}%)"
+        )
 
         _stats["total_pnl"] += pnl
         _stats["pnl_history"].append(pnl)
@@ -1534,28 +1503,24 @@ def close_trade(symbol, reason=""):
             _perf[symbol]["losses"] += 1
             if pnl < _stats["worst_trade"]: _stats["worst_trade"] = pnl
 
-        if "TP2"     in reason: _stats["tp2_hits"]    += 1
-        if "SL"      in reason: _stats["sl_hits"]     += 1
+        if "TP2"     in reason: _stats["tp2_hits"]     += 1
+        if "SL"      in reason: _stats["sl_hits"]      += 1
         if "Force"   in reason: _stats["force_closes"] += 1
         if "InstCut" in reason: _stats["instant_cuts"] += 1
 
-        trade_log.append({
-            "symbol": symbol, "side": side,
-            "pnl": round(pnl, 4), "reason": reason,
-            "hold_sec": int(hold_s)
-        })
-        print_stats_inline()
+        trade_log.append({"symbol": symbol, "side": side, "pnl": round(pnl,4),
+                          "reason": reason, "hold_sec": int(hold_s)})
         set_symbol_cooldown(symbol)
-        trigger_rescan(f"close@{symbol}({reason})", priority_symbol=symbol)
+        trigger_rescan(f"close@{symbol}", priority_symbol=symbol)
         return True
     except Exception as e:
-        print(f"  ❌ [{symbol}] Close error: {e}")
+        safe_print(f"  ❌ [{symbol}] Close err: {e}")
         return False
 
 
-# ════════════════════════════════════════════════════
-#  POSITION MONITOR v15 — INSTANT TRAIL + INSTANT CUT
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+#  POSITION MONITOR v16
+# ════════════════════════════════════════════════════════
 def manage_positions():
     if not open_positions:
         return
@@ -1573,83 +1538,68 @@ def manage_positions():
         side  = pos["side"]
         entry = pos["entry"]
         atr   = pos.get("atr", entry * 0.002)
-
         pos["entry_candle"] = pos.get("entry_candle", 0) + 1
-
-        # Force close kalau terlalu lama
         hold_min = (time.time() - pos["open_time"]) / 60
+
+        # Force close
         if hold_min >= MAX_HOLDING_MIN * 0.95:
             close_trade(symbol, f"⏰Force({hold_min:.1f}m)")
             continue
 
-        # Flash crash/pump protection
+        # Flash protection
         if flash_dir == "crash" and side == "LONG":
-            close_trade(symbol, f"⚡Flash-{flash_pct:.1f}%")
-            continue
+            close_trade(symbol, f"⚡Flash-{flash_pct:.1f}%"); continue
         elif flash_dir == "pump" and side == "SHORT":
-            close_trade(symbol, f"⚡Flash+{flash_pct:.1f}%")
-            continue
+            close_trade(symbol, f"⚡Flash+{flash_pct:.1f}%"); continue
 
-        # ── INSTANT CUT — potong kalau minus cepat ──────────
-        within_window = pos.get("entry_candle", 0) <= (INSTANT_CUT_WINDOW * 5)
+        # Instant cut — awal posisi
+        within_window = pos.get("entry_candle", 0) <= (INSTANT_CUT_WINDOW * 6)
         if not pos.get("instant_cut_done") and not pos.get("tp1_hit") and within_window:
             ic = pos["instant_cut"]
-            if side == "LONG" and price <= ic:
+            if (side == "LONG" and price <= ic) or (side == "SHORT" and price >= ic):
                 pos["instant_cut_done"] = True
-                close_trade(symbol, f"⚡InstCut")
+                close_trade(symbol, "⚡InstCut")
                 continue
-            elif side == "SHORT" and price >= ic:
-                pos["instant_cut_done"] = True
-                close_trade(symbol, f"⚡InstCut")
-                continue
-        else:
-            if not within_window:
-                pos["instant_cut_done"] = True
+        elif not within_window:
+            pos["instant_cut_done"] = True
 
         if side == "LONG":
             profit_pct = (price - entry) / entry
 
-            # TP1 check
             if not pos["tp1_hit"] and price >= pos["tp1"]:
                 partial_close_tp1(symbol)
                 continue
 
-            # Update peak dan trailing stop (aktif dari awal di v15)
             if price > pos["peak"]:
                 pos["peak"] = price
-                trail_mult = ATR_TRAIL_TIGHT_MULT if pos["trail_phase"] >= 3 else ATR_TRAIL_MULT
-                new_trail  = price * (1 - atr * trail_mult / price)
+                mult = ATR_TRAIL_TIGHT_MULT if pos["trail_phase"] >= 3 else ATR_TRAIL_MULT
+                new_trail = price - atr * mult
                 pos["trail_sl"] = max(pos["trail_sl"], new_trail)
 
-            # Fase ketat kalau sudah profit cukup
             if profit_pct >= TRAIL_TIGHT_PCT and pos["trail_phase"] < 3:
                 pos["trail_phase"] = 3
 
-            # Breakeven setelah TP1
-            if pos.get("be_active") and price > pos["entry"]:
+            if pos.get("be_active"):
                 be_floor = pos["entry"] * (1 + TRAIL_BE_PCT)
                 pos["trail_sl"] = max(pos["trail_sl"], be_floor)
 
-            # TP2
             if pos["tp1_hit"] and price >= pos["tp2"]:
-                close_trade(symbol, "✨TP2")
-                continue
+                close_trade(symbol, "✨TP2"); continue
 
-            # Trail stop
             if price <= pos["trail_sl"]:
                 tag = "🔒TrailBE" if pos.get("be_active") else "🔄Trail"
-                close_trade(symbol, tag)
-                continue
+                close_trade(symbol, tag); continue
 
-            # Hard SL (fallback)
             if price <= pos["sl"]:
-                close_trade(symbol, "🛑SL")
-                continue
+                close_trade(symbol, "🛑SL"); continue
 
-            pnl   = (price - entry) * pos.get("qty_remain", pos["qty"])
-            phase = pos.get("trail_phase", 1)
-            tp_tag = f"TP2:{pos['tp2']:.5g}" if pos["tp1_hit"] else f"TP1:{pos['tp1']:.5g}"
-            print(f"  📌 [{symbol}] L@{entry:.5g}→{price:.5g} ({profit_pct*100:+.2f}%) | {pnl:+.3f}U | {hold_min:.1f}m | TSL-P{phase}:{pos['trail_sl']:.5g} {tp_tag}")
+            pnl = (price - entry) * pos.get("qty_remain", pos["qty"])
+            tp_tag = f"TP2:{pos['tp2']:.6g}" if pos["tp1_hit"] else f"TP1:{pos['tp1']:.6g}"
+            safe_print(
+                f"  📌 [{symbol}] L@{entry:.6g}→{price:.6g} "
+                f"({profit_pct*100:+.2f}%) {pnl:+.3f}U "
+                f"{hold_min:.1f}m P{pos['trail_phase']} TSL:{pos['trail_sl']:.6g} {tp_tag}"
+            )
 
         else:  # SHORT
             profit_pct = (entry - price) / entry
@@ -1660,39 +1610,49 @@ def manage_positions():
 
             if price < pos["peak"]:
                 pos["peak"] = price
-                trail_mult = ATR_TRAIL_TIGHT_MULT if pos["trail_phase"] >= 3 else ATR_TRAIL_MULT
-                new_trail  = price * (1 + atr * trail_mult / price)
+                mult = ATR_TRAIL_TIGHT_MULT if pos["trail_phase"] >= 3 else ATR_TRAIL_MULT
+                new_trail = price + atr * mult
                 pos["trail_sl"] = min(pos["trail_sl"], new_trail)
 
             if profit_pct >= TRAIL_TIGHT_PCT and pos["trail_phase"] < 3:
                 pos["trail_phase"] = 3
 
-            if pos.get("be_active") and price < pos["entry"]:
+            if pos.get("be_active"):
                 be_ceil = pos["entry"] * (1 - TRAIL_BE_PCT)
                 pos["trail_sl"] = min(pos["trail_sl"], be_ceil)
 
             if pos["tp1_hit"] and price <= pos["tp2"]:
-                close_trade(symbol, "✨TP2")
-                continue
+                close_trade(symbol, "✨TP2"); continue
 
             if price >= pos["trail_sl"]:
                 tag = "🔒TrailBE" if pos.get("be_active") else "🔄Trail"
-                close_trade(symbol, tag)
-                continue
+                close_trade(symbol, tag); continue
 
             if price >= pos["sl"]:
-                close_trade(symbol, "🛑SL")
-                continue
+                close_trade(symbol, "🛑SL"); continue
 
-            pnl   = (entry - price) * pos.get("qty_remain", pos["qty"])
-            phase = pos.get("trail_phase", 1)
-            tp_tag = f"TP2:{pos['tp2']:.5g}" if pos["tp1_hit"] else f"TP1:{pos['tp1']:.5g}"
-            print(f"  📌 [{symbol}] S@{entry:.5g}→{price:.5g} ({profit_pct*100:+.2f}%) | {pnl:+.3f}U | {hold_min:.1f}m | TSL-P{phase}:{pos['trail_sl']:.5g} {tp_tag}")
+            pnl = (entry - price) * pos.get("qty_remain", pos["qty"])
+            tp_tag = f"TP2:{pos['tp2']:.6g}" if pos["tp1_hit"] else f"TP1:{pos['tp1']:.6g}"
+            safe_print(
+                f"  📌 [{symbol}] S@{entry:.6g}→{price:.6g} "
+                f"({profit_pct*100:+.2f}%) {pnl:+.3f}U "
+                f"{hold_min:.1f}m P{pos['trail_phase']} TSL:{pos['trail_sl']:.6g} {tp_tag}"
+            )
 
 
-# ════════════════════════════════════════════════════
-#  PERFORMANCE
-# ════════════════════════════════════════════════════
+def position_monitor_thread():
+    while True:
+        try:
+            if open_positions:
+                manage_positions()
+        except Exception as e:
+            safe_print(f"  ❌ Monitor err: {e}")
+        time.sleep(POSITION_MONITOR_SEC)
+
+
+# ════════════════════════════════════════════════════════
+#  STATS
+# ════════════════════════════════════════════════════════
 def calc_expectancy():
     wins   = [t["pnl"] for t in trade_log if t["pnl"] > 0]
     losses = [t["pnl"] for t in trade_log if t["pnl"] < 0]
@@ -1703,135 +1663,86 @@ def calc_expectancy():
     avg_l = abs(sum(losses) / len(losses)) if losses else 0
     return round((wr * avg_w) - ((1 - wr) * avg_l), 5)
 
+
 def calc_sharpe():
     pnls = list(_stats["pnl_history"])
     if len(pnls) < 5:
         return 0.0
-    arr  = np.array(pnls)
-    std  = float(np.std(arr))
-    if std == 0:
-        return 0.0
-    return round(float(np.mean(arr)) / std, 3)
+    arr = np.array(pnls)
+    std = float(np.std(arr))
+    return round(float(np.mean(arr)) / std, 3) if std else 0.0
 
-def calc_max_drawdown():
-    pnls = list(_stats["pnl_history"])
-    if len(pnls) < 2:
-        return 0.0
-    equity = np.cumsum(pnls)
-    peak   = np.maximum.accumulate(equity)
-    return round(float(np.min(equity - peak)), 4)
-
-def print_stats_inline():
-    n   = _stats["wins"] + _stats["losses"]
-    wr  = _stats["wins"] / n * 100 if n else 0
-    pnl = _stats["total_pnl"]
-    exp = calc_expectancy()
-    bar = ("█" * _stats["wins"] + "░" * _stats["losses"])[-20:]
-    emoji = "💚" if pnl >= 0 else "🔴"
-    paper_tag = "[PAPER]" if PAPER_TRADING else "[LIVE]"
-    print(f"     ┌─ 📊 {paper_tag} {n}T | WR:{wr:.0f}% | {emoji}PnL:{pnl:+.4f}U | Exp:{exp:+.4f}U")
-    print(f"     └─ TP1:{_stats['tp1_hits']} TP2:{_stats['tp2_hits']} SL:{_stats['sl_hits']} ⚡Cut:{_stats['instant_cuts']} [{bar}]")
 
 def print_stats():
     n    = _stats["wins"] + _stats["losses"]
     wr   = _stats["wins"] / n * 100 if n else 0
-    sess = (time.time() - _stats["session_start"]) / 3600
+    sess = (time.time() - _stats["session_start"]) / 60
     pnl  = _stats["total_pnl"]
     emoji = "💚" if pnl >= 0 else "🔴"
     exp  = calc_expectancy()
     sr   = calc_sharpe()
-    mdd  = calc_max_drawdown()
     ks   = _kill_switch
-    paper_tag = "📋 PAPER TRADING MODE" if PAPER_TRADING else "🔴 LIVE TRADING MODE"
-    paper_bal = f" | Virtual balance: ${_paper['balance']:.2f}" if PAPER_TRADING else ""
+    bal  = f" | Bal:${_paper['balance']:.2f}" if PAPER_TRADING else ""
 
-    print(f"\n  {'─'*66}")
-    print(f"  {paper_tag}{paper_bal}")
-    print(f"  📊 SESSION {sess*60:.0f}m | AI scans:{_stats['ai_scans']} | Rescans:{_stats['rescans']}")
-    print(f"  🎯 {n} trades | WR:{wr:.0f}% | W:{_stats['wins']} L:{_stats['losses']}")
-    print(f"  {emoji} Total P&L:  {pnl:+.4f} USDT (simulated)")
-    print(f"  📐 Expectancy:{exp:+.5f}U | Sharpe:{sr:.2f} | MaxDD:{mdd:.4f}U")
-    print(f"  📈 Best:{_stats['best_trade']:+.4f}U | 📉 Worst:{_stats['worst_trade']:+.4f}U")
-    print(f"  🎯TP1:{_stats['tp1_hits']} | ✨TP2:{_stats['tp2_hits']} | 🛑SL:{_stats['sl_hits']} | ⚡Cut:{_stats['instant_cuts']} | ⏰Force:{_stats['force_closes']}")
-    print(f"  🚫 Skip: Chop:{_stats['skipped_chop']} NoMom:{_stats['skipped_no_momentum']} Spread:{_stats['skipped_spread']}")
-    print(f"  🛡️  KS: {'ACTIVE('+ks['reason']+')' if ks['active'] else 'OK'} | CL:{ks['consec_losses']} | DailyPnL:{ks['daily_pnl']:+.2f}U | Lag:{ks['api_lag']*1000:.0f}ms")
-    print(f"  🤖 Groq AI picks ({len(_ai_picks)}): {', '.join([p['symbol'] for p in _ai_picks[:5]])}")
-    sym_sorted = sorted(_perf.items(), key=lambda x: x[1]["pnl"], reverse=True)
-    if sym_sorted:
-        print(f"  🏆 Top coins:")
-        for sym, data in sym_sorted[:5]:
-            wr_s = data["wins"] / data["trades"] * 100 if data["trades"] else 0
-            print(f"     {sym:<16} {data['trades']}T WR:{wr_s:.0f}% PnL:{data['pnl']:+.4f}U")
-    if trade_log:
-        print(f"  📋 Last 5 trades:")
-        for t in trade_log[-5:]:
-            e    = "🟢" if t["pnl"] > 0 else "🔴"
-            secs = t.get("hold_sec", 0)
-            hold = f"{secs//60}m{secs%60}s"
-            print(f"     {e} {t['symbol']:<16} {t['side']} {t['pnl']:+.4f}U ({hold}) — {t['reason'][:25]}")
-    print(f"  {'─'*66}")
-
-
-# ════════════════════════════════════════════════════
-#  POSITION MONITOR THREAD
-# ════════════════════════════════════════════════════
-def position_monitor_thread():
-    while True:
-        try:
-            if open_positions:
-                manage_positions()
-        except Exception as e:
-            print(f"  ❌ Monitor error: {e}")
-        time.sleep(POSITION_MONITOR_SEC)
+    with _print_lock:
+        print(f"\n  {'─'*64}")
+        print(f"  📋 PAPER TRADING{bal}")
+        print(f"  ⏱  {sess:.0f}m | Trades:{n} WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
+        print(f"  {emoji} PnL:{pnl:+.4f}U | Exp:{exp:+.5f}U | Sharpe:{sr:.2f}")
+        print(f"  🎯TP1:{_stats['tp1_hits']} ✨TP2:{_stats['tp2_hits']} "
+              f"🛑SL:{_stats['sl_hits']} ⚡Cut:{_stats['instant_cuts']} ⏰Force:{_stats['force_closes']}")
+        print(f"  🚫 Chop:{_stats['skipped_chop']} NoMom:{_stats['skipped_no_momentum']} "
+              f"Spread:{_stats['skipped_spread']}")
+        print(f"  🤖 AI picks: {', '.join([p['symbol'] for p in _ai_picks[:5]])}")
+        print(f"  🛡  KS:{ks['consec_losses']}CL DailyPnL:{ks['daily_pnl']:+.2f}U Lag:{ks['api_lag']*1000:.0f}ms")
+        sym_sorted = sorted(_perf.items(), key=lambda x: x[1]["pnl"], reverse=True)
+        if sym_sorted:
+            print(f"  🏆 Top:")
+            for sym, d in sym_sorted[:5]:
+                w = d["wins"]/d["trades"]*100 if d["trades"] else 0
+                print(f"     {sym:<16} {d['trades']}T WR:{w:.0f}% PnL:{d['pnl']:+.4f}U")
+        if trade_log:
+            print(f"  📋 Last 5:")
+            for t in trade_log[-5:]:
+                e = "🟢" if t["pnl"] > 0 else "🔴"
+                s = t.get("hold_sec", 0)
+                print(f"     {e} {t['symbol']:<16} {t['side']} {t['pnl']:+.4f}U "
+                      f"({s//60}m{s%60}s) — {t['reason'][:20]}")
+        print(f"  {'─'*64}\n")
 
 
-# ════════════════════════════════════════════════════
-#  MAIN LOOP — v15 AI MOMENTUM ENGINE
-# ════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+#  MAIN LOOP v16
+# ════════════════════════════════════════════════════════
 def run_bot():
-    paper_tag = "📋 PAPER/BACKTEST MODE" if PAPER_TRADING else "🔴 LIVE TRADING"
-    print("╔══════════════════════════════════════════════════════════════════╗")
-    print("║  🤖 BOT SCALPING v15 — AI MOMENTUM ENGINE                       ║")
-    print("╠══════════════════════════════════════════════════════════════════╣")
-    print(f"║  {paper_tag:<60}  ║")
-    print(f"║  Leverage:{LEVERAGE}x │ Per trade:${ORDER_USDT} │ Max posisi:{MAX_POSITIONS}                    ║")
-    print(f"║  SL: ATR×{ATR_SL_MULT} │ TP1: ATR×{ATR_TP1_MULT} │ TP2: ATR×{ATR_TP2_MULT}            ║")
-    print(f"║  Trail: INSTANT (aktif dari entry, bukan delayed)            ║")
-    print(f"║  InstantCut: ATR×{INSTANT_CUT_MULT} dalam {INSTANT_CUT_WINDOW} candle pertama               ║")
-    print(f"║  🤖 Groq AI Scanner (GRATIS): {'AKTIF ✅' if GROQ_API_KEY else 'OFF — set GROQ_API_KEY di .env'}        ║")
-    print(f"║  Always fill {MAX_POSITIONS} slots: {'AKTIF' if ALWAYS_FILL_SLOTS else 'OFF'}                                    ║")
-    print("╚══════════════════════════════════════════════════════════════════╝")
+    with _print_lock:
+        print("╔══════════════════════════════════════════════════════════════╗")
+        print("║  🤖 BOT SCALPING v16 — AI MOMENTUM ENGINE                   ║")
+        print("╠══════════════════════════════════════════════════════════════╣")
+        print("║  📋 PAPER/BACKTEST MODE (USDT pairs only, no USDC)          ║")
+        print(f"║  Leverage:{LEVERAGE}x  PerTrade:${ORDER_USDT}  MaxPos:{MAX_POSITIONS}  Hold:{MAX_HOLDING_MIN}m           ║")
+        print(f"║  KillSwitch: {CONSEC_LOSS_MAX}CL / ${abs(DAILY_LOSS_LIMIT)} daily loss / pause {CONSEC_LOSS_PAUSE_MIN}m        ║")
+        print(f"║  Groq AI: {'AKTIF ✅' if GROQ_API_KEY else 'OFF (set GROQ_API_KEY)'}                              ║")
+        print("╚══════════════════════════════════════════════════════════════╝\n")
 
-    if PAPER_TRADING:
-        print(f"\n  ⚠️  PAPER TRADING MODE AKTIF")
-        print(f"  ✅  Semua order hanya di-log, TIDAK masuk ke Binance")
-        print(f"  ✅  Data market real-time dari Binance (read-only)")
-        print(f"  ✅  Log tersimpan di: {PAPER_LOG_FILE}")
-        print(f"  ℹ️  Untuk live trading: set PAPER_TRADING = False\n")
-
-    print("  ⏳ Validasi symbols...")
+    safe_print("  ⏳ Validasi symbols (USDT only)...")
     symbols_active = validate_symbols()
-    print(f"  📊 {len(symbols_active)} symbols aktif")
+    safe_print(f"  📊 {len(symbols_active)} symbols aktif")
 
-    print(f"  📦 Pre-load symbol info...")
+    safe_print("  📦 Pre-load sym info...")
     with ThreadPoolExecutor(max_workers=15) as ex:
         list(ex.map(get_sym_info, symbols_active[:80]))
 
-    print(f"  🌐 Refresh macro...")
+    safe_print("  🌐 Refresh macro...")
     refresh_macro()
     update_btc_price()
-
-    print(f"\n  ✅ BTC:{_macro['btc_trend_5m']} | Mode:{_macro['scalp_mode']} | F&G:{_macro['fng']}")
-    print(f"  🚀 Start dalam 3 detik...\n")
+    safe_print(f"  ✅ BTC:{_macro['btc_trend_5m']} Mode:{_macro['scalp_mode']} F&G:{_macro['fng']}")
+    safe_print("  🚀 Start dalam 3s...\n")
     time.sleep(3)
 
-    pm_thread = threading.Thread(target=position_monitor_thread, daemon=True)
-    pm_thread.start()
-    print("  🔧 Position monitor: START ✅")
-
-    rs_thread = threading.Thread(target=instant_rescan_worker, args=(symbols_active,), daemon=True)
-    rs_thread.start()
-    print("  🔧 Re-scan thread: START ✅\n")
+    threading.Thread(target=position_monitor_thread, daemon=True).start()
+    threading.Thread(target=instant_rescan_worker, args=(symbols_active,), daemon=True).start()
+    safe_print("  🔧 Monitor + Rescan threads: START ✅\n")
 
     global _scan_batch_idx, _ai_cycle_counter
     cycle         = 0
@@ -1846,103 +1757,100 @@ def run_bot():
         if cycle % 30 == 0:
             check_api_latency()
 
-        # ── AI SCAN — tanya Claude tiap N cycle ─────────────
+        # Groq AI scan tiap N cycle
         if _ai_cycle_counter >= AI_SCAN_INTERVAL and GROQ_API_KEY:
             _ai_cycle_counter = 0
             tickers = fetch_ticker24h_all()
             threading.Thread(
-                target=ask_groq_for_best_coins,
-                args=(tickers, _macro),
-                daemon=True
+                target=ask_groq_for_best_coins, args=(tickers, _macro), daemon=True
             ).start()
 
         flash_dir, flash_pct = detect_flash_move()
-        flash_info = f"⚡{flash_dir.upper()}:{flash_pct:.1f}%" if flash_dir != "none" else ""
+        flash_str = f"⚡{flash_dir.upper()}:{flash_pct:.1f}%" if flash_dir != "none" else ""
 
-        utc_h    = time.gmtime().tm_hour
-        sess_tag = f"⚠️ JAM_JELEK" if utc_h in BAD_HOURS_UTC else ""
-        paper_b  = f"${_paper['balance']:.0f}" if PAPER_TRADING else ""
+        utc_h  = time.gmtime().tm_hour
+        bad_h  = "⚠️BAD_HR" if utc_h in BAD_HOURS_UTC else ""
+        bal_s  = f"${_paper['balance']:.0f}" if PAPER_TRADING else ""
 
-        print(f"\n{'═'*69}")
-        print(f"  🔄 #{cycle} {time.strftime('%H:%M:%S')} | F&G:{_macro['fng']} | "
-              f"BTC:{_macro['btc_trend_5m']} {flash_info} {sess_tag} {paper_b}")
-        print(f"  Mode:{_macro['scalp_mode']} | Breadth:{_macro['market_breadth']*100:.0f}% | "
-              f"Posisi({len(open_positions)}/{MAX_POSITIONS}): "
-              f"{list(open_positions.keys()) or '—'}")
-        if _ai_picks:
-            ai_display = [(p["symbol"], p.get("direction","?")) for p in _ai_picks[:5]]
-            ai_str     = " | ".join(f"{s}({d})" for s, d in ai_display)
-            print(f"  🤖 AI picks: {ai_str}")
+        pos_list = list(open_positions.keys())
+        with _print_lock:
+            print(f"\n{'═'*65}")
+            print(f"  #{cycle} {time.strftime('%H:%M:%S')} | F&G:{_macro['fng']} "
+                  f"BTC:{_macro['btc_trend_5m']} {flash_str} {bad_h} {bal_s}")
+            print(f"  Mode:{_macro['scalp_mode']} Breadth:{_macro['market_breadth']*100:.0f}% "
+                  f"Pos({len(pos_list)}/{MAX_POSITIONS}): {pos_list or '—'}")
+            if _ai_picks:
+                ai_str = " | ".join(f"{p['symbol']}({p.get('direction','?')})" for p in _ai_picks[:5])
+                print(f"  🤖 {ai_str}")
 
         slots_free = MAX_POSITIONS - len(open_positions)
         ks_active, ks_reason = check_kill_switch()
 
         if ks_active:
             resume_in = max(0, _kill_switch["resume_time"] - time.time())
-            print(f"  🚨 KILL SWITCH: {ks_reason} | Resume: {resume_in/60:.1f}m")
+            safe_print(f"  🚨 KS: {ks_reason} Resume:{resume_in/60:.1f}m")
 
         skip_reason = None
-        if _macro["news"] == "strong_negative":
-            skip_reason = "bad_news"
-        elif flash_dir != "none":
-            skip_reason = f"flash_{flash_dir}"
-        elif ks_active:
-            skip_reason = f"kill:{ks_reason}"
+        if _macro["news"] == "strong_negative": skip_reason = "bad_news"
+        elif flash_dir != "none":               skip_reason = f"flash_{flash_dir}"
+        elif ks_active:                         skip_reason = f"kill:{ks_reason}"
 
         if slots_free > 0 and not skip_reason:
-            # Gabung AI picks + top movers + regular batch
-            ai_syms   = [p["symbol"] for p in _ai_picks if p["symbol"] not in open_positions
-                         and p["symbol"] in set(symbols_active)][:15]
+            active_set = set(symbols_active)
+            ai_syms   = [p["symbol"] for p in _ai_picks
+                         if p["symbol"] not in open_positions and p["symbol"] in active_set][:15]
             top_mv    = get_top_movers(symbols_active, n=40)
-            top_syms  = [s for s, _, _ in top_mv if s not in open_positions and s not in ai_syms]
+            top_syms  = [s for s, _, _ in top_mv
+                         if s not in open_positions and s not in ai_syms][:20]
 
-            batch_start   = _scan_batch_idx * BATCH_SIZE
-            batch_regular = [s for s in symbols_active[batch_start:batch_start + BATCH_SIZE]
-                             if s not in open_positions and s not in ai_syms and s not in top_syms]
+            batch_start = _scan_batch_idx * BATCH_SIZE
+            reg_syms    = [s for s in symbols_active[batch_start:batch_start + BATCH_SIZE]
+                           if s not in open_positions and s not in ai_syms and s not in top_syms]
             _scan_batch_idx = (_scan_batch_idx + 1) % total_batches
 
-            scan_list = ai_syms + top_syms[:15] + batch_regular[:10]
+            scan_list = ai_syms + top_syms[:12] + reg_syms[:10]
 
-            top_display = [(s, pct) for s, pct, _ in top_mv[:5]]
-            top_str     = " | ".join(f"{s}({pct:+.1f}%)" for s, pct in top_display)
-            print(f"  📊 TopMovers: {top_str}")
-            print(f"  🔍 Scan {len(scan_list)} syms | AI:{len(ai_syms)} Movers:{len(top_syms[:15])} Regular:{len(batch_regular[:10])}")
+            top_str = " | ".join(f"{s}({p:+.1f}%)" for s, p, _ in top_mv[:5])
+            with _print_lock:
+                print(f"  📊 Top:{top_str}")
+                print(f"  🔍 {len(scan_list)} syms | AI:{len(ai_syms)} Movers:{len(top_syms[:12])} Reg:{len(reg_syms[:10])}")
 
             try:
                 candidates = scan_batch_parallel(scan_list)
             except Exception as e:
-                print(f"  ❌ Scan error: {e}")
+                safe_print(f"  ❌ Scan err: {e}")
                 candidates = []
 
             if candidates:
                 candidates.sort(key=lambda x: x[2].get("score", 0), reverse=True)
-                print(f"  🎯 {len(candidates)} setup! Ambil top {min(len(candidates), slots_free)}")
+                safe_print(f"  🎯 {len(candidates)} setup!")
                 for sym, direction, info in candidates[:slots_free]:
                     if len(open_positions) >= MAX_POSITIONS:
                         break
-                    ai_tag = "🤖" if info.get("ai_hint") else ""
+                    ai_tag  = "🤖" if info.get("ai_hint") else ""
                     sig_str = " | ".join(info.get("signals", [])[:3])
-                    print(f"     ⭐ {ai_tag}{sym} {direction} Mom:{info.get('mom_pct',0)*100:+.2f}% Score:{info['score']:.0f}")
-                    print(f"        {sig_str}")
+                    safe_print(f"     ⭐{ai_tag}{sym} {direction} "
+                               f"Mom:{info.get('mom_pct',0)*100:+.2f}% Score:{info['score']:.0f} — {sig_str}")
                     open_trade(sym, direction, info)
             else:
-                print(f"  ⏳ No setup")
+                safe_print("  ⏳ No setup")
 
-            # Always fill: kalau masih ada slot kosong, trigger rescan segera
             if ALWAYS_FILL_SLOTS and len(open_positions) < MAX_POSITIONS:
-                trigger_rescan("always_fill", priority_symbol=None)
+                trigger_rescan("always_fill")
         else:
             if skip_reason:
-                print(f"  ⏸️  Skip: {skip_reason}")
-            elif slots_free == 0:
-                print(f"  ✅ Semua {MAX_POSITIONS} slot penuh")
+                safe_print(f"  ⏸️  Skip: {skip_reason}")
+            else:
+                safe_print(f"  ✅ {MAX_POSITIONS} slot penuh")
 
-        if cycle % 20 == 0:
+        if cycle % 15 == 0:
             print_stats()
 
         ks = _kill_switch
-        print(f"  ⏱️  Next:{SCAN_INTERVAL}s | KS:{ks['consec_losses']}CL/{ks['daily_pnl']:+.2f}U | "
-              f"AI:{len(_ai_picks)}picks | Rescans:{_stats['rescans']}")
+        safe_print(
+            f"  ⏱  Next:{SCAN_INTERVAL}s | KS:{ks['consec_losses']}CL/{ks['daily_pnl']:+.2f}U "
+            f"| AI:{len(_ai_picks)}picks | Rescans:{_stats['rescans']}"
+        )
         time.sleep(SCAN_INTERVAL)
 
 
