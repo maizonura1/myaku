@@ -1,65 +1,44 @@
 """
-Bot Scalping v15.2 — PAPER TRADING + SMART COIN SELECTOR
-=========================================================
+Bot Scalping v15.3 — SMART HOLD/CUT ENGINE
+============================================
 
-PATCH v15.2 — Fix hasil awal (0% WR, force close dominan)
-──────────────────────────────────────────────────────────
-✅ CANDLE AGE filter dilonggarkan: 75% → 90%
-   (409 skip dalam 9 menit = terlalu agresif, banyak setup valid yang dibuang)
+ROOT CAUSE dari masalah v15.2 (WR 20%, semua SHORT loss):
+───────────────────────────────────────────────────────────
+❌ MEAN_REV SHORT terlalu longgar — BTC MILD_BEAR + Breadth 30%
+   sudah cukup untuk allow SHORT. Padahal MILD ≠ BEAR.
+   → Fix: SHORT di MEAN_REV hanya kalau BTC 5m = "BEAR" (bukan MILD)
+     DAN 15m BEAR DAN breadth < 25% DAN 1h BEAR. Semua harus agree.
 
-✅ MAX_HOLDING_MIN: 5 → 8 menit
-   Kasih napas lebih ke posisi, terutama di market yang slow
+❌ SmartCut terlalu agresif — cut di 3m45s (time_ratio > 0.4)
+   Posisi baru buka belum sempat bergerak sudah di-cut.
+   → Fix: SmartCut hanya kalau time_ratio > 0.65 DAN loss > 0.2%
+     DAN sudah 60% jalan ke SL DAN semua 3 momentum sinyal melawan.
 
-✅ ORDER_USDT: $2 → $1 per trade
-   NEARUSDT -0.59U dari 1 trade = catastrophic. Dengan $1, worst case -0.30U
+❌ _get_live_momentum hanya 2 sinyal (EMA + satu candle) — sangat
+   noise. Satu candle bear bisa trigger -2 dan SmartCut.
+   → Fix: 3 sinyal independen (EMA9>21, price vs EMA9, 3 candle trend).
+     Score -2 hanya kalau KETIGA sinyal melawan.
 
-✅ ATR_SL_MULT: 1.2 → 1.0 (SL lebih ketat, cut lebih awal kalau salah arah)
-   MAX_SL_PCT: 0.55% → 0.45% (hard cap SL lebih kecil)
+❌ TrailStop kena di +0.00% (SUSHIUSDT) — trail aktif di 0.15%
+   dengan ATR×0.7 langsung jadi TSL terlalu dekat dari harga.
+   → Fix: Initial trail SL pakai ATR×1.05 (1.5× lebih lebar).
+     Baru ketat saat harga bergerak lebih jauh.
 
-✅ BEAR MARKET AWARE — kalau BTC BEAR + Breadth < 30%:
-   - LONG dilarang keras (bukan cuma skip kalau BTC_5m+15m keduanya BEAR)
-   - SHORT diberi bonus score +10
-   - MIN_SCORE diturunkan ke 44 untuk SHORT (lebih mudah masuk SHORT)
+❌ Kill switch 4 loss = 30 menit pause — terlalu sensitif di awal sesi.
+   → Fix: kembali ke 5 loss, pause 20 menit (bukan 30).
 
-✅ MEAN_REV mode tidak lagi block semua entry:
-   Di MEAN_REV, SHORT tetap diizinkan kalau BTC BEAR
-   (sebelumnya MEAN_REV = skip semua, padahal SHORT di bear market valid)
+❌ BEAR market detection pakai MILD_BEAR — terlalu broad.
+   Breadth 30% + BTC MILD_BEAR bukan "bear market yang clear".
+   → Fix: is_strong_bear = BTC 5m BEAR + 15m BEAR + 1h BEAR + breadth < 25%
 
-✅ CONSEC_LOSS_MAX: 5 → 4 (lebih cepat pause kalau beruntun loss)
-   DAILY_LOSS_LIMIT: -5.0 → -3.0 (lebih konservatif untuk paper test)
-
-PERUBAHAN DARI v14
-─────────────────────────────────────────────────────────
-✅ PAPER TRADING MODE — tidak ada order beneran ke Binance
-   Semua eksekusi hanya di log/state internal (dry run)
-   Cocok untuk backtest paralel tanpa ganggu akun demo
-
-✅ SMART COIN SELECTOR — sistem rangking coin lebih cerdas:
-   • Performance memory: prefer coin yang WR-nya tinggi di sesi ini
-   • Multi-timeframe alignment score (1m+5m+15m harus agree)
-   • Volume quality: volume nyata, bukan noise (tbbase/tbquote ratio)
-   • Trend strength score dari ADX (lebih kuat = lebih prioritas)
-   • Volatility sweet spot: tidak terlalu volatile (jelek), tidak flat
-   • Funding rate alignment: hindari coin dengan funding melawan arah
-   • 24h momentum alignment: coin yang trennya sudah terbentuk dari awal hari
-
-✅ FORCE CLOSE FIX — bukan soal filter, tapi timing entry:
-   • Entry hanya di awal candle baru (bukan di tengah)
-   • Tambah "candle age check" — skip kalau candle sudah > 80% habis
-   • MAX_HOLDING ditentukan per-coin berdasarkan volatility
-
-✅ TRAIL STOP LEBIH AGRESIF PROTECT PROFIT:
-   • Trail aktif lebih cepat (0.15% bukan 0.20%)
-   • Phase 3 lebih cepat (0.30% bukan 0.40%)
-   • TP2 lebih realistis (ATR×2.5 bukan 3.5)
-
-✅ COIN BLACKLIST/WHITELIST otomatis per sesi:
-   • Coin dengan 3+ SL beruntun masuk blacklist sementara
-   • Coin dengan 2+ TP beruntun masuk prioritas
-
-PATCH v15.1 — Stabilitas
-─────────────────────────
-✅ Sama seperti v14.1 (max_workers=15, batch=15, timeout graceful)
+PERUBAHAN TEKNIS v15.3
+───────────────────────
+✅ MEAN_REV: hanya allow SHORT kalau is_strong_bear (semua 4 kondisi)
+✅ SmartCut: 5 syarat ketat (bukan 3), time_ratio 0.65 (bukan 0.40)
+✅ Momentum check: 3-sinyal voting (butuh semua 3 untuk score ±2)
+✅ Trail activation: initial width ATR×1.05 (bukan ATR×0.7)
+✅ CONSEC_LOSS_MAX: 5 (kembali dari 4), pause 20m (bukan 30m)
+✅ BTC alignment filter: hanya block kalau "BEAR" eksplisit, bukan "MILD_BEAR"
 """
 
 import os, time, math, json, threading, queue
@@ -179,9 +158,9 @@ BAD_HOURS_UTC         = {4, 5, 6}
 BAD_HOURS_MIN_SCORE   = 62
 
 # ── KILL SWITCH ───────────────────────────────────────────
-DAILY_LOSS_LIMIT      = -3.0         # v15.2: -5→-3, lebih konservatif
-CONSEC_LOSS_MAX       = 4            # v15.2: 5→4, lebih cepat pause
-CONSEC_LOSS_PAUSE_MIN = 30
+DAILY_LOSS_LIMIT      = -3.0
+CONSEC_LOSS_MAX       = 5            # v15.3: balik ke 5, jangan terlalu sensitif
+CONSEC_LOSS_PAUSE_MIN = 20           # v15.3: turun dari 30 → 20 menit pause
 MAX_API_LAG_SEC       = 3.0
 
 # ── CACHE TTL ─────────────────────────────────────────────
@@ -1432,37 +1411,44 @@ def should_enter(symbol):
     breadth     = _macro.get("market_breadth", 0.5)
     btc_5m      = _macro["btc_trend_5m"]
     btc_15m     = _macro["btc_trend_15m"]
-    is_bear_mkt = (breadth < BEAR_MARKET_BREADTH and btc_5m in BEAR_TRENDS)
+    btc_1h      = _macro.get("btc_trend_1h", "UNKNOWN")
 
-    # MEAN_REV: SHORT boleh kalau BTC bearish, LONG selalu skip
+    # Bear market = BTC BEAR (bukan MILD_BEAR) DAN breadth < 25% DAN 1h juga bear
+    is_strong_bear = (btc_5m == "BEAR" and btc_15m in BEAR_TRENDS
+                      and breadth < 0.25 and btc_1h in BEAR_TRENDS)
+
+    # MEAN_REV: skip semua entry kecuali SHORT di strong bear market yang confirmed
     if scalp_mode == "MEAN_REV":
         if direction == "LONG":
             _stats["skipped_mean_rev"] += 1
             return None, "skip_MEAN_REV_LONG"
-        if direction == "SHORT" and btc_5m not in BEAR_TRENDS:
-            _stats["skipped_mean_rev"] += 1
-            return None, f"skip_MEAN_REV_SHORT(BTC={btc_5m})"
+        if direction == "SHORT":
+            # Untuk SHORT di MEAN_REV, butuh strong bear + BTC 5m harus BEAR (bukan MILD)
+            if not is_strong_bear:
+                _stats["skipped_mean_rev"] += 1
+                return None, f"skip_MEAN_REV_SHORT(bear={is_strong_bear},BTC5m={btc_5m})"
 
-    # Bear market: block LONG kalau breadth sangat rendah + BTC bear
-    if BEAR_BLOCK_LONG and is_bear_mkt and direction == "LONG":
+    # Bear market: block LONG kalau kondisi benar-benar bearish
+    # Pakai is_strong_bear (bukan MILD_BEAR + breadth 30%)
+    if BEAR_BLOCK_LONG and is_strong_bear and direction == "LONG":
         return None, f"bear_mkt_block_LONG(breadth={breadth*100:.0f}%)"
 
-    if direction == "LONG"  and btc_5m in BEAR_TRENDS and btc_15m in BEAR_TRENDS:
+    # BTC alignment check — harus jelas, MILD tidak cukup untuk block
+    if direction == "LONG"  and btc_5m == "BEAR" and btc_15m == "BEAR":
         return None, f"skip_LONG:BTC_{btc_5m}"
-    if direction == "SHORT" and btc_5m in BULL_TRENDS and btc_15m in BULL_TRENDS:
+    if direction == "SHORT" and btc_5m == "BULL" and btc_15m == "BULL":
         return None, f"skip_SHORT:BTC_{btc_5m}"
     if direction == "LONG"  and fng > MAX_FNG_LONG:
         return None, f"overbought:F&G={fng}"
 
     score, sigs = get_entry_score(symbol, df_5m, direction)
 
-    # Bear market: bonus score SHORT, turunkan threshold-nya
-    if is_bear_mkt and direction == "SHORT":
+    # Bear market bonus: hanya kalau benar-benar strong bear, bukan setiap kali breadth < 30%
+    if is_strong_bear and direction == "SHORT":
         score = min(100, score + BEAR_SHORT_SCORE_BONUS)
 
     min_score_now = get_session_min_score()
-    # Kalau bear market + SHORT, pakai threshold lebih rendah
-    if is_bear_mkt and direction == "SHORT":
+    if is_strong_bear and direction == "SHORT":
         min_score_now = min(min_score_now, BEAR_MIN_SCORE_SHORT)
     if score < min_score_now:
         if min_score_now > MIN_SCORE:
@@ -1898,48 +1884,68 @@ def close_trade(symbol, reason=""):
 # ════════════════════════════════════════════════════
 def _get_live_momentum(symbol, side):
     """
-    Cek apakah momentum coin masih searah posisi kita (untuk keputusan hold vs cut).
+    Cek momentum coin dari 1m chart — lebih robust, butuh 3 konfirmasi bukan 1.
     Return: (score -2..+2, description)
-      +2 = momentum kuat searah (HOLD, bahkan extend)
-      +1 = momentum lemah searah (HOLD)
-       0 = momentum netral (HOLD tapi waspada)
-      -1 = momentum berbalik lemah (pertimbangkan cut lebih awal)
-      -2 = momentum berbalik kuat (cut segera)
+      +2 = momentum kuat searah
+      +1 = momentum lemah searah
+       0 = netral / tidak cukup sinyal
+      -1 = mulai berbalik (waspada)
+      -2 = berbalik kuat + confirmed (boleh pertimbangkan cut)
+
+    PENTING: score -2 hanya kalau SEMUA sinyal agree berbalik.
+    Satu candle bearish saja tidak cukup untuk -2.
     """
     try:
-        df = get_ohlcv(symbol, Client.KLINE_INTERVAL_1MINUTE, 15)
-        if df is None or len(df) < 8:
+        df = get_ohlcv(symbol, Client.KLINE_INTERVAL_1MINUTE, 20)
+        if df is None or len(df) < 10:
             return 0, "no_data"
         df = run_ta_lite(df.copy())
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
 
-        score = 0
+        last  = df.iloc[-1]
+        prev  = df.iloc[-2]
+        prev2 = df.iloc[-3]
+
+        votes_for  = 0   # sinyal searah posisi
+        votes_against = 0  # sinyal melawan posisi
         notes = []
 
-        # EMA 1m arah
-        e3  = last.get("ema3",  last["close"])
-        e9  = last.get("ema9",  last["close"])
-        e21 = last.get("ema21", last["close"])
-        p   = last["close"]
+        price = last["close"]
+        e9    = last.get("ema9",  price)
+        e21   = last.get("ema21", price)
 
+        # ── Sinyal 1: EMA9 vs EMA21 alignment ────────────
         if side == "LONG":
-            if p > e3 > e9:   score += 1; notes.append("ema↑")
-            elif p < e9:      score -= 1; notes.append("ema↓")
+            if e9 > e21:    votes_for  += 1; notes.append("ema9>21↑")
+            elif e9 < e21:  votes_against += 1; notes.append("ema9<21↓")
         else:
-            if p < e3 < e9:   score += 1; notes.append("ema↓")
-            elif p > e9:      score -= 1; notes.append("ema↑")
+            if e9 < e21:    votes_for  += 1; notes.append("ema9<21↓")
+            elif e9 > e21:  votes_against += 1; notes.append("ema9>21↑")
 
-        # Candle arah terakhir
-        last_bull = last["close"] > last["open"]
+        # ── Sinyal 2: Price vs EMA9 ───────────────────────
         if side == "LONG":
-            if last_bull:    score += 1; notes.append("bull_candle")
-            else:            score -= 1; notes.append("bear_candle")
+            if price > e9:  votes_for  += 1; notes.append("p>e9")
+            else:           votes_against += 1; notes.append("p<e9")
         else:
-            if not last_bull: score += 1; notes.append("bear_candle")
-            else:             score -= 1; notes.append("bull_candle")
+            if price < e9:  votes_for  += 1; notes.append("p<e9")
+            else:           votes_against += 1; notes.append("p>e9")
 
-        score = max(-2, min(2, score))
+        # ── Sinyal 3: 3 candle trend ──────────────────────
+        last3_bull = [df.iloc[i]["close"] > df.iloc[i]["open"] for i in [-3,-2,-1]]
+        if side == "LONG":
+            if sum(last3_bull) >= 2:  votes_for  += 1; notes.append("3c↑")
+            elif sum(last3_bull) == 0: votes_against += 1; notes.append("3c↓")
+        else:
+            if sum(last3_bull) <= 1:  votes_for  += 1; notes.append("3c↓")
+            elif sum(last3_bull) == 3: votes_against += 1; notes.append("3c↑")
+
+        # Hitung score dari votes
+        net = votes_for - votes_against
+        if net >= 2:   score = 2
+        elif net == 1: score = 1
+        elif net == 0: score = 0
+        elif net == -1: score = -1
+        else:          score = -2   # semua 3 sinyal melawan
+
         return score, "|".join(notes)
     except:
         return 0, "err"
@@ -1947,31 +1953,32 @@ def _get_live_momentum(symbol, side):
 
 def calc_dynamic_hold_min(pos):
     """
-    Hitung max holding time secara dinamis berdasarkan kondisi posisi.
-    - Posisi rugi: hold lebih pendek (cut lebih cepat)
-    - Posisi profit tp1 sudah hit: hold lebih panjang (beri kesempatan TP2)
-    - Momentum kuat: hold lebih panjang
+    Hitung max holding time secara dinamis.
+    
+    Prinsip: jangan potong posisi terlalu cepat.
+    - Default 8 menit untuk semua skenario
+    - TP1 sudah hit → extend ke 12 menit untuk kejar TP2
+    - Rugi besar (> 0.5%) dan momentum confirmed berbalik → bisa cut di 6 menit
+    - Profit kecil tapi jalan → extend sedikit
+    
+    TIDAK mempersingkat hold hanya karena rugi < 0.3%: 
+    noise normal dalam 2-3 menit pertama.
     """
-    base = MAX_HOLDING_MIN
+    base  = MAX_HOLDING_MIN
     entry = pos.get("entry", 1)
-    price_snapshot = pos.get("_last_price", entry)
-    side = pos.get("side", "LONG")
+    price = pos.get("_last_price", entry)
+    side  = pos.get("side", "LONG")
 
-    if side == "LONG":
-        profit_pct = (price_snapshot - entry) / entry
-    else:
-        profit_pct = (entry - price_snapshot) / entry
+    profit_pct = (price - entry) / entry if side == "LONG" else (entry - price) / entry
 
     if pos.get("tp1_hit"):
-        return base * 1.5    # Sudah TP1 → beri waktu extra untuk TP2
+        return base * 1.5    # Sudah TP1 → extend untuk kejar TP2
 
-    if profit_pct < -0.003:
-        return base * 0.6    # Rugi > 0.3% → cut lebih cepat
+    if profit_pct < -0.005 and pos.get("_mom_score", 0) <= -2:
+        # Rugi > 0.5% DAN momentum sudah confirmed berbalik semua 3 sinyal
+        return base * 0.75   # Baru boleh cut lebih cepat
 
-    if profit_pct > TRAIL_ACTIVATE_PCT:
-        return base * 1.2    # Profit kecil tapi arah benar → sedikit extra
-
-    return base
+    return base   # Default: pakai base, jangan persingkat tanpa alasan kuat
 
 
 def manage_positions():
@@ -2047,12 +2054,15 @@ def manage_positions():
                 continue
 
             # Trail activation
+            # Initial trail SL pakai 1.5x lebih lebar dari ATR_TRAIL_MULT —
+            # beri ruang napas saat pertama aktif, baru ketatkan saat harga naik
             if not pos["trail_active"] and profit_pct >= TRAIL_ACTIVATE_PCT:
                 pos["trail_active"] = True
                 pos["sl"]       = round(entry * (1 + TRAIL_BE_PCT), 8)
-                pos["trail_sl"] = price * (1 - atr * ATR_TRAIL_MULT / price)
+                init_trail_mult = ATR_TRAIL_MULT * 1.5   # lebar saat pertama aktif
+                pos["trail_sl"] = price * (1 - atr * init_trail_mult / price)
                 pos["peak"]     = price
-                print(f"     🔓 [{symbol}] Trail AKTIF @ {profit_pct*100:+.2f}%")
+                print(f"     🔓 [{symbol}] Trail AKTIF @ {profit_pct*100:+.2f}% (init TSL:{pos['trail_sl']:.5g})")
 
             # Phase 3 tight trail
             if profit_pct >= TRAIL_TIGHT_PCT and pos["trail_phase"] < 3:
@@ -2071,26 +2081,35 @@ def manage_positions():
                 close_trade(symbol, "✨TP2")
                 continue
 
-            # Smart early cut: kalau belum profit + momentum berbalik kuat + sudah > 40% waktu
-            time_ratio = hold_min / max_hold_now
+            # Smart early cut:
+            # Syarat ketat - semua harus terpenuhi sekaligus:
+            # 1. Belum TP1
+            # 2. Rugi lebih dari 50% jarak SL (mendekati SL)
+            # 3. Momentum confirmed berbalik (semua 3 sinyal, score = -2)
+            # 4. Sudah > 65% dari max holding time
+            # Tujuan: cut 1-2 menit lebih awal dari SL, bukan cut di 3 menit
+            time_ratio  = hold_min / max_hold_now
+            sl_dist     = abs(entry - pos["sl"])
+            loss_to_sl  = abs(price - pos["sl"]) / sl_dist if sl_dist > 0 else 1.0
+            # loss_to_sl < 0.5 artinya harga sudah melebihi setengah jarak SL
             if (not pos["tp1_hit"]
-                    and profit_pct < 0
-                    and mom_score <= -2
-                    and time_ratio > 0.4):
-                close_trade(symbol, f"🧠SmartCut(mom={mom_score})")
+                    and profit_pct < -0.002         # Rugi minimal 0.2%
+                    and mom_score == -2             # SEMUA sinyal melawan (bukan -1)
+                    and loss_to_sl < 0.4            # Sudah 60% jalan ke SL
+                    and time_ratio > 0.65):         # Sudah > 65% waktu habis
+                close_trade(symbol, f"🧠SmartCut(loss={profit_pct*100:.2f}%)")
                 continue
 
-            # Smart tighten SL: kalau profit tapi momentum mulai berbalik
+            # Smart tighten trail: hanya kalau sudah dalam profit DAN momentum berbalik confirmed
             if (pos["trail_active"]
-                    and profit_pct > TRAIL_ACTIVATE_PCT
-                    and mom_score <= -1
+                    and profit_pct > TRAIL_ACTIVATE_PCT * 2    # profit minimal 2x threshold
+                    and mom_score == -2                         # bukan -1, harus -2
                     and pos["trail_phase"] < 3):
-                # Paksa masuk phase 3 (trail lebih ketat) kalau momentum berbalik
                 pos["trail_phase"] = 3
                 trail_mult = ATR_TRAIL_TIGHT_MULT
                 new_trail  = price * (1 - atr * trail_mult / price)
                 pos["trail_sl"] = max(pos["trail_sl"], new_trail)
-                print(f"     ⚡ [{symbol}] Trail diperketat karena momentum berbalik ({mom_detail})")
+                print(f"     ⚡ [{symbol}] Trail diperketat ({mom_detail})")
 
             # Trail stop
             if pos["trail_active"] and price <= pos["trail_sl"]:
@@ -2124,13 +2143,14 @@ def manage_positions():
                 partial_close_tp1(symbol)
                 continue
 
-            # Trail activation
+            # Trail activation SHORT — initial lebar, baru ketat saat price turun
             if not pos["trail_active"] and profit_pct >= TRAIL_ACTIVATE_PCT:
                 pos["trail_active"] = True
                 pos["sl"]       = round(entry * (1 - TRAIL_BE_PCT), 8)
-                pos["trail_sl"] = price * (1 + atr * ATR_TRAIL_MULT / price)
+                init_trail_mult = ATR_TRAIL_MULT * 1.5
+                pos["trail_sl"] = price * (1 + atr * init_trail_mult / price)
                 pos["peak"]     = price
-                print(f"     🔓 [{symbol}] Trail AKTIF @ {profit_pct*100:+.2f}%")
+                print(f"     🔓 [{symbol}] Trail AKTIF @ {profit_pct*100:+.2f}% (init TSL:{pos['trail_sl']:.5g})")
 
             # Phase 3
             if profit_pct >= TRAIL_TIGHT_PCT and pos["trail_phase"] < 3:
@@ -2149,19 +2169,22 @@ def manage_positions():
                 close_trade(symbol, "✨TP2")
                 continue
 
-            # Smart early cut
+            # Smart early cut SHORT — syarat sama ketatnya dengan LONG
             time_ratio = hold_min / max_hold_now
+            sl_dist    = abs(pos["sl"] - entry)
+            loss_to_sl = abs(pos["sl"] - price) / sl_dist if sl_dist > 0 else 1.0
             if (not pos["tp1_hit"]
-                    and profit_pct < 0
-                    and mom_score <= -2
-                    and time_ratio > 0.4):
-                close_trade(symbol, f"🧠SmartCut(mom={mom_score})")
+                    and profit_pct < -0.002
+                    and mom_score == -2
+                    and loss_to_sl < 0.4
+                    and time_ratio > 0.65):
+                close_trade(symbol, f"🧠SmartCut(loss={profit_pct*100:.2f}%)")
                 continue
 
-            # Smart tighten trail
+            # Smart tighten trail SHORT
             if (pos["trail_active"]
-                    and profit_pct > TRAIL_ACTIVATE_PCT
-                    and mom_score <= -1
+                    and profit_pct > TRAIL_ACTIVATE_PCT * 2
+                    and mom_score == -2
                     and pos["trail_phase"] < 3):
                 pos["trail_phase"] = 3
                 trail_mult = ATR_TRAIL_TIGHT_MULT
