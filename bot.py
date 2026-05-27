@@ -318,6 +318,7 @@ _stats = {
     "sl_hits": 0,
     "instant_cuts": 0,
     "force_closes": 0,
+    "smart_cuts":   0,
     "rescans": 0,
     "skipped_no_momentum": 0,
     "skipped_chop": 0,
@@ -582,12 +583,12 @@ def calc_coin_priority_score(symbol, base_score, direction, df_5m):
 #  KILL SWITCH ENGINE
 # ════════════════════════════════════════════════════
 def check_kill_switch():
-    ks = _kill_switch
+    ks  = _kill_switch
     now = time.time()
 
     if ks["active"] and now >= ks["resume_time"]:
-        ks["active"] = False
-        ks["reason"] = ""
+        ks["active"]        = False
+        ks["reason"]        = ""
         ks["consec_losses"] = 0
         print(f"\n  ✅ Kill switch CLEARED — bot aktif kembali")
 
@@ -596,19 +597,20 @@ def check_kill_switch():
 
     day_start = now - (now % 86400)
     if day_start > ks["daily_reset_ts"]:
-        ks["daily_pnl"] = 0.0
+        ks["daily_pnl"]      = 0.0
         ks["daily_reset_ts"] = day_start
+        ks["consec_losses"]  = 0   # reset juga saat hari baru
 
     if ks["daily_pnl"] <= DAILY_LOSS_LIMIT:
-        ks["active"] = True
-        ks["reason"] = f"daily_loss({ks['daily_pnl']:.2f}U)"
+        ks["active"]      = True
+        ks["reason"]      = f"daily_loss({ks['daily_pnl']:.2f}U)"
         ks["resume_time"] = day_start + 86400
         print(f"\n  🚨 KILL SWITCH: daily loss limit ({ks['daily_pnl']:.2f}U)")
         return True, ks["reason"]
 
     if ks["consec_losses"] >= CONSEC_LOSS_MAX:
-        ks["active"] = True
-        ks["reason"] = f"consec_loss({ks['consec_losses']})"
+        ks["active"]      = True
+        ks["reason"]      = f"consec_loss({ks['consec_losses']})"
         ks["resume_time"] = now + (CONSEC_LOSS_PAUSE_MIN * 60)
         print(f"\n  🚨 KILL SWITCH: {ks['consec_losses']} loss beruntun — pause {CONSEC_LOSS_PAUSE_MIN}m")
         return True, ks["reason"]
@@ -617,12 +619,19 @@ def check_kill_switch():
 
 
 def update_kill_switch_after_trade(pnl):
+    """
+    Update kill switch setelah trade selesai.
+    Bug fix v15.3: partial TP1 (pnl kecil positif) tidak reset consec_loss —
+    hanya full close yang profit signifikan yang reset.
+    Ini mencegah consec_loss reset karena TP1 partial lalu langsung SL.
+    """
     ks = _kill_switch
     ks["daily_pnl"] += pnl
     if pnl < 0:
         ks["consec_losses"] += 1
-    else:
+    elif pnl > 0.005:          # hanya reset kalau profit meaningful (> $0.005)
         ks["consec_losses"] = 0
+    # kalau pnl antara 0–0.005 (TP1 partial kecil), consec_losses tidak diubah
 
 
 def check_api_latency():
@@ -1419,13 +1428,25 @@ def should_enter(symbol):
     if direction == "SHORT" and funding_bias == "bullish_bias" and fr < -0.001:
         return None, f"funding_bullish({fr*100:.3f}%)"
 
-    scalp_mode = _macro.get("scalp_mode", "TREND")
-    if scalp_mode == "MEAN_REV":
-        _stats["skipped_mean_rev"] += 1
-        return None, f"skip_MEAN_REV(regime)"
+    scalp_mode  = _macro.get("scalp_mode", "TREND")
+    breadth     = _macro.get("market_breadth", 0.5)
+    btc_5m      = _macro["btc_trend_5m"]
+    btc_15m     = _macro["btc_trend_15m"]
+    is_bear_mkt = (breadth < BEAR_MARKET_BREADTH and btc_5m in BEAR_TRENDS)
 
-    btc_5m  = _macro["btc_trend_5m"]
-    btc_15m = _macro["btc_trend_15m"]
+    # MEAN_REV: SHORT boleh kalau BTC bearish, LONG selalu skip
+    if scalp_mode == "MEAN_REV":
+        if direction == "LONG":
+            _stats["skipped_mean_rev"] += 1
+            return None, "skip_MEAN_REV_LONG"
+        if direction == "SHORT" and btc_5m not in BEAR_TRENDS:
+            _stats["skipped_mean_rev"] += 1
+            return None, f"skip_MEAN_REV_SHORT(BTC={btc_5m})"
+
+    # Bear market: block LONG kalau breadth sangat rendah + BTC bear
+    if BEAR_BLOCK_LONG and is_bear_mkt and direction == "LONG":
+        return None, f"bear_mkt_block_LONG(breadth={breadth*100:.0f}%)"
+
     if direction == "LONG"  and btc_5m in BEAR_TRENDS and btc_15m in BEAR_TRENDS:
         return None, f"skip_LONG:BTC_{btc_5m}"
     if direction == "SHORT" and btc_5m in BULL_TRENDS and btc_15m in BULL_TRENDS:
@@ -1435,7 +1456,14 @@ def should_enter(symbol):
 
     score, sigs = get_entry_score(symbol, df_5m, direction)
 
+    # Bear market: bonus score SHORT, turunkan threshold-nya
+    if is_bear_mkt and direction == "SHORT":
+        score = min(100, score + BEAR_SHORT_SCORE_BONUS)
+
     min_score_now = get_session_min_score()
+    # Kalau bear market + SHORT, pakai threshold lebih rendah
+    if is_bear_mkt and direction == "SHORT":
+        min_score_now = min(min_score_now, BEAR_MIN_SCORE_SHORT)
     if score < min_score_now:
         if min_score_now > MIN_SCORE:
             _stats["skipped_session"] += 1
@@ -1848,6 +1876,7 @@ def close_trade(symbol, reason=""):
             if "SL"      in reason or "Stop" in reason: _stats["sl_hits"] += 1
             if "Force"   in reason: _stats["force_closes"] += 1
             if "Instant" in reason: _stats["instant_cuts"] += 1
+            if "SmartCut" in reason: _stats["smart_cuts"]  += 1
 
             # Update paper balance
             if PAPER_TRADING:
@@ -1867,6 +1896,84 @@ def close_trade(symbol, reason=""):
 # ════════════════════════════════════════════════════
 #  POSITION MONITOR v15 — DELAYED TRAIL
 # ════════════════════════════════════════════════════
+def _get_live_momentum(symbol, side):
+    """
+    Cek apakah momentum coin masih searah posisi kita (untuk keputusan hold vs cut).
+    Return: (score -2..+2, description)
+      +2 = momentum kuat searah (HOLD, bahkan extend)
+      +1 = momentum lemah searah (HOLD)
+       0 = momentum netral (HOLD tapi waspada)
+      -1 = momentum berbalik lemah (pertimbangkan cut lebih awal)
+      -2 = momentum berbalik kuat (cut segera)
+    """
+    try:
+        df = get_ohlcv(symbol, Client.KLINE_INTERVAL_1MINUTE, 15)
+        if df is None or len(df) < 8:
+            return 0, "no_data"
+        df = run_ta_lite(df.copy())
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        score = 0
+        notes = []
+
+        # EMA 1m arah
+        e3  = last.get("ema3",  last["close"])
+        e9  = last.get("ema9",  last["close"])
+        e21 = last.get("ema21", last["close"])
+        p   = last["close"]
+
+        if side == "LONG":
+            if p > e3 > e9:   score += 1; notes.append("ema↑")
+            elif p < e9:      score -= 1; notes.append("ema↓")
+        else:
+            if p < e3 < e9:   score += 1; notes.append("ema↓")
+            elif p > e9:      score -= 1; notes.append("ema↑")
+
+        # Candle arah terakhir
+        last_bull = last["close"] > last["open"]
+        if side == "LONG":
+            if last_bull:    score += 1; notes.append("bull_candle")
+            else:            score -= 1; notes.append("bear_candle")
+        else:
+            if not last_bull: score += 1; notes.append("bear_candle")
+            else:             score -= 1; notes.append("bull_candle")
+
+        score = max(-2, min(2, score))
+        return score, "|".join(notes)
+    except:
+        return 0, "err"
+
+
+def calc_dynamic_hold_min(pos):
+    """
+    Hitung max holding time secara dinamis berdasarkan kondisi posisi.
+    - Posisi rugi: hold lebih pendek (cut lebih cepat)
+    - Posisi profit tp1 sudah hit: hold lebih panjang (beri kesempatan TP2)
+    - Momentum kuat: hold lebih panjang
+    """
+    base = MAX_HOLDING_MIN
+    entry = pos.get("entry", 1)
+    price_snapshot = pos.get("_last_price", entry)
+    side = pos.get("side", "LONG")
+
+    if side == "LONG":
+        profit_pct = (price_snapshot - entry) / entry
+    else:
+        profit_pct = (entry - price_snapshot) / entry
+
+    if pos.get("tp1_hit"):
+        return base * 1.5    # Sudah TP1 → beri waktu extra untuk TP2
+
+    if profit_pct < -0.003:
+        return base * 0.6    # Rugi > 0.3% → cut lebih cepat
+
+    if profit_pct > TRAIL_ACTIVATE_PCT:
+        return base * 1.2    # Profit kecil tapi arah benar → sedikit extra
+
+    return base
+
+
 def manage_positions():
     if not open_positions: return
     flash_dir, flash_pct = detect_flash_move()
@@ -1883,13 +1990,19 @@ def manage_positions():
         entry = pos["entry"]
         atr   = pos.get("atr", entry * 0.002)
 
+        # Simpan harga terakhir untuk calc_dynamic_hold_min
+        pos["_last_price"] = price
+
         pos["entry_candle"] = pos.get("entry_candle", 0) + 1
 
-        hold_min = (time.time() - pos["open_time"]) / 60
-        if hold_min >= MAX_HOLDING_MIN * 0.95:
-            close_trade(symbol, f"⏰Force({hold_min:.1f}m)")
+        # ── Dynamic hold time ─────────────────────────────
+        hold_min     = (time.time() - pos["open_time"]) / 60
+        max_hold_now = calc_dynamic_hold_min(pos)
+        if hold_min >= max_hold_now * 0.97:
+            close_trade(symbol, f"⏰Force({hold_min:.1f}m/{max_hold_now:.1f}m)")
             continue
 
+        # ── Flash move protection ─────────────────────────
         if flash_dir == "crash" and side == "LONG":
             close_trade(symbol, f"⚡FlashCrash-{flash_pct:.1f}%")
             continue
@@ -1897,107 +2010,185 @@ def manage_positions():
             close_trade(symbol, f"⚡FlashPump+{flash_pct:.1f}%")
             continue
 
+        # ── Smart momentum check ──────────────────────────
+        # Cek momentum setiap 5 tick (~5 detik) — tidak setiap detik
+        pos["_mom_tick"] = pos.get("_mom_tick", 0) + 1
+        mom_score  = pos.get("_mom_score", 0)
+        mom_detail = pos.get("_mom_detail", "")
+        if pos["_mom_tick"] % 5 == 0:
+            mom_score, mom_detail = _get_live_momentum(symbol, side)
+            pos["_mom_score"]  = mom_score
+            pos["_mom_detail"] = mom_detail
+
+        # ── Instant cut (awal trade) ──────────────────────
         within_window = pos.get("entry_candle", 0) <= (INSTANT_CUT_WINDOW * 5)
         if not pos.get("instant_cut_done") and not pos.get("tp1_hit") and within_window:
             ic = pos["instant_cut"]
             if side == "LONG" and price <= ic:
                 pos["instant_cut_done"] = True
-                close_trade(symbol, f"⚡InstCut")
+                close_trade(symbol, "⚡InstCut")
                 continue
             elif side == "SHORT" and price >= ic:
                 pos["instant_cut_done"] = True
-                close_trade(symbol, f"⚡InstCut")
+                close_trade(symbol, "⚡InstCut")
                 continue
         elif not within_window:
             pos["instant_cut_done"] = True
 
+        # ══════════════════════════════════════════════════
+        #  LONG MANAGEMENT
+        # ══════════════════════════════════════════════════
         if side == "LONG":
             profit_pct = (price - entry) / entry
 
+            # TP1 hit
             if not pos["tp1_hit"] and price >= pos["tp1"]:
                 partial_close_tp1(symbol)
                 continue
 
+            # Trail activation
             if not pos["trail_active"] and profit_pct >= TRAIL_ACTIVATE_PCT:
                 pos["trail_active"] = True
                 pos["sl"]       = round(entry * (1 + TRAIL_BE_PCT), 8)
                 pos["trail_sl"] = price * (1 - atr * ATR_TRAIL_MULT / price)
                 pos["peak"]     = price
-                print(f"     🔓 [{symbol}] Trail AKTIF @ {profit_pct*100:+.2f}% → SL → BE")
+                print(f"     🔓 [{symbol}] Trail AKTIF @ {profit_pct*100:+.2f}%")
 
+            # Phase 3 tight trail
             if profit_pct >= TRAIL_TIGHT_PCT and pos["trail_phase"] < 3:
                 pos["trail_phase"] = 3
+                print(f"     ⬆️  [{symbol}] Phase3 trail ketat")
 
+            # Update trail SL
             if pos["trail_active"] and price > pos["peak"]:
                 pos["peak"] = price
                 trail_mult  = ATR_TRAIL_TIGHT_MULT if pos["trail_phase"] >= 3 else ATR_TRAIL_MULT
                 new_trail   = price * (1 - atr * trail_mult / price)
                 pos["trail_sl"] = max(pos["trail_sl"], new_trail)
 
+            # TP2
             if pos["tp1_hit"] and price >= pos["tp2"]:
                 close_trade(symbol, "✨TP2")
                 continue
 
+            # Smart early cut: kalau belum profit + momentum berbalik kuat + sudah > 40% waktu
+            time_ratio = hold_min / max_hold_now
+            if (not pos["tp1_hit"]
+                    and profit_pct < 0
+                    and mom_score <= -2
+                    and time_ratio > 0.4):
+                close_trade(symbol, f"🧠SmartCut(mom={mom_score})")
+                continue
+
+            # Smart tighten SL: kalau profit tapi momentum mulai berbalik
+            if (pos["trail_active"]
+                    and profit_pct > TRAIL_ACTIVATE_PCT
+                    and mom_score <= -1
+                    and pos["trail_phase"] < 3):
+                # Paksa masuk phase 3 (trail lebih ketat) kalau momentum berbalik
+                pos["trail_phase"] = 3
+                trail_mult = ATR_TRAIL_TIGHT_MULT
+                new_trail  = price * (1 - atr * trail_mult / price)
+                pos["trail_sl"] = max(pos["trail_sl"], new_trail)
+                print(f"     ⚡ [{symbol}] Trail diperketat karena momentum berbalik ({mom_detail})")
+
+            # Trail stop
             if pos["trail_active"] and price <= pos["trail_sl"]:
                 tag = "🔒TrailBE" if pos.get("be_active") else "🔄TrailStop"
                 close_trade(symbol, tag)
                 continue
 
+            # Hard SL
             if price <= pos["sl"]:
                 close_trade(symbol, "🛑SL")
                 continue
 
+            # Status print
             pnl     = (price - entry) * pos.get("qty_remain", pos["qty"])
             phase   = pos.get("trail_phase", 1)
             act_tag = "✅" if pos["trail_active"] else "⏸️ "
             tsl     = f"TSL[{act_tag}P{phase}]:{pos['trail_sl']:.5g}"
             tp      = f"TP2:{pos['tp2']:.5g}" if pos["tp1_hit"] else f"TP1:{pos['tp1']:.5g}"
             ptag    = "📝" if pos.get("paper") else "📌"
-            print(f"  {ptag} [{symbol}] L@{entry:.5g}→{price:.5g} ({profit_pct*100:+.2f}%) | {pnl:+.3f}U | {hold_min:.1f}m | {tsl} {tp}")
+            mom_tag = ["🔴🔴","🔴","⚪","🟢","🟢🟢"][mom_score + 2]
+            print(f"  {ptag} [{symbol}] L@{entry:.5g}→{price:.5g} ({profit_pct*100:+.2f}%) | {pnl:+.3f}U | {hold_min:.1f}/{max_hold_now:.1f}m | {tsl} {tp} {mom_tag}")
 
-        else:  # SHORT
+        # ══════════════════════════════════════════════════
+        #  SHORT MANAGEMENT
+        # ══════════════════════════════════════════════════
+        else:
             profit_pct = (entry - price) / entry
 
+            # TP1 hit
             if not pos["tp1_hit"] and price <= pos["tp1"]:
                 partial_close_tp1(symbol)
                 continue
 
+            # Trail activation
             if not pos["trail_active"] and profit_pct >= TRAIL_ACTIVATE_PCT:
                 pos["trail_active"] = True
                 pos["sl"]       = round(entry * (1 - TRAIL_BE_PCT), 8)
                 pos["trail_sl"] = price * (1 + atr * ATR_TRAIL_MULT / price)
                 pos["peak"]     = price
-                print(f"     🔓 [{symbol}] Trail AKTIF @ {profit_pct*100:+.2f}% → SL → BE")
+                print(f"     🔓 [{symbol}] Trail AKTIF @ {profit_pct*100:+.2f}%")
 
+            # Phase 3
             if profit_pct >= TRAIL_TIGHT_PCT and pos["trail_phase"] < 3:
                 pos["trail_phase"] = 3
+                print(f"     ⬆️  [{symbol}] Phase3 trail ketat")
 
+            # Update trail SL
             if pos["trail_active"] and price < pos["peak"]:
                 pos["peak"] = price
                 trail_mult  = ATR_TRAIL_TIGHT_MULT if pos["trail_phase"] >= 3 else ATR_TRAIL_MULT
                 new_trail   = price * (1 + atr * trail_mult / price)
                 pos["trail_sl"] = min(pos["trail_sl"], new_trail)
 
+            # TP2
             if pos["tp1_hit"] and price <= pos["tp2"]:
                 close_trade(symbol, "✨TP2")
                 continue
 
+            # Smart early cut
+            time_ratio = hold_min / max_hold_now
+            if (not pos["tp1_hit"]
+                    and profit_pct < 0
+                    and mom_score <= -2
+                    and time_ratio > 0.4):
+                close_trade(symbol, f"🧠SmartCut(mom={mom_score})")
+                continue
+
+            # Smart tighten trail
+            if (pos["trail_active"]
+                    and profit_pct > TRAIL_ACTIVATE_PCT
+                    and mom_score <= -1
+                    and pos["trail_phase"] < 3):
+                pos["trail_phase"] = 3
+                trail_mult = ATR_TRAIL_TIGHT_MULT
+                new_trail  = price * (1 + atr * trail_mult / price)
+                pos["trail_sl"] = min(pos["trail_sl"], new_trail)
+                print(f"     ⚡ [{symbol}] Trail diperketat ({mom_detail})")
+
+            # Trail stop
             if pos["trail_active"] and price >= pos["trail_sl"]:
                 tag = "🔒TrailBE" if pos.get("be_active") else "🔄TrailStop"
                 close_trade(symbol, tag)
                 continue
 
+            # Hard SL
             if price >= pos["sl"]:
                 close_trade(symbol, "🛑SL")
                 continue
 
+            # Status print
             pnl     = (entry - price) * pos.get("qty_remain", pos["qty"])
             phase   = pos.get("trail_phase", 1)
             act_tag = "✅" if pos["trail_active"] else "⏸️ "
             tsl     = f"TSL[{act_tag}P{phase}]:{pos['trail_sl']:.5g}"
             tp      = f"TP2:{pos['tp2']:.5g}" if pos["tp1_hit"] else f"TP1:{pos['tp1']:.5g}"
             ptag    = "📝" if pos.get("paper") else "📌"
-            print(f"  {ptag} [{symbol}] S@{entry:.5g}→{price:.5g} ({profit_pct*100:+.2f}%) | {pnl:+.3f}U | {hold_min:.1f}m | {tsl} {tp}")
+            mom_tag = ["🔴🔴","🔴","⚪","🟢","🟢🟢"][mom_score + 2]
+            print(f"  {ptag} [{symbol}] S@{entry:.5g}→{price:.5g} ({profit_pct*100:+.2f}%) | {pnl:+.3f}U | {hold_min:.1f}/{max_hold_now:.1f}m | {tsl} {tp} {mom_tag}")
 
 
 # ════════════════════════════════════════════════════
@@ -2041,7 +2232,7 @@ def print_stats_inline():
     emoji = "💚" if pnl >= 0 else "🔴"
     ptag = "[PAPER]" if PAPER_TRADING else ""
     print(f"     ┌─ 📊 {ptag} {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} | {emoji}PnL:{pnl:+.4f}U | Exp:{exp:+.4f}U")
-    print(f"     └─ TP1:{_stats['tp1_hits']} TP2:{_stats['tp2_hits']} SL:{_stats['sl_hits']} ⚡Cut:{_stats['instant_cuts']} Force:{_stats['force_closes']} [{bar}]")
+    print(f"     └─ TP1:{_stats['tp1_hits']} TP2:{_stats['tp2_hits']} SL:{_stats['sl_hits']} ⚡Cut:{_stats['instant_cuts']} 🧠:{_stats.get('smart_cuts',0)} Force:{_stats['force_closes']} [{bar}]")
 
 
 def print_stats():
@@ -2067,7 +2258,7 @@ def print_stats():
         print(f"  💰 Paper equity: {_paper_balance['equity']:.2f}U (modal {_paper_balance['initial_usdt']:.0f}U)")
     print(f"  📐 Expectancy:{exp:+.5f}U | Sharpe:{sr:.2f} | MaxDD:{mdd:.4f}U")
     print(f"  📈 Best:{_stats['best_trade']:+.4f}U │ 📉 Worst:{_stats['worst_trade']:+.4f}U")
-    print(f"  🎯TP1:{_stats['tp1_hits']} ✨TP2:{_stats['tp2_hits']} 🛑SL:{_stats['sl_hits']} ⚡Cut:{_stats['instant_cuts']} ⏰Force:{_stats['force_closes']}")
+    print(f"  🎯TP1:{_stats['tp1_hits']} ✨TP2:{_stats['tp2_hits']} 🛑SL:{_stats['sl_hits']} ⚡Cut:{_stats['instant_cuts']} 🧠Smart:{_stats.get('smart_cuts',0)} ⏰Force:{_stats['force_closes']}")
     print(f"  🚫 Skip: Chop:{_stats['skipped_chop']} NoMom:{_stats['skipped_no_momentum']} Spread:{_stats['skipped_spread']} Session:{_stats.get('skipped_session',0)} MeanRev:{_stats.get('skipped_mean_rev',0)}")
     print(f"       MTF:{_stats.get('skipped_mtf',0)} CandleAge:{_stats.get('skipped_candle_age',0)} Blacklist:{_stats.get('skipped_blacklist',0)}")
     print(f"  🛡️  Kill switch: {'ACTIVE('+ks['reason']+')' if ks['active'] else 'OK'} | ConsecLoss:{ks['consec_losses']} | DailyPnL:{ks['daily_pnl']:+.2f}U | Lag:{ks['api_lag']*1000:.0f}ms")
@@ -2119,13 +2310,15 @@ def position_monitor_thread():
 def run_bot():
     mode_line = "PAPER TRADING (DRY RUN)" if PAPER_TRADING else "⚠️  LIVE TRADING"
     print("╔══════════════════════════════════════════════════════════════╗")
-    print(f"║  🎯 BOT SCALPING v15 — SMART COIN SELECTOR                  ║")
+    print(f"║  🎯 BOT SCALPING v15.3 — SMART HOLD/CUT ENGINE              ║")
     print(f"║  Mode: {mode_line:<53}║")
     print("╠══════════════════════════════════════════════════════════════╣")
     print(f"║  Leverage:{LEVERAGE}x │ Per trade:${ORDER_USDT} │ Max posisi:{MAX_POSITIONS}              ║")
     print(f"║  SL:ATR×{ATR_SL_MULT} TP1:ATR×{ATR_TP1_MULT} TP2:ATR×{ATR_TP2_MULT}                    ║")
     print(f"║  Trail aktif > {TRAIL_ACTIVATE_PCT*100:.2f}% | Tight > {TRAIL_TIGHT_PCT*100:.2f}%                 ║")
     print(f"║  Smart Coin Selector: AKTIF                                 ║")
+    print(f"║  Smart Hold/Cut:      AKTIF (momentum 1m realtime)          ║")
+    print(f"║  Bear Market Mode:    AKTIF (block LONG breadth<{BEAR_MARKET_BREADTH*100:.0f}%)        ║")
     print(f"║  Multi-TF Alignment:  AKTIF ({MTF_MIN_AGREE}/3 TF harus agree)          ║")
     print(f"║  Candle age filter:   max {MAX_CANDLE_AGE_PCT*100:.0f}% dari candle           ║")
     print(f"║  Temp blacklist: {TEMP_BLACKLIST_SL} SL beruntun → {TEMP_BLACKLIST_MIN}m cooldown           ║")
