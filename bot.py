@@ -1,6 +1,32 @@
 """
-Bot Scalping v15 — PAPER TRADING + SMART COIN SELECTOR
-=======================================================
+Bot Scalping v15.2 — PAPER TRADING + SMART COIN SELECTOR
+=========================================================
+
+PATCH v15.2 — Fix hasil awal (0% WR, force close dominan)
+──────────────────────────────────────────────────────────
+✅ CANDLE AGE filter dilonggarkan: 75% → 90%
+   (409 skip dalam 9 menit = terlalu agresif, banyak setup valid yang dibuang)
+
+✅ MAX_HOLDING_MIN: 5 → 8 menit
+   Kasih napas lebih ke posisi, terutama di market yang slow
+
+✅ ORDER_USDT: $2 → $1 per trade
+   NEARUSDT -0.59U dari 1 trade = catastrophic. Dengan $1, worst case -0.30U
+
+✅ ATR_SL_MULT: 1.2 → 1.0 (SL lebih ketat, cut lebih awal kalau salah arah)
+   MAX_SL_PCT: 0.55% → 0.45% (hard cap SL lebih kecil)
+
+✅ BEAR MARKET AWARE — kalau BTC BEAR + Breadth < 30%:
+   - LONG dilarang keras (bukan cuma skip kalau BTC_5m+15m keduanya BEAR)
+   - SHORT diberi bonus score +10
+   - MIN_SCORE diturunkan ke 44 untuk SHORT (lebih mudah masuk SHORT)
+
+✅ MEAN_REV mode tidak lagi block semua entry:
+   Di MEAN_REV, SHORT tetap diizinkan kalau BTC BEAR
+   (sebelumnya MEAN_REV = skip semua, padahal SHORT di bear market valid)
+
+✅ CONSEC_LOSS_MAX: 5 → 4 (lebih cepat pause kalau beruntun loss)
+   DAILY_LOSS_LIMIT: -5.0 → -3.0 (lebih konservatif untuk paper test)
 
 PERUBAHAN DARI v14
 ─────────────────────────────────────────────────────────
@@ -68,87 +94,93 @@ if PAPER_TRADING:
 
 
 # ════════════════════════════════════════════════════
-#  CONFIG v15
+#  CONFIG v15.2
 # ════════════════════════════════════════════════════
 
 # ── CORE ─────────────────────────────────────────────────
 LEVERAGE              = 20
-ORDER_USDT            = 2
+ORDER_USDT            = 1            # v15.2: turun $2→$1, lindungi dari worst-case
 MAX_POSITIONS         = 3
 
 # ── ATR MULTIPLIER ───────────────────────────────────────
-ATR_SL_MULT           = 1.2
-ATR_TP1_MULT          = 1.8      # Turun dari 2.0 → lebih realistis
-ATR_TP2_MULT          = 2.5      # Turun dari 3.5 → lebih realistis
-ATR_TRAIL_MULT        = 0.7      # Turun dari 0.8 → trail lebih ketat
-ATR_TRAIL_TIGHT_MULT  = 0.4      # Turun dari 0.5
+ATR_SL_MULT           = 1.0          # v15.2: 1.2→1.0, SL lebih ketat
+ATR_TP1_MULT          = 1.8
+ATR_TP2_MULT          = 2.5
+ATR_TRAIL_MULT        = 0.7
+ATR_TRAIL_TIGHT_MULT  = 0.4
 
-MIN_SL_PCT            = 0.0010
-MAX_SL_PCT            = 0.0055   # Sedikit lebih ketat
-MIN_TP1_PCT           = 0.0018
-MAX_TP2_PCT           = 0.0150   # Turun dari 0.020
+MIN_SL_PCT            = 0.0008
+MAX_SL_PCT            = 0.0045       # v15.2: 0.55%→0.45% hard cap
+MIN_TP1_PCT           = 0.0015
+MAX_TP2_PCT           = 0.0150
 
 # ── DELAYED TRAIL ──────────────────────────────────────
-TRAIL_ACTIVATE_PCT    = 0.0015   # Turun dari 0.0020 → trail lebih cepat aktif
+TRAIL_ACTIVATE_PCT    = 0.0015
 TRAIL_BE_PCT          = 0.0003
-TRAIL_TIGHT_PCT       = 0.0030   # Turun dari 0.0040
+TRAIL_TIGHT_PCT       = 0.0030
 
 # ── PARTIAL CLOSE ─────────────────────────────────────────
 TP1_CLOSE_RATIO       = 0.60
 TP2_CLOSE_RATIO       = 0.40
 
 # ── INSTANT CUT ──────────────────────────────────────────
-INSTANT_CUT_MULT      = 0.45     # Sedikit lebih ketat
+INSTANT_CUT_MULT      = 0.45
 INSTANT_CUT_WINDOW    = 3
 
 # ── CHOP FILTER ──────────────────────────────────────────
 CHOP_INDEX_THRESHOLD  = 58.0
 MIN_BB_WIDTH_PCT      = 0.005
 MAX_EMA_CROSS_FREQ    = 3
-MIN_ADX               = 18       # Turun dari 20 agar tidak terlalu ketat
+MIN_ADX               = 18
 
 # ── MOMENTUM FILTER ──────────────────────────────────────
-MIN_MOMENTUM_PCT      = 0.0015   # Turun dari 0.0018 → sedikit lebih longgar
-MIN_VOL_SURGE         = 1.4      # Turun dari 1.6
+MIN_MOMENTUM_PCT      = 0.0015
+MIN_VOL_SURGE         = 1.4
 MIN_TREND_CANDLES     = 3
 
-# ── MULTI-TF ALIGNMENT (BARU) ────────────────────────────
-REQUIRE_MTF_ALIGN     = True     # Wajib 1m+5m+15m satu arah
-MTF_MIN_AGREE         = 2        # Minimal 2 dari 3 TF agree (jika 3 lebih ketat)
+# ── MULTI-TF ALIGNMENT ───────────────────────────────────
+REQUIRE_MTF_ALIGN     = True
+MTF_MIN_AGREE         = 2
 
-# ── SMART COIN SELECTOR (BARU) ───────────────────────────
-PERF_WINDOW           = 10       # Evaluasi 10 trade terakhir per coin
-MIN_PERF_WR           = 0.40     # Coin dengan WR < 40% dalam 10T masuk watch
-PERF_BOOST_WR         = 0.65     # Coin dengan WR > 65% dapat priority boost
-TEMP_BLACKLIST_SL     = 3        # 3 SL beruntun → masuk blacklist sementara
-TEMP_BLACKLIST_MIN    = 30       # Blacklist selama 30 menit
-PRIORITY_TP_STREAK    = 2        # 2 TP beruntun → masuk priority list
+# ── SMART COIN SELECTOR ──────────────────────────────────
+PERF_WINDOW           = 10
+MIN_PERF_WR           = 0.40
+PERF_BOOST_WR         = 0.65
+TEMP_BLACKLIST_SL     = 3
+TEMP_BLACKLIST_MIN    = 30
+PRIORITY_TP_STREAK    = 2
 
-# ── CANDLE TIMING FILTER (BARU) ──────────────────────────
-MAX_CANDLE_AGE_PCT    = 0.75     # Skip kalau candle 5m sudah > 75% habis
-                                  # (hindari entry di akhir candle)
+# ── CANDLE TIMING FILTER ─────────────────────────────────
+MAX_CANDLE_AGE_PCT    = 0.90         # v15.2: 75%→90%, was terlalu agresif skip (409x!)
 
-# ── VOLATILITY SWEET SPOT (BARU) ─────────────────────────
-MIN_ATR_PCT           = 0.0008   # ATR minimum (terlalu flat → skip)
-MAX_ATR_PCT           = 0.0080   # ATR maximum (terlalu volatile → skip)
-SWEET_ATR_PCT         = 0.0025   # Target ideal ATR
+# ── VOLATILITY SWEET SPOT ────────────────────────────────
+MIN_ATR_PCT           = 0.0008
+MAX_ATR_PCT           = 0.0080
+SWEET_ATR_PCT         = 0.0025
+
+# ── BEAR MARKET MODE (BARU v15.2) ────────────────────────
+# Kalau market kondisi bearish berat, bias ke SHORT
+BEAR_MARKET_BREADTH   = 0.30         # Breadth < 30% = bear market
+BEAR_SHORT_SCORE_BONUS= 10           # Bonus score untuk SHORT di bear market
+BEAR_MIN_SCORE_SHORT  = 44           # Score threshold lebih rendah untuk SHORT di bear
+BEAR_BLOCK_LONG       = True         # Block LONG kalau breadth < threshold + BTC BEAR
 
 # ── KECEPATAN ────────────────────────────────────────────
 SCAN_INTERVAL         = 3
 POSITION_MONITOR_SEC  = 1
 SCAN_DELAY_MS         = 0.050
 BATCH_SIZE            = 15
-MAX_HOLDING_MIN       = 5
-SYMBOL_COOLDOWN_SEC   = 12       # Naik dari 10 → lebih tenang
+MAX_HOLDING_MIN       = 8            # v15.2: 5→8 menit, kasih napas lebih
+SYMBOL_COOLDOWN_SEC   = 12
 RE_SCAN_DELAY_SEC     = 0.3
 
 # ── SESSION FILTER ────────────────────────────────────────
 BAD_HOURS_UTC         = {4, 5, 6}
-BAD_HOURS_MIN_SCORE   = 62       # Naik dari 60
+BAD_HOURS_MIN_SCORE   = 62
 
 # ── KILL SWITCH ───────────────────────────────────────────
-DAILY_LOSS_LIMIT      = -5.0
-CONSEC_LOSS_MAX       = 5
+DAILY_LOSS_LIMIT      = -3.0         # v15.2: -5→-3, lebih konservatif
+CONSEC_LOSS_MAX       = 4            # v15.2: 5→4, lebih cepat pause
 CONSEC_LOSS_PAUSE_MIN = 30
 MAX_API_LAG_SEC       = 3.0
 
