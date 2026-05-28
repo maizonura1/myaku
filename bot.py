@@ -1856,6 +1856,11 @@ def partial_close_tp1(symbol):
         _perf[symbol]["trades"] += 1
         if pnl > _stats["best_trade"]: _stats["best_trade"] = pnl
 
+        # Sync paper balance — partial TP1 juga harus masuk equity
+        if PAPER_TRADING:
+            _paper_balance["pnl_total"] += pnl
+            _paper_balance["equity"]     = _paper_balance["initial_usdt"] + _paper_balance["pnl_total"]
+
         trade_log.append({
             "symbol": symbol, "side": side,
             "pnl": round(pnl, 4), "reason": "TP1 Partial",
@@ -2361,7 +2366,7 @@ def print_stats():
     print(f"  🎯 {n} trades | WR:{wr:.0f}% | W:{_stats['wins']} L:{_stats['losses']}")
     print(f"  {emoji} Total P&L: {pnl:+.4f} USDT (virtual)")
     if PAPER_TRADING:
-        print(f"  💰 Paper equity: {_paper_balance['equity']:.2f}U (modal {_paper_balance['initial_usdt']:.0f}U)")
+        print(f"  💰 Paper equity: {_paper_balance['equity']:.4f}U (modal {_paper_balance['initial_usdt']:.0f}U)")
     print(f"  📐 Expectancy:{exp:+.5f}U | Sharpe:{sr:.2f} | MaxDD:{mdd:.4f}U")
     print(f"  📈 Best:{_stats['best_trade']:+.4f}U │ 📉 Worst:{_stats['worst_trade']:+.4f}U")
     print(f"  🎯TP1:{_stats['tp1_hits']} ✨TP2:{_stats['tp2_hits']} 🛑SL:{_stats['sl_hits']} ⚡Cut:{_stats['instant_cuts']} 🧠Smart:{_stats.get('smart_cuts',0)} ⏰Force:{_stats['force_closes']}")
@@ -2485,7 +2490,9 @@ def run_bot():
               f"News:{_macro['news']} | Posisi({len(open_positions)}/{MAX_POSITIONS}): "
               f"{list(open_positions.keys()) or '—'}")
         if PAPER_TRADING:
-            print(f"  💰 Paper equity: {_paper_balance['equity']:.2f}U | PnL: {_paper_balance['pnl_total']:+.4f}U")
+            # Gunakan _stats["total_pnl"] sebagai single source of truth
+            # _paper_balance["equity"] sekarang selalu sync (include TP1 partial)
+            print(f"  💰 Paper equity: {_paper_balance['equity']:.4f}U | PnL: {_stats['total_pnl']:+.4f}U")
 
         slots_free = MAX_POSITIONS - len(open_positions)
         ks_active, ks_reason = check_kill_switch()
