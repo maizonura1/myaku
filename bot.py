@@ -307,6 +307,7 @@ _stats = {
     "skipped_candle_age": 0,
     "skipped_blacklist": 0,
     "skipped_mtf": 0,
+    "skipped_mq": 0,
     "pnl_history": deque(maxlen=200),
     "session_start": time.time(),
 }
@@ -565,20 +566,22 @@ def check_kill_switch():
     ks  = _kill_switch
     now = time.time()
 
+    # Resume setelah pause
     if ks["active"] and now >= ks["resume_time"]:
         ks["active"]        = False
         ks["reason"]        = ""
-        ks["consec_losses"] = 0
+        ks["consec_losses"] = 0   # reset counter SETELAH pause selesai
         print(f"\n  ✅ Kill switch CLEARED — bot aktif kembali")
 
     if ks["active"]:
         return True, ks["reason"]
 
+    # Daily reset
     day_start = now - (now % 86400)
     if day_start > ks["daily_reset_ts"]:
         ks["daily_pnl"]      = 0.0
         ks["daily_reset_ts"] = day_start
-        ks["consec_losses"]  = 0   # reset juga saat hari baru
+        ks["consec_losses"]  = 0
 
     if ks["daily_pnl"] <= DAILY_LOSS_LIMIT:
         ks["active"]      = True
@@ -591,26 +594,23 @@ def check_kill_switch():
         ks["active"]      = True
         ks["reason"]      = f"consec_loss({ks['consec_losses']})"
         ks["resume_time"] = now + (CONSEC_LOSS_PAUSE_MIN * 60)
-        print(f"\n  🚨 KILL SWITCH: {ks['consec_losses']} loss beruntun — pause {CONSEC_LOSS_PAUSE_MIN}m")
+        # Reset counter SEKARANG supaya setelah resume tidak langsung trigger lagi
+        # Counter akan mulai dari 0 setelah bot aktif kembali
+        ks["consec_losses"] = 0
+        print(f"\n  🚨 KILL SWITCH: consec loss — pause {CONSEC_LOSS_PAUSE_MIN}m")
         return True, ks["reason"]
 
     return False, ""
 
 
 def update_kill_switch_after_trade(pnl):
-    """
-    Update kill switch setelah trade selesai.
-    Bug fix v15.3: partial TP1 (pnl kecil positif) tidak reset consec_loss —
-    hanya full close yang profit signifikan yang reset.
-    Ini mencegah consec_loss reset karena TP1 partial lalu langsung SL.
-    """
     ks = _kill_switch
     ks["daily_pnl"] += pnl
     if pnl < 0:
         ks["consec_losses"] += 1
-    elif pnl > 0.005:          # hanya reset kalau profit meaningful (> $0.005)
+    elif pnl > 0.005:
         ks["consec_losses"] = 0
-    # kalau pnl antara 0–0.005 (TP1 partial kecil), consec_losses tidak diubah
+    # pnl 0–0.005: tidak ubah counter (TP1 partial tidak reset streak)
 
 
 def check_api_latency():
@@ -1321,14 +1321,79 @@ def determine_direction(df_5m, df_15m=None):
     return None
 
 
+def get_market_quality():
+    """
+    Hitung kualitas market saat ini sebagai score 0-100.
+    Entry hanya diizinkan kalau market quality >= threshold.
+    
+    Komponen:
+    - BTC trend consistency (1m, 5m, 15m, 1h agree = bagus)
+    - Market breadth (% coin di atas EMA9)
+    - F&G (ekstrem fear/greed = berbahaya)
+    - Scalp mode (TREND lebih baik dari MEAN_REV)
+    
+    Score tinggi = kondisi market bagus untuk scalping.
+    Score rendah = banyak noise, terlalu banyak coin sideways.
+    """
+    score = 50  # baseline netral
+
+    btc_1m  = _macro.get("btc_trend_1m",  "UNKNOWN")
+    btc_5m  = _macro.get("btc_trend_5m",  "UNKNOWN")
+    btc_15m = _macro.get("btc_trend_15m", "UNKNOWN")
+    btc_1h  = _macro.get("btc_trend_1h",  "UNKNOWN")
+    breadth = _macro.get("market_breadth", 0.5)
+    fng     = _macro.get("fng", 50)
+    mode    = _macro.get("scalp_mode", "TREND")
+
+    # BTC consistency — makin banyak TF agree, makin bagus
+    btc_trends = [btc_1m, btc_5m, btc_15m, btc_1h]
+    bull_count = sum(1 for t in btc_trends if t in BULL_TRENDS)
+    bear_count = sum(1 for t in btc_trends if t in BEAR_TRENDS)
+    max_agree  = max(bull_count, bear_count)
+    sideways   = sum(1 for t in btc_trends if t == "SIDEWAYS")
+
+    if max_agree == 4:   score += 25   # semua TF agree
+    elif max_agree == 3: score += 15
+    elif max_agree == 2: score += 5
+    else:                score -= 15   # tidak ada agreement = choppy
+    score -= sideways * 5              # setiap SIDEWAYS = -5
+
+    # Breadth — makin ekstrem (sangat bullish atau sangat bearish) makin jelas
+    if breadth >= 0.65 or breadth <= 0.25:
+        score += 15    # pasar punya arah jelas
+    elif breadth >= 0.50 or breadth <= 0.40:
+        score += 5
+    else:
+        score -= 10    # breadth di tengah 40-50% = market bingung
+
+    # F&G terlalu ekstrem (< 20 atau > 85) = berbahaya
+    if fng < 20:
+        score -= 10
+    elif fng > 85:
+        score -= 10
+
+    # Scalp mode
+    if mode == "TREND":
+        score += 10
+    else:
+        score -= 5
+
+    return max(0, min(100, score))
+
+
+# Threshold market quality untuk entry
+MQ_MIN_ENTRY     = 45    # di bawah ini: skip semua entry
+MQ_HIGH_QUALITY  = 65    # di atas ini: izinkan entry dengan score lebih rendah
+
+
 # ════════════════════════════════════════════════════
-#  ENTRY FILTER v15
+#  ENTRY FILTER v15.4
 # ════════════════════════════════════════════════════
 def should_enter(symbol):
     # ── Smart Coin Selector: blacklist check ──────────────
     if is_coin_blacklisted(symbol):
         _stats["skipped_blacklist"] += 1
-        return None, f"blacklist"
+        return None, "blacklist"
 
     killed, kill_reason = check_kill_switch()
     if killed:
@@ -1344,6 +1409,12 @@ def should_enter(symbol):
 
     flash_dir, _ = detect_flash_move()
     if flash_dir != "none":       return None, f"flash_{flash_dir}"
+
+    # ── Market Quality Gate ───────────────────────────────
+    mq = get_market_quality()
+    if mq < MQ_MIN_ENTRY:
+        _stats["skipped_mq"] = _stats.get("skipped_mq", 0) + 1
+        return None, f"mq_low({mq})"
 
     tickers = fetch_ticker24h_all()
     pct_24h = 0.0
@@ -1443,17 +1514,28 @@ def should_enter(symbol):
 
     score, sigs = get_entry_score(symbol, df_5m, direction)
 
-    # Bear market bonus: hanya kalau benar-benar strong bear, bukan setiap kali breadth < 30%
+    # Bear market bonus: hanya kalau benar-benar strong bear
     if is_strong_bear and direction == "SHORT":
         score = min(100, score + BEAR_SHORT_SCORE_BONUS)
 
     min_score_now = get_session_min_score()
+
+    # Market Quality adjustment:
+    # Kalau market bagus (MQ >= 65): threshold turun 3 poin (lebih mudah entry)
+    # Kalau market biasa (45-65): threshold normal
+    # → mq sudah pasti >= MQ_MIN_ENTRY di sini karena sudah lolos gate di atas
+    if mq >= MQ_HIGH_QUALITY:
+        min_score_now = max(MIN_SCORE - 3, min_score_now - 3)
+    elif mq < 55:
+        min_score_now = min_score_now + 5   # market kurang bagus: threshold naik 5
+
     if is_strong_bear and direction == "SHORT":
         min_score_now = min(min_score_now, BEAR_MIN_SCORE_SHORT)
+
     if score < min_score_now:
         if min_score_now > MIN_SCORE:
             _stats["skipped_session"] += 1
-        return None, f"score={score:.0f}<{min_score_now}"
+        return None, f"score={score:.0f}<{min_score_now}(mq={mq})"
 
     if len(sigs) < MIN_ENTRY_SIGNALS: return None, f"signals={len(sigs)}"
 
@@ -1492,6 +1574,7 @@ def should_enter(symbol):
         "instant_cut":    levels["instant_cut"],
         "perf_score":     get_coin_perf_score(symbol),
         "is_priority":    is_coin_priority(symbol),
+        "mq":             mq,
     }
 
 
@@ -2282,8 +2365,8 @@ def print_stats():
     print(f"  📐 Expectancy:{exp:+.5f}U | Sharpe:{sr:.2f} | MaxDD:{mdd:.4f}U")
     print(f"  📈 Best:{_stats['best_trade']:+.4f}U │ 📉 Worst:{_stats['worst_trade']:+.4f}U")
     print(f"  🎯TP1:{_stats['tp1_hits']} ✨TP2:{_stats['tp2_hits']} 🛑SL:{_stats['sl_hits']} ⚡Cut:{_stats['instant_cuts']} 🧠Smart:{_stats.get('smart_cuts',0)} ⏰Force:{_stats['force_closes']}")
-    print(f"  🚫 Skip: Chop:{_stats['skipped_chop']} NoMom:{_stats['skipped_no_momentum']} Spread:{_stats['skipped_spread']} Session:{_stats.get('skipped_session',0)} MeanRev:{_stats.get('skipped_mean_rev',0)}")
-    print(f"       MTF:{_stats.get('skipped_mtf',0)} CandleAge:{_stats.get('skipped_candle_age',0)} Blacklist:{_stats.get('skipped_blacklist',0)}")
+    print(f"  🚫 Skip: Chop:{_stats['skipped_chop']} NoMom:{_stats['skipped_no_momentum']} MQ:{_stats['skipped_mq']} MeanRev:{_stats.get('skipped_mean_rev',0)}")
+    print(f"       MTF:{_stats.get('skipped_mtf',0)} CandleAge:{_stats.get('skipped_candle_age',0)} Spread:{_stats['skipped_spread']} Blacklist:{_stats.get('skipped_blacklist',0)}")
     print(f"  🛡️  Kill switch: {'ACTIVE('+ks['reason']+')' if ks['active'] else 'OK'} | ConsecLoss:{ks['consec_losses']} | DailyPnL:{ks['daily_pnl']:+.2f}U | Lag:{ks['api_lag']*1000:.0f}ms")
 
     sym_sorted = sorted(_perf.items(), key=lambda x: x[1]["pnl"], reverse=True)
@@ -2396,7 +2479,9 @@ def run_bot():
         print(f"\n{'═'*67}")
         print(f"  🔄 #{cycle} {time.strftime('%H:%M:%S')} {'[PAPER]' if PAPER_TRADING else ''} | F&G:{_macro['fng']} | "
               f"BTC1m:{_macro['btc_trend_1m']} 5m:{_macro['btc_trend_5m']} {flash_info} {sess_tag}")
-        print(f"  Mode:{_macro['scalp_mode']} | Breadth:{_macro['market_breadth']*100:.0f}% | "
+        mq_now = get_market_quality()
+        mq_tag = f"MQ:{mq_now}" + ("✅" if mq_now >= MQ_HIGH_QUALITY else "⚠️" if mq_now >= MQ_MIN_ENTRY else "🚫")
+        print(f"  Mode:{_macro['scalp_mode']} | Breadth:{_macro['market_breadth']*100:.0f}% | {mq_tag} | "
               f"News:{_macro['news']} | Posisi({len(open_positions)}/{MAX_POSITIONS}): "
               f"{list(open_positions.keys()) or '—'}")
         if PAPER_TRADING:
