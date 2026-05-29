@@ -73,48 +73,52 @@ if PAPER_TRADING:
 
 
 # ════════════════════════════════════════════════════
-#  CONFIG v15.2
+#  CONFIG v15.4 — RR FIX
 # ════════════════════════════════════════════════════
 
 # ── CORE ─────────────────────────────────────────────────
 LEVERAGE              = 20
-ORDER_USDT            = 1            # v15.2: turun $2→$1, lindungi dari worst-case
+ORDER_USDT            = 1
 MAX_POSITIONS         = 3
 
 # ── ATR MULTIPLIER ───────────────────────────────────────
-ATR_SL_MULT           = 1.0          # v15.2: 1.2→1.0, SL lebih ketat
-ATR_TP1_MULT          = 1.8
-ATR_TP2_MULT          = 2.5
-ATR_TRAIL_MULT        = 0.7
-ATR_TRAIL_TIGHT_MULT  = 0.4
+# MASALAH v15.x: TP1 jauh (ATR×1.8), SL dekat (ATR×1.0) → RR < 1:1
+# FIX: TP1 lebih dekat (ATR×1.2 ≈ capture momentum cepat)
+#      SL sedikit lebih lebar (ATR×1.3 ≈ beri ruang napas)
+#      TP2 tetap ambisius tapi realistis (ATR×2.2)
+ATR_SL_MULT           = 1.3          # SL sedikit lebih lebar dari TP1
+ATR_TP1_MULT          = 1.2          # TP1 cepat — capture momentum awal
+ATR_TP2_MULT          = 2.2          # TP2 setelah TP1 hit
+ATR_TRAIL_MULT        = 0.8          # Trail normal
+ATR_TRAIL_TIGHT_MULT  = 0.5          # Trail phase 3 (ketat)
 
-MIN_SL_PCT            = 0.0008
-MAX_SL_PCT            = 0.0045       # v15.2: 0.55%→0.45% hard cap
-MIN_TP1_PCT           = 0.0015
-MAX_TP2_PCT           = 0.0150
+MIN_SL_PCT            = 0.0010       # Min SL 0.1%
+MAX_SL_PCT            = 0.0060       # Max SL 0.6%
+MIN_TP1_PCT           = 0.0012       # Min TP1 0.12% (lebih reachable)
+MAX_TP2_PCT           = 0.0200
 
-# ── DELAYED TRAIL ──────────────────────────────────────
-TRAIL_ACTIVATE_PCT    = 0.0015
-TRAIL_BE_PCT          = 0.0003
-TRAIL_TIGHT_PCT       = 0.0030
+# ── TRAIL — lebih agresif protect profit ─────────────────
+TRAIL_ACTIVATE_PCT    = 0.0012       # Trail aktif lebih cepat (0.12%)
+TRAIL_BE_PCT          = 0.0002       # BE offset kecil
+TRAIL_TIGHT_PCT       = 0.0025       # Phase 3 mulai di 0.25%
 
 # ── PARTIAL CLOSE ─────────────────────────────────────────
-TP1_CLOSE_RATIO       = 0.60
-TP2_CLOSE_RATIO       = 0.40
+TP1_CLOSE_RATIO       = 0.50         # Tutup 50% di TP1 (sebelumnya 60%)
+TP2_CLOSE_RATIO       = 0.50         # Sisa 50% kejar TP2
 
-# ── INSTANT CUT ──────────────────────────────────────────
-INSTANT_CUT_MULT      = 0.45
-INSTANT_CUT_WINDOW    = 3
+# ── INSTANT CUT — lebih agresif untuk cut rugi awal ───────
+INSTANT_CUT_MULT      = 0.40         # IC = ATR×0.4 dari entry (lebih ketat)
+INSTANT_CUT_WINDOW    = 4            # 4 tick window (bukan 3)
 
 # ── CHOP FILTER ──────────────────────────────────────────
-CHOP_INDEX_THRESHOLD  = 58.0
+CHOP_INDEX_THRESHOLD  = 56.0         # Lebih ketat dari 58
 MIN_BB_WIDTH_PCT      = 0.005
 MAX_EMA_CROSS_FREQ    = 3
-MIN_ADX               = 18
+MIN_ADX               = 20           # ADX minimal naik ke 20
 
 # ── MOMENTUM FILTER ──────────────────────────────────────
-MIN_MOMENTUM_PCT      = 0.0015
-MIN_VOL_SURGE         = 1.4
+MIN_MOMENTUM_PCT      = 0.0018       # Sedikit lebih ketat
+MIN_VOL_SURGE         = 1.5
 MIN_TREND_CANDLES     = 3
 
 # ── MULTI-TF ALIGNMENT ───────────────────────────────────
@@ -126,30 +130,39 @@ PERF_WINDOW           = 10
 MIN_PERF_WR           = 0.40
 PERF_BOOST_WR         = 0.65
 TEMP_BLACKLIST_SL     = 3
-TEMP_BLACKLIST_MIN    = 30
+TEMP_BLACKLIST_MIN    = 25
 PRIORITY_TP_STREAK    = 2
 
 # ── CANDLE TIMING FILTER ─────────────────────────────────
-MAX_CANDLE_AGE_PCT    = 0.90         # v15.2: 75%→90%, was terlalu agresif skip (409x!)
+MAX_CANDLE_AGE_PCT    = 0.85
 
 # ── VOLATILITY SWEET SPOT ────────────────────────────────
 MIN_ATR_PCT           = 0.0008
 MAX_ATR_PCT           = 0.0080
 SWEET_ATR_PCT         = 0.0025
 
-# ── BEAR MARKET MODE (BARU v15.2) ────────────────────────
-# Kalau market kondisi bearish berat, bias ke SHORT
-BEAR_MARKET_BREADTH   = 0.30         # Breadth < 30% = bear market
-BEAR_SHORT_SCORE_BONUS= 10           # Bonus score untuk SHORT di bear market
-BEAR_MIN_SCORE_SHORT  = 44           # Score threshold lebih rendah untuk SHORT di bear
-BEAR_BLOCK_LONG       = True         # Block LONG kalau breadth < threshold + BTC BEAR
+# ── BEAR MARKET ──────────────────────────────────────────
+BEAR_MARKET_BREADTH   = 0.30
+BEAR_SHORT_SCORE_BONUS= 10
+BEAR_MIN_SCORE_SHORT  = 44
+BEAR_BLOCK_LONG       = True
 
-# ── KECEPATAN ────────────────────────────────────────────
+# ── HOLDING — force close lebih cepat kalau tidak ada progress ───
+MAX_HOLDING_MIN       = 7            # Turun dari 8 → 7
+
+# Holding adaptive per kondisi posisi:
+HOLD_MULT_TP1_HIT     = 1.7          # Sudah TP1: hold sampai 7×1.7 = 11.9m
+HOLD_MULT_PROFIT      = 1.15         # Profit kecil: 7×1.15 = 8m
+HOLD_MULT_LOSS_BIG    = 0.65         # Rugi besar + semua sinyal melawan: 7×0.65 = 4.5m
+HOLD_MULT_LOSS_SMALL  = 0.85         # Rugi kecil: 7×0.85 = 6m
+
+LOSS_BIG_THRESHOLD    = -0.004       # "Rugi besar" = > 0.4%
+
+# ── SCAN & TIMING ────────────────────────────────────────
 SCAN_INTERVAL         = 3
 POSITION_MONITOR_SEC  = 1
 SCAN_DELAY_MS         = 0.050
 BATCH_SIZE            = 15
-MAX_HOLDING_MIN       = 8            # v15.2: 5→8 menit, kasih napas lebih
 SYMBOL_COOLDOWN_SEC   = 12
 RE_SCAN_DELAY_SEC     = 0.3
 
@@ -159,8 +172,8 @@ BAD_HOURS_MIN_SCORE   = 62
 
 # ── KILL SWITCH ───────────────────────────────────────────
 DAILY_LOSS_LIMIT      = -3.0
-CONSEC_LOSS_MAX       = 5            # v15.3: balik ke 5, jangan terlalu sensitif
-CONSEC_LOSS_PAUSE_MIN = 20           # v15.3: turun dari 30 → 20 menit pause
+CONSEC_LOSS_MAX       = 5
+CONSEC_LOSS_PAUSE_MIN = 20
 MAX_API_LAG_SEC       = 3.0
 
 # ── CACHE TTL ─────────────────────────────────────────────
@@ -174,7 +187,7 @@ FUNDING_TTL           = 30
 TOP_MOVERS_TTL        = 8
 
 # ── FILTER UTAMA ──────────────────────────────────────────
-MIN_SCORE             = 48       # Naik dari 45
+MIN_SCORE             = 52       # v15.4: naik ke 52 — hanya entry terbaik
 MIN_ENTRY_SIGNALS     = 2
 MIN_FNG               = 15
 MAX_FNG_LONG          = 92
@@ -182,7 +195,7 @@ MIN_BREADTH           = 0.0
 MAX_SL_ATR_PCT        = 0.009
 
 # ── SPREAD ────────────────────────────────────────────────
-MAX_SPREAD_RATIO      = 0.28     # Sedikit lebih ketat dari 0.30
+MAX_SPREAD_RATIO      = 0.28
 
 # ── SYMBOLS ───────────────────────────────────────────────
 SYMBOLS = [
@@ -2041,32 +2054,36 @@ def _get_live_momentum(symbol, side):
 
 def calc_dynamic_hold_min(pos):
     """
-    Hitung max holding time secara dinamis.
-    
-    Prinsip: jangan potong posisi terlalu cepat.
-    - Default 8 menit untuk semua skenario
-    - TP1 sudah hit → extend ke 12 menit untuk kejar TP2
-    - Rugi besar (> 0.5%) dan momentum confirmed berbalik → bisa cut di 6 menit
-    - Profit kecil tapi jalan → extend sedikit
-    
-    TIDAK mempersingkat hold hanya karena rugi < 0.3%: 
-    noise normal dalam 2-3 menit pertama.
+    Hold time adaptif berdasarkan kondisi posisi.
+
+    Prinsip:
+    - Sudah TP1 hit → extend banyak, kejar TP2
+    - Profit kecil → extend sedikit, beri waktu
+    - Rugi kecil → default, tunggu SL atau momentum berbalik
+    - Rugi besar + momentum semua melawan → cut lebih cepat
     """
-    base  = MAX_HOLDING_MIN
-    entry = pos.get("entry", 1)
-    price = pos.get("_last_price", entry)
-    side  = pos.get("side", "LONG")
+    base       = MAX_HOLDING_MIN
+    entry      = pos.get("entry", 1)
+    price      = pos.get("_last_price", entry)
+    side       = pos.get("side", "LONG")
+    mom_score  = pos.get("_mom_score", 0)
 
     profit_pct = (price - entry) / entry if side == "LONG" else (entry - price) / entry
 
     if pos.get("tp1_hit"):
-        return base * 1.5    # Sudah TP1 → extend untuk kejar TP2
+        return base * HOLD_MULT_TP1_HIT
 
-    if profit_pct < -0.005 and pos.get("_mom_score", 0) <= -2:
-        # Rugi > 0.5% DAN momentum sudah confirmed berbalik semua 3 sinyal
-        return base * 0.75   # Baru boleh cut lebih cepat
+    if profit_pct <= LOSS_BIG_THRESHOLD and mom_score <= -1:
+        # Rugi besar dan momentum mulai berbalik — kurangi waktu tunggu
+        return base * HOLD_MULT_LOSS_BIG
 
-    return base   # Default: pakai base, jangan persingkat tanpa alasan kuat
+    if profit_pct < 0:
+        return base * HOLD_MULT_LOSS_SMALL
+
+    if profit_pct > TRAIL_ACTIVATE_PCT:
+        return base * HOLD_MULT_PROFIT
+
+    return base
 
 
 def manage_positions():
@@ -2169,35 +2186,32 @@ def manage_positions():
                 close_trade(symbol, "✨TP2")
                 continue
 
-            # Smart early cut:
-            # Syarat ketat - semua harus terpenuhi sekaligus:
-            # 1. Belum TP1
-            # 2. Rugi lebih dari 50% jarak SL (mendekati SL)
-            # 3. Momentum confirmed berbalik (semua 3 sinyal, score = -2)
-            # 4. Sudah > 65% dari max holding time
-            # Tujuan: cut 1-2 menit lebih awal dari SL, bukan cut di 3 menit
-            time_ratio  = hold_min / max_hold_now
-            sl_dist     = abs(entry - pos["sl"])
-            loss_to_sl  = abs(price - pos["sl"]) / sl_dist if sl_dist > 0 else 1.0
-            # loss_to_sl < 0.5 artinya harga sudah melebihi setengah jarak SL
-            if (not pos["tp1_hit"]
-                    and profit_pct < -0.002         # Rugi minimal 0.2%
-                    and mom_score == -2             # SEMUA sinyal melawan (bukan -1)
-                    and loss_to_sl < 0.4            # Sudah 60% jalan ke SL
-                    and time_ratio > 0.65):         # Sudah > 65% waktu habis
-                close_trade(symbol, f"🧠SmartCut(loss={profit_pct*100:.2f}%)")
-                continue
+            # SmartCut — cut lebih awal dari force close kalau sudah jelas salah
+            # Kondisi:
+            # A) Rugi besar (> 0.4%) + waktu > 50% + momentum negatif confirmed
+            # B) Rugi sedang (> 0.2%) + waktu > 75% + semua sinyal melawan
+            time_ratio = hold_min / max_hold_now
+            if not pos["tp1_hit"] and profit_pct < 0:
+                cond_a = (profit_pct <= LOSS_BIG_THRESHOLD
+                          and mom_score <= -1
+                          and time_ratio > 0.50)
+                cond_b = (profit_pct < -0.002
+                          and mom_score == -2
+                          and time_ratio > 0.75)
+                if cond_a or cond_b:
+                    close_trade(symbol, f"🧠SmartCut({profit_pct*100:.2f}%,t={time_ratio:.0%})")
+                    continue
 
-            # Smart tighten trail: hanya kalau sudah dalam profit DAN momentum berbalik confirmed
+            # Smart tighten trail: profit sudah ada + momentum berbalik confirmed
             if (pos["trail_active"]
-                    and profit_pct > TRAIL_ACTIVATE_PCT * 2    # profit minimal 2x threshold
-                    and mom_score == -2                         # bukan -1, harus -2
+                    and profit_pct > TRAIL_ACTIVATE_PCT
+                    and mom_score <= -1
                     and pos["trail_phase"] < 3):
                 pos["trail_phase"] = 3
                 trail_mult = ATR_TRAIL_TIGHT_MULT
                 new_trail  = price * (1 - atr * trail_mult / price)
                 pos["trail_sl"] = max(pos["trail_sl"], new_trail)
-                print(f"     ⚡ [{symbol}] Trail diperketat ({mom_detail})")
+                print(f"     ⚡ [{symbol}] Trail ketat ({mom_detail})")
 
             # Trail stop
             if pos["trail_active"] and price <= pos["trail_sl"]:
@@ -2257,28 +2271,29 @@ def manage_positions():
                 close_trade(symbol, "✨TP2")
                 continue
 
-            # Smart early cut SHORT — syarat sama ketatnya dengan LONG
+            # SmartCut SHORT
             time_ratio = hold_min / max_hold_now
-            sl_dist    = abs(pos["sl"] - entry)
-            loss_to_sl = abs(pos["sl"] - price) / sl_dist if sl_dist > 0 else 1.0
-            if (not pos["tp1_hit"]
-                    and profit_pct < -0.002
-                    and mom_score == -2
-                    and loss_to_sl < 0.4
-                    and time_ratio > 0.65):
-                close_trade(symbol, f"🧠SmartCut(loss={profit_pct*100:.2f}%)")
-                continue
+            if not pos["tp1_hit"] and profit_pct < 0:
+                cond_a = (profit_pct <= LOSS_BIG_THRESHOLD
+                          and mom_score <= -1
+                          and time_ratio > 0.50)
+                cond_b = (profit_pct < -0.002
+                          and mom_score == -2
+                          and time_ratio > 0.75)
+                if cond_a or cond_b:
+                    close_trade(symbol, f"🧠SmartCut({profit_pct*100:.2f}%,t={time_ratio:.0%})")
+                    continue
 
             # Smart tighten trail SHORT
             if (pos["trail_active"]
-                    and profit_pct > TRAIL_ACTIVATE_PCT * 2
-                    and mom_score == -2
+                    and profit_pct > TRAIL_ACTIVATE_PCT
+                    and mom_score <= -1
                     and pos["trail_phase"] < 3):
                 pos["trail_phase"] = 3
                 trail_mult = ATR_TRAIL_TIGHT_MULT
                 new_trail  = price * (1 + atr * trail_mult / price)
                 pos["trail_sl"] = min(pos["trail_sl"], new_trail)
-                print(f"     ⚡ [{symbol}] Trail diperketat ({mom_detail})")
+                print(f"     ⚡ [{symbol}] Trail ketat ({mom_detail})")
 
             # Trail stop
             if pos["trail_active"] and price >= pos["trail_sl"]:
