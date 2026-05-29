@@ -73,7 +73,7 @@ if PAPER_TRADING:
 
 
 # ════════════════════════════════════════════════════
-#  CONFIG v15.4 — RR FIX
+#  CONFIG v15.5 — RIDE THE MOVE
 # ════════════════════════════════════════════════════
 
 # ── CORE ─────────────────────────────────────────────────
@@ -86,39 +86,39 @@ MAX_POSITIONS         = 3
 # FIX: TP1 lebih dekat (ATR×1.2 ≈ capture momentum cepat)
 #      SL sedikit lebih lebar (ATR×1.3 ≈ beri ruang napas)
 #      TP2 tetap ambisius tapi realistis (ATR×2.2)
-ATR_SL_MULT           = 1.3          # SL sedikit lebih lebar dari TP1
-ATR_TP1_MULT          = 1.2          # TP1 cepat — capture momentum awal
-ATR_TP2_MULT          = 2.2          # TP2 setelah TP1 hit
-ATR_TRAIL_MULT        = 0.8          # Trail normal
-ATR_TRAIL_TIGHT_MULT  = 0.5          # Trail phase 3 (ketat)
+ATR_SL_MULT           = 1.1          # SL kecil — cut cepat kalau salah
+ATR_TP1_MULT          = 1.0          # TP1 = SL distance, capture cepat
+ATR_TP2_MULT          = 2.0          # TP2 setelah TP1 hit
+ATR_TRAIL_MULT        = 0.6          # Trail agresif
+ATR_TRAIL_TIGHT_MULT  = 0.4          # Trail phase 3
 
-MIN_SL_PCT            = 0.0010       # Min SL 0.1%
-MAX_SL_PCT            = 0.0060       # Max SL 0.6%
-MIN_TP1_PCT           = 0.0012       # Min TP1 0.12% (lebih reachable)
+MIN_SL_PCT            = 0.0010
+MAX_SL_PCT            = 0.0055
+MIN_TP1_PCT           = 0.0010       # Min TP1 0.10%
 MAX_TP2_PCT           = 0.0200
 
 # ── TRAIL — lebih agresif protect profit ─────────────────
-TRAIL_ACTIVATE_PCT    = 0.0012       # Trail aktif lebih cepat (0.12%)
-TRAIL_BE_PCT          = 0.0002       # BE offset kecil
-TRAIL_TIGHT_PCT       = 0.0025       # Phase 3 mulai di 0.25%
+TRAIL_ACTIVATE_PCT    = 0.0008       # Trail aktif di 0.08% profit
+TRAIL_BE_PCT          = 0.0001
+TRAIL_TIGHT_PCT       = 0.0020       # Phase 3 di 0.20%
 
 # ── PARTIAL CLOSE ─────────────────────────────────────────
-TP1_CLOSE_RATIO       = 0.50         # Tutup 50% di TP1 (sebelumnya 60%)
-TP2_CLOSE_RATIO       = 0.50         # Sisa 50% kejar TP2
+TP1_CLOSE_RATIO       = 0.65         # Tutup 65% di TP1
+TP2_CLOSE_RATIO       = 0.35
 
 # ── INSTANT CUT — lebih agresif untuk cut rugi awal ───────
-INSTANT_CUT_MULT      = 0.40         # IC = ATR×0.4 dari entry (lebih ketat)
-INSTANT_CUT_WINDOW    = 4            # 4 tick window (bukan 3)
+INSTANT_CUT_MULT      = 0.50
+INSTANT_CUT_WINDOW    = 5
 
 # ── CHOP FILTER ──────────────────────────────────────────
 CHOP_INDEX_THRESHOLD  = 56.0         # Lebih ketat dari 58
 MIN_BB_WIDTH_PCT      = 0.005
 MAX_EMA_CROSS_FREQ    = 3
-MIN_ADX               = 20           # ADX minimal naik ke 20
+MIN_ADX               = 18
 
 # ── MOMENTUM FILTER ──────────────────────────────────────
-MIN_MOMENTUM_PCT      = 0.0018       # Sedikit lebih ketat
-MIN_VOL_SURGE         = 1.5
+MIN_MOMENTUM_PCT      = 0.0015
+MIN_VOL_SURGE         = 1.4
 MIN_TREND_CANDLES     = 3
 
 # ── MULTI-TF ALIGNMENT ───────────────────────────────────
@@ -147,23 +147,35 @@ BEAR_SHORT_SCORE_BONUS= 10
 BEAR_MIN_SCORE_SHORT  = 44
 BEAR_BLOCK_LONG       = True
 
-# ── HOLDING — force close lebih cepat kalau tidak ada progress ───
-MAX_HOLDING_MIN       = 7            # Turun dari 8 → 7
+# ── HOLDING ──────────────────────────────────────────────
+MAX_HOLDING_MIN       = 7            # Max 7 menit — tapi jarang kena karena smart exit
 
-# Holding adaptive per kondisi posisi:
-HOLD_MULT_TP1_HIT     = 1.7          # Sudah TP1: hold sampai 7×1.7 = 11.9m
-HOLD_MULT_PROFIT      = 1.15         # Profit kecil: 7×1.15 = 8m
-HOLD_MULT_LOSS_BIG    = 0.65         # Rugi besar + semua sinyal melawan: 7×0.65 = 4.5m
-HOLD_MULT_LOSS_SMALL  = 0.85         # Rugi kecil: 7×0.85 = 6m
+HOLD_MULT_TP1_HIT     = 1.7          # TP1 hit → 12 menit kejar TP2
+HOLD_MULT_PROFIT      = 1.20         # Profit & momentum bagus → 8.4 menit
+HOLD_MULT_LOSS_BIG    = 0.65         # Rugi besar + negatif → 4.5 menit
+HOLD_MULT_LOSS_SMALL  = 0.90         # Rugi kecil → 6.3 menit
 
-LOSS_BIG_THRESHOLD    = -0.004       # "Rugi besar" = > 0.4%
+LOSS_BIG_THRESHOLD    = -0.003       # Rugi > 0.3% = besar
+
+# ── MOMENTUM EXIT (baru v15.5) ───────────────────────────
+# Keluar dari posisi profit saat momentum melambat/berbalik
+# Lebih baik ambil profit kecil daripada tunggu habis waktu
+MOM_EXIT_PROFIT_MIN   = 0.0008       # Minimal profit 0.08% untuk trigger
+MOM_EXIT_TIME_MIN     = 0.30         # Sudah lewat minimal 30% waktu
+MOM_EXIT_SCORE_MAX    = 0            # Momentum <= 0 (netral atau negatif)
+
+# ── STAGNATION EXIT (baru v15.5) ─────────────────────────
+# Posisi tidak bergerak = buang slot → keluar lebih cepat
+STAG_CHECK_MIN        = 2.5          # Cek stagnasi setelah 2.5 menit
+STAG_PROFIT_MAX       = 0.0002       # "Stagnan" = profit < 0.02%
+STAG_MOM_MAX          = 0            # Dan momentum tidak positif
 
 # ── SCAN & TIMING ────────────────────────────────────────
 SCAN_INTERVAL         = 3
 POSITION_MONITOR_SEC  = 1
 SCAN_DELAY_MS         = 0.050
 BATCH_SIZE            = 15
-SYMBOL_COOLDOWN_SEC   = 12
+SYMBOL_COOLDOWN_SEC   = 10
 RE_SCAN_DELAY_SEC     = 0.3
 
 # ── SESSION FILTER ────────────────────────────────────────
@@ -187,7 +199,7 @@ FUNDING_TTL           = 30
 TOP_MOVERS_TTL        = 8
 
 # ── FILTER UTAMA ──────────────────────────────────────────
-MIN_SCORE             = 52       # v15.4: naik ke 52 — hanya entry terbaik
+MIN_SCORE             = 50       # v15.5: sedikit turun, TP1 lebih mudah dicapai
 MIN_ENTRY_SIGNALS     = 2
 MIN_FNG               = 15
 MAX_FNG_LONG          = 92
@@ -311,6 +323,8 @@ _stats = {
     "instant_cuts": 0,
     "force_closes": 0,
     "smart_cuts":   0,
+    "mom_exits":    0,
+    "stag_exits":   0,
     "rescans": 0,
     "skipped_no_momentum": 0,
     "skipped_chop": 0,
@@ -1336,20 +1350,17 @@ def determine_direction(df_5m, df_15m=None):
 
 def get_market_quality():
     """
-    Hitung kualitas market saat ini sebagai score 0-100.
-    Entry hanya diizinkan kalau market quality >= threshold.
-    
-    Komponen:
-    - BTC trend consistency (1m, 5m, 15m, 1h agree = bagus)
-    - Market breadth (% coin di atas EMA9)
-    - F&G (ekstrem fear/greed = berbahaya)
-    - Scalp mode (TREND lebih baik dari MEAN_REV)
-    
-    Score tinggi = kondisi market bagus untuk scalping.
-    Score rendah = banyak noise, terlalu banyak coin sideways.
-    """
-    score = 50  # baseline netral
+    Market Quality score 0-100.
 
+    PENTING: Score rendah = bot TIDAK entry.
+    Desain baru: lebih mudah dapat score rendah (skip) di kondisi buruk,
+    lebih sulit dapat score tinggi (entry bebas).
+
+    Kondisi buruk yang langsung return score rendah:
+    - BTC semua TF tidak agree (choppy)
+    - Breadth di zona abu-abu (40-60%) = tidak ada arah
+    - F&G ekstrem + BTC mixed = berbahaya
+    """
     btc_1m  = _macro.get("btc_trend_1m",  "UNKNOWN")
     btc_5m  = _macro.get("btc_trend_5m",  "UNKNOWN")
     btc_15m = _macro.get("btc_trend_15m", "UNKNOWN")
@@ -1358,38 +1369,47 @@ def get_market_quality():
     fng     = _macro.get("fng", 50)
     mode    = _macro.get("scalp_mode", "TREND")
 
-    # BTC consistency — makin banyak TF agree, makin bagus
-    btc_trends = [btc_1m, btc_5m, btc_15m, btc_1h]
+    btc_trends = [btc_5m, btc_15m, btc_1h]   # pakai 3 TF utama, skip 1m (noise)
     bull_count = sum(1 for t in btc_trends if t in BULL_TRENDS)
     bear_count = sum(1 for t in btc_trends if t in BEAR_TRENDS)
     max_agree  = max(bull_count, bear_count)
-    sideways   = sum(1 for t in btc_trends if t == "SIDEWAYS")
 
-    if max_agree == 4:   score += 25   # semua TF agree
-    elif max_agree == 3: score += 15
-    elif max_agree == 2: score += 5
-    else:                score -= 15   # tidak ada agreement = choppy
-    score -= sideways * 5              # setiap SIDEWAYS = -5
+    # ── Hard block conditions ─────────────────────────────
+    # 1. BTC semua TF tidak ada yang agree jelas (max agree < 2 dari 3 TF)
+    if max_agree < 2:
+        return 30   # Langsung score rendah — market choppy
 
-    # Breadth — makin ekstrem (sangat bullish atau sangat bearish) makin jelas
-    if breadth >= 0.65 or breadth <= 0.25:
-        score += 15    # pasar punya arah jelas
-    elif breadth >= 0.50 or breadth <= 0.40:
+    # 2. Breadth di zona abu-abu 35-65% = pasar terbagi, tidak ada arah
+    if 0.35 <= breadth <= 0.65:
+        return 38   # Masih di bawah MQ_MIN_ENTRY = skip entry
+
+    # ── Scoring normal ────────────────────────────────────
+    score = 50
+
+    if max_agree == 3:   score += 25
+    elif max_agree == 2: score += 10
+
+    # Breadth ekstrem = arah jelas
+    if breadth >= 0.75 or breadth <= 0.20:
+        score += 20
+    elif breadth >= 0.65 or breadth <= 0.25:
+        score += 12
+    elif breadth >= 0.55 or breadth <= 0.35:
         score += 5
-    else:
-        score -= 10    # breadth di tengah 40-50% = market bingung
 
-    # F&G terlalu ekstrem (< 20 atau > 85) = berbahaya
-    if fng < 20:
-        score -= 10
-    elif fng > 85:
-        score -= 10
-
-    # Scalp mode
-    if mode == "TREND":
-        score += 10
+    # F&G
+    if 25 <= fng <= 75:
+        score += 5    # Normal range
+    elif fng < 15 or fng > 90:
+        score -= 15   # Ekstrem berbahaya
     else:
         score -= 5
+
+    # Mode
+    if mode == "TREND":
+        score += 8
+    else:
+        score -= 8
 
     return max(0, min(100, score))
 
@@ -1961,9 +1981,11 @@ def close_trade(symbol, reason=""):
 
             if "TP2"     in reason: _stats["tp2_hits"]     += 1
             if "SL"      in reason or "Stop" in reason: _stats["sl_hits"] += 1
-            if "Force"   in reason: _stats["force_closes"] += 1
-            if "Instant" in reason: _stats["instant_cuts"] += 1
-            if "SmartCut" in reason: _stats["smart_cuts"]  += 1
+            if "Force"       in reason: _stats["force_closes"] += 1
+            if "Instant"     in reason: _stats["instant_cuts"] += 1
+            if "SmartCut"    in reason: _stats["smart_cuts"]   += 1
+            if "MomExit"     in reason: _stats["mom_exits"]    += 1
+            if "StagExit"    in reason: _stats["stag_exits"]   += 1
 
             # Update paper balance
             if PAPER_TRADING:
@@ -2110,9 +2132,31 @@ def manage_positions():
         # ── Dynamic hold time ─────────────────────────────
         hold_min     = (time.time() - pos["open_time"]) / 60
         max_hold_now = calc_dynamic_hold_min(pos)
+
         if hold_min >= max_hold_now * 0.97:
-            close_trade(symbol, f"⏰Force({hold_min:.1f}m/{max_hold_now:.1f}m)")
-            continue
+            # Kalau posisi profit dan trail sudah aktif → jangan force close,
+            # biarkan trail yang menutup. Force close hanya kalau:
+            # 1. Posisi belum profit sama sekali, ATAU
+            # 2. Trail belum aktif (belum proteksi profit)
+            if side == "LONG":
+                unrealized_pct = (price - entry) / entry
+            else:
+                unrealized_pct = (entry - price) / entry
+
+            if pos.get("trail_active") and unrealized_pct > 0:
+                # Trail aktif + masih profit → perketat trail, jangan force close
+                if pos["trail_phase"] < 3:
+                    pos["trail_phase"] = 3
+                    print(f"     ⏰ [{symbol}] Hold limit → trail diperketat (bukan force close)")
+                # Extend hold sedikit supaya trail punya waktu
+                if hold_min < max_hold_now * 1.3:
+                    pass   # Lanjut, jangan close
+                else:
+                    close_trade(symbol, f"⏰Force({hold_min:.1f}m/{max_hold_now:.1f}m)")
+                    continue
+            else:
+                close_trade(symbol, f"⏰Force({hold_min:.1f}m/{max_hold_now:.1f}m)")
+                continue
 
         # ── Flash move protection ─────────────────────────
         if flash_dir == "crash" and side == "LONG":
@@ -2186,10 +2230,20 @@ def manage_positions():
                 close_trade(symbol, "✨TP2")
                 continue
 
+            # Post-TP1 MomentumExit: kalau sudah TP1 tapi harga stagnan dan momentum berbalik,
+            # keluar dari sisa posisi daripada nunggu TrailStop atau force close
+            if (pos["tp1_hit"]
+                    and mom_score <= -1
+                    and time_ratio > 0.55
+                    and profit_pct < pos.get("_peak_profit_pct", profit_pct) * 0.5):
+                close_trade(symbol, f"🎯PostTP1MomExit(+{profit_pct*100:.2f}%)")
+                continue
+
+            # Track peak profit untuk post-TP1 exit
+            if pos["tp1_hit"]:
+                pos["_peak_profit_pct"] = max(pos.get("_peak_profit_pct", 0), profit_pct)
+
             # SmartCut — cut lebih awal dari force close kalau sudah jelas salah
-            # Kondisi:
-            # A) Rugi besar (> 0.4%) + waktu > 50% + momentum negatif confirmed
-            # B) Rugi sedang (> 0.2%) + waktu > 75% + semua sinyal melawan
             time_ratio = hold_min / max_hold_now
             if not pos["tp1_hit"] and profit_pct < 0:
                 cond_a = (profit_pct <= LOSS_BIG_THRESHOLD
@@ -2201,6 +2255,25 @@ def manage_positions():
                 if cond_a or cond_b:
                     close_trade(symbol, f"🧠SmartCut({profit_pct*100:.2f}%,t={time_ratio:.0%})")
                     continue
+
+            # ── MomentumExit LONG ─────────────────────────────
+            # Keluar saat profit ada tapi momentum berbalik/berhenti.
+            # Hindari force close dengan profit kecil — ambil sekarang.
+            if (not pos["tp1_hit"]
+                    and profit_pct >= MOM_EXIT_PROFIT_MIN
+                    and time_ratio >= MOM_EXIT_TIME_MIN
+                    and mom_score <= MOM_EXIT_SCORE_MAX):
+                close_trade(symbol, f"🎯MomExit(+{profit_pct*100:.2f}%)")
+                continue
+
+            # ── StagnationExit LONG ───────────────────────────
+            # Posisi tidak bergerak setelah 2.5+ menit → buang slot
+            if (not pos["tp1_hit"]
+                    and hold_min >= STAG_CHECK_MIN
+                    and abs(profit_pct) <= STAG_PROFIT_MAX
+                    and mom_score <= STAG_MOM_MAX):
+                close_trade(symbol, f"⏏️StagExit({profit_pct*100:+.3f}%)")
+                continue
 
             # Smart tighten trail: profit sudah ada + momentum berbalik confirmed
             if (pos["trail_active"]
@@ -2271,6 +2344,17 @@ def manage_positions():
                 close_trade(symbol, "✨TP2")
                 continue
 
+            # Post-TP1 MomentumExit SHORT
+            if (pos["tp1_hit"]
+                    and mom_score <= -1
+                    and time_ratio > 0.55
+                    and profit_pct < pos.get("_peak_profit_pct", profit_pct) * 0.5):
+                close_trade(symbol, f"🎯PostTP1MomExit(+{profit_pct*100:.2f}%)")
+                continue
+
+            if pos["tp1_hit"]:
+                pos["_peak_profit_pct"] = max(pos.get("_peak_profit_pct", 0), profit_pct)
+
             # SmartCut SHORT
             time_ratio = hold_min / max_hold_now
             if not pos["tp1_hit"] and profit_pct < 0:
@@ -2283,6 +2367,22 @@ def manage_positions():
                 if cond_a or cond_b:
                     close_trade(symbol, f"🧠SmartCut({profit_pct*100:.2f}%,t={time_ratio:.0%})")
                     continue
+
+            # ── MomentumExit SHORT ────────────────────────────
+            if (not pos["tp1_hit"]
+                    and profit_pct >= MOM_EXIT_PROFIT_MIN
+                    and time_ratio >= MOM_EXIT_TIME_MIN
+                    and mom_score <= MOM_EXIT_SCORE_MAX):
+                close_trade(symbol, f"🎯MomExit(+{profit_pct*100:.2f}%)")
+                continue
+
+            # ── StagnationExit SHORT ──────────────────────────
+            if (not pos["tp1_hit"]
+                    and hold_min >= STAG_CHECK_MIN
+                    and abs(profit_pct) <= STAG_PROFIT_MAX
+                    and mom_score <= STAG_MOM_MAX):
+                close_trade(symbol, f"⏏️StagExit({profit_pct*100:+.3f}%)")
+                continue
 
             # Smart tighten trail SHORT
             if (pos["trail_active"]
@@ -2358,7 +2458,7 @@ def print_stats_inline():
     emoji = "💚" if pnl >= 0 else "🔴"
     ptag = "[PAPER]" if PAPER_TRADING else ""
     print(f"     ┌─ 📊 {ptag} {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} | {emoji}PnL:{pnl:+.4f}U | Exp:{exp:+.4f}U")
-    print(f"     └─ TP1:{_stats['tp1_hits']} TP2:{_stats['tp2_hits']} SL:{_stats['sl_hits']} ⚡Cut:{_stats['instant_cuts']} 🧠:{_stats.get('smart_cuts',0)} Force:{_stats['force_closes']} [{bar}]")
+    print(f"     └─ TP1:{_stats['tp1_hits']} TP2:{_stats['tp2_hits']} SL:{_stats['sl_hits']} 🎯Mom:{_stats.get('mom_exits',0)} ⏏️Stag:{_stats.get('stag_exits',0)} 🧠:{_stats.get('smart_cuts',0)} ⚡Cut:{_stats['instant_cuts']} Force:{_stats['force_closes']} [{bar}]")
 
 
 def print_stats():
@@ -2384,7 +2484,7 @@ def print_stats():
         print(f"  💰 Paper equity: {_paper_balance['equity']:.4f}U (modal {_paper_balance['initial_usdt']:.0f}U)")
     print(f"  📐 Expectancy:{exp:+.5f}U | Sharpe:{sr:.2f} | MaxDD:{mdd:.4f}U")
     print(f"  📈 Best:{_stats['best_trade']:+.4f}U │ 📉 Worst:{_stats['worst_trade']:+.4f}U")
-    print(f"  🎯TP1:{_stats['tp1_hits']} ✨TP2:{_stats['tp2_hits']} 🛑SL:{_stats['sl_hits']} ⚡Cut:{_stats['instant_cuts']} 🧠Smart:{_stats.get('smart_cuts',0)} ⏰Force:{_stats['force_closes']}")
+    print(f"  🎯TP1:{_stats['tp1_hits']} ✨TP2:{_stats['tp2_hits']} 🛑SL:{_stats['sl_hits']} ⚡Cut:{_stats['instant_cuts']} 🧠Smart:{_stats.get('smart_cuts',0)} 🎯Mom:{_stats.get('mom_exits',0)} ⏏️Stag:{_stats.get('stag_exits',0)} ⏰Force:{_stats['force_closes']}")
     print(f"  🚫 Skip: Chop:{_stats['skipped_chop']} NoMom:{_stats['skipped_no_momentum']} MQ:{_stats['skipped_mq']} MeanRev:{_stats.get('skipped_mean_rev',0)}")
     print(f"       MTF:{_stats.get('skipped_mtf',0)} CandleAge:{_stats.get('skipped_candle_age',0)} Spread:{_stats['skipped_spread']} Blacklist:{_stats.get('skipped_blacklist',0)}")
     print(f"  🛡️  Kill switch: {'ACTIVE('+ks['reason']+')' if ks['active'] else 'OK'} | ConsecLoss:{ks['consec_losses']} | DailyPnL:{ks['daily_pnl']:+.2f}U | Lag:{ks['api_lag']*1000:.0f}ms")
