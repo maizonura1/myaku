@@ -1198,7 +1198,18 @@ def get_ob_imbalance(symbol):
 #  ENTRY SCORE ENGINE v15
 # ════════════════════════════════════════════════════
 def get_entry_score(symbol, df_5m, direction):
-    if df_5m is None or len(df_5m) < 30:
+    """
+    Entry scoring v15.5 — lebih ketat, lebih bermakna.
+
+    Perubahan dari v14/v15:
+    - RSI confirmation: LONG butuh RSI 45-72, SHORT butuh RSI 28-55
+      (hindari entry di ekstrem RSI yang sering reversal)
+    - Setiap kategori harus punya kontribusi positif minimal
+      (tidak bisa lolos hanya dari satu kategori saja)
+    - Struktur harga: breakout harus real (tidak false breakout)
+    - Volume harus seiring dengan arah momentum (bukan noise)
+    """
+    if df_5m is None or len(df_5m) < 35:
         return 0, []
 
     last  = df_5m.iloc[-1]
@@ -1207,49 +1218,83 @@ def get_entry_score(symbol, df_5m, direction):
     sigs  = []
     score = 0
 
-    # ── KATEGORI A: TREND (max 25) ────────────────────────
-    e3, e5, e9, e21 = last["ema3"], last["ema5"], last["ema9"], last["ema21"]
-    p = last["close"]
+    rsi      = last.get("rsi", 50)
+    rsi_fast = last.get("rsi_fast", 50)
+    p        = last["close"]
+
+    # ── HARD GATE: RSI overextension ──────────────────────
+    # Entry LONG saat RSI > 75 = beli di puncak, sering langsung balik
+    # Entry SHORT saat RSI < 25 = jual di bottom, sering reversal
+    if direction == "LONG"  and rsi > 75: return 0, []
+    if direction == "SHORT" and rsi < 25: return 0, []
+
+    # ── HARD GATE: RSI berlawanan arah ────────────────────
+    # LONG butuh RSI minimal 40 (ada ruang naik)
+    # SHORT butuh RSI maksimal 60 (ada ruang turun)
+    if direction == "LONG"  and rsi < 40: return 0, []
+    if direction == "SHORT" and rsi > 60: return 0, []
+
+    # ── KATEGORI A: TREND (max 30) ────────────────────────
+    e3, e5, e9, e21, e50 = (last["ema3"], last["ema5"], last["ema9"],
+                             last["ema21"], last["ema50"])
 
     trend_score = 0
     trend_sig   = ""
     if direction == "LONG":
-        if p > e3 > e5 > e9 > e21:
+        if p > e3 > e5 > e9 > e21 > e50:
+            trend_score = 30; trend_sig = "📐EMA_PERFECT↑"
+        elif p > e3 > e5 > e9 > e21:
             trend_score = 25; trend_sig = "📐EMA_STACK↑"
         elif p > e5 > e9 > e21:
             trend_score = 18; trend_sig = "📐EMA↑"
         elif p > e9 > e21:
-            trend_score = 12; trend_sig = "📐EMA_align↑"
+            trend_score = 10; trend_sig = "📐EMA_align↑"
     else:
-        if p < e3 < e5 < e9 < e21:
+        if p < e3 < e5 < e9 < e21 < e50:
+            trend_score = 30; trend_sig = "📐EMA_PERFECT↓"
+        elif p < e3 < e5 < e9 < e21:
             trend_score = 25; trend_sig = "📐EMA_STACK↓"
         elif p < e5 < e9 < e21:
             trend_score = 18; trend_sig = "📐EMA↓"
         elif p < e9 < e21:
-            trend_score = 12; trend_sig = "📐EMA_align↓"
+            trend_score = 10; trend_sig = "📐EMA_align↓"
+
+    # Bonus kalau RSI confirm arah
+    if direction == "LONG"  and 50 <= rsi <= 72: trend_score += 3
+    if direction == "SHORT" and 28 <= rsi <= 50: trend_score += 3
 
     score += trend_score
     if trend_sig: sigs.append(trend_sig)
 
-    # ── KATEGORI B: VOLATILITY/MOMENTUM (max 25) ──────────
-    mom5     = abs(last.get("mom5", 0))
-    vol_rat  = last["vol_ratio"]
-    atr_now  = last["atr"]
-    atr_prev = df_5m.iloc[-6]["atr"] if len(df_5m) > 6 else atr_now
-    atr_exp  = atr_now > atr_prev * 1.2
+    # ── KATEGORI B: MOMENTUM (max 25) ─────────────────────
+    mom5    = last.get("mom5", 0)
+    mom3    = last.get("mom3", 0)
+    vol_rat = last["vol_ratio"]
+    atr_now = last["atr"]
+    atr_pv  = df_5m.iloc[-6]["atr"] if len(df_5m) > 6 else atr_now
+    atr_exp = atr_now > atr_pv * 1.15
+
+    # Pastikan momentum searah dengan direction
+    mom_aligned = (mom5 > 0 and direction == "LONG") or (mom5 < 0 and direction == "SHORT")
+    mom5_abs    = abs(mom5)
+    mom3_abs    = abs(mom3)
 
     vol_score = 0
     vol_sig   = ""
-    if mom5 >= 0.008 and atr_exp:
-        vol_score = 25; vol_sig = f"🚀Mom{mom5*100:.1f}%+ATRexp"
-    elif mom5 >= 0.005 and vol_rat >= 2.0:
-        vol_score = 20; vol_sig = f"📈Mom{mom5*100:.1f}%+Vol{vol_rat:.1f}x"
-    elif mom5 >= 0.003:
-        vol_score = 13; vol_sig = f"📈Mom{mom5*100:.1f}%"
-    elif vol_rat >= 3.0:
-        vol_score = 13; vol_sig = f"🔥VolSurge{vol_rat:.1f}x"
-    elif vol_rat >= 2.0:
-        vol_score = 8
+    if mom_aligned:
+        if mom5_abs >= 0.008 and atr_exp and vol_rat >= 2.0:
+            vol_score = 25; vol_sig = f"🚀Mom{mom5_abs*100:.1f}%+ATR+Vol{vol_rat:.1f}x"
+        elif mom5_abs >= 0.005 and vol_rat >= 2.0:
+            vol_score = 20; vol_sig = f"📈Mom{mom5_abs*100:.1f}%+Vol{vol_rat:.1f}x"
+        elif mom5_abs >= 0.003 and vol_rat >= 1.5:
+            vol_score = 14; vol_sig = f"📈Mom{mom5_abs*100:.1f}%"
+        elif mom5_abs >= 0.002 and vol_rat >= 3.0:
+            vol_score = 12; vol_sig = f"🔥VolSurge{vol_rat:.1f}x"
+        elif mom5_abs >= 0.0015:
+            vol_score = 7
+    else:
+        # Momentum berlawanan = penalti besar
+        vol_score = -10
 
     score += vol_score
     if vol_sig: sigs.append(vol_sig)
@@ -1260,91 +1305,166 @@ def get_entry_score(symbol, df_5m, direction):
     h_p2   = prev2["macd_hist"]
     br     = last["buy_ratio"]
 
+    # MACD harus konsisten min 3 candle searah
+    macd_trend_long  = h_now > h_prev and h_prev > h_p2 and h_now > 0
+    macd_trend_short = h_now < h_prev and h_prev < h_p2 and h_now < 0
+    macd_cross_up    = h_p2 < 0 and h_prev < 0 and h_now >= 0
+    macd_cross_dn    = h_p2 > 0 and h_prev > 0 and h_now <= 0
+
     flow_score = 0
     flow_sig   = ""
     if direction == "LONG":
-        if h_now > 0 and h_now > h_prev > h_p2 and br > 0.55:
+        if macd_trend_long and br > 0.58:
             flow_score = 25; flow_sig = f"✅MACD↑↑+Buy{br:.0%}"
-        elif h_now > 0 and h_now > h_prev:
-            flow_score = 17; flow_sig = "✅MACD↑"
-        elif h_prev < 0 and h_now >= 0:
-            flow_score = 20; flow_sig = "⚡MACD_X0↑"
-        elif br > 0.60:
-            flow_score = 10; flow_sig = f"💧Buy{br:.0%}"
+        elif macd_trend_long:
+            flow_score = 18; flow_sig = "✅MACD↑↑"
+        elif macd_cross_up and br > 0.55:
+            flow_score = 22; flow_sig = f"⚡MACD_X0↑+Buy{br:.0%}"
+        elif macd_cross_up:
+            flow_score = 15; flow_sig = "⚡MACD_X0↑"
+        elif h_now > 0 and h_now > h_prev and br > 0.60:
+            flow_score = 10; flow_sig = f"💧MACD+Buy{br:.0%}"
+        elif br > 0.65:
+            flow_score = 8; flow_sig = f"💧Buy{br:.0%}"
     else:
-        if h_now < 0 and h_now < h_prev < h_p2 and br < 0.45:
+        if macd_trend_short and br < 0.42:
             flow_score = 25; flow_sig = f"✅MACD↓↓+Sell{1-br:.0%}"
-        elif h_now < 0 and h_now < h_prev:
-            flow_score = 17; flow_sig = "✅MACD↓"
-        elif h_prev > 0 and h_now <= 0:
-            flow_score = 20; flow_sig = "⚡MACD_X0↓"
-        elif br < 0.40:
-            flow_score = 10; flow_sig = f"💧Sell{1-br:.0%}"
+        elif macd_trend_short:
+            flow_score = 18; flow_sig = "✅MACD↓↓"
+        elif macd_cross_dn and br < 0.45:
+            flow_score = 22; flow_sig = f"⚡MACD_X0↓+Sell{1-br:.0%}"
+        elif macd_cross_dn:
+            flow_score = 15; flow_sig = "⚡MACD_X0↓"
+        elif h_now < 0 and h_now < h_prev and br < 0.40:
+            flow_score = 10; flow_sig = f"💧MACD+Sell{1-br:.0%}"
+        elif br < 0.35:
+            flow_score = 8; flow_sig = f"💧Sell{1-br:.0%}"
 
     score += flow_score
     if flow_sig: sigs.append(flow_sig)
 
-    # ── KATEGORI D: MARKET STRUCTURE (max 25) ─────────────
-    recent_hi = df_5m.iloc[-6:-1]["high"].max()
-    recent_lo = df_5m.iloc[-6:-1]["low"].min()
+    # ── KATEGORI D: MARKET STRUCTURE (max 20) ─────────────
+    # Breakout harus dikonfirmasi volume dan body kuat
+    # Hindari false breakout (breakout tanpa volume)
+    recent_hi = df_5m.iloc[-8:-1]["high"].max()
+    recent_lo = df_5m.iloc[-8:-1]["low"].min()
+    candle_range = last["high"] - last["low"]
+    is_strong_candle = last["body_ratio"] > 0.55 and last["vol_ratio"] > 1.5
+
     struct_score = 0
     struct_sig   = ""
-
     if direction == "LONG":
-        if p > recent_hi and last["body_ratio"] > 0.6 and last["vol_ratio"] > 1.5:
-            struct_score = 25; struct_sig = "🚀BreakoutBull"
-        elif last["close"] > last["open"] and last["close"] > prev["high"] and last["body_ratio"] > 0.6:
-            struct_score = 20; struct_sig = "🕯️Engulf↑"
-        elif p > recent_hi:
-            struct_score = 12; struct_sig = "📈Breakout↑"
+        confirmed_breakout = p > recent_hi and is_strong_candle
+        engulf = (last["close"] > last["open"]
+                  and last["close"] > prev["high"]
+                  and last["body_ratio"] > 0.65
+                  and last["vol_ratio"] > 1.3)
+        if confirmed_breakout and last["vol_ratio"] > 2.0:
+            struct_score = 20; struct_sig = "🚀BreakoutBull"
+        elif confirmed_breakout:
+            struct_score = 14; struct_sig = "📈Breakout↑"
+        elif engulf:
+            struct_score = 18; struct_sig = "🕯️Engulf↑"
+        elif p > recent_hi and last["vol_ratio"] > 2.5:
+            struct_score = 10; struct_sig = "📈HiBreak↑"
     else:
-        if p < recent_lo and last["body_ratio"] > 0.6 and last["vol_ratio"] > 1.5:
-            struct_score = 25; struct_sig = "💥BreakoutBear"
-        elif last["close"] < last["open"] and last["close"] < prev["low"] and last["body_ratio"] > 0.6:
-            struct_score = 20; struct_sig = "🕯️Engulf↓"
-        elif p < recent_lo:
-            struct_score = 12; struct_sig = "📈Breakout↓"
+        confirmed_breakdown = p < recent_lo and is_strong_candle
+        engulf = (last["close"] < last["open"]
+                  and last["close"] < prev["low"]
+                  and last["body_ratio"] > 0.65
+                  and last["vol_ratio"] > 1.3)
+        if confirmed_breakdown and last["vol_ratio"] > 2.0:
+            struct_score = 20; struct_sig = "💥BreakdownBear"
+        elif confirmed_breakdown:
+            struct_score = 14; struct_sig = "📉Breakdown↓"
+        elif engulf:
+            struct_score = 18; struct_sig = "🕯️Engulf↓"
+        elif p < recent_lo and last["vol_ratio"] > 2.5:
+            struct_score = 10; struct_sig = "📉LoBreak↓"
 
     score += struct_score
     if struct_sig: sigs.append(struct_sig)
 
-    return max(0, min(score, 100)), sigs
+    # ── VETO: Kategori penting harus ada kontribusi ────────
+    # Kalau tidak ada trend DAN tidak ada structure → score sangat rendah
+    if trend_score == 0 and struct_score == 0:
+        return 0, []   # tidak ada base, skip
+
+    # Kalau MACD berlawanan kuat (negatif sementara entry LONG, atau sebaliknya)
+    if direction == "LONG"  and h_now < 0 and h_prev < 0 and h_p2 < 0:
+        score -= 15    # penalti: semua MACD negatif untuk LONG
+    if direction == "SHORT" and h_now > 0 and h_prev > 0 and h_p2 > 0:
+        score -= 15
+
+    return max(0, min(100, score)), sigs
 
 
 def determine_direction(df_5m, df_15m=None):
+    """
+    Tentukan arah entry. v15.5: lebih ketat.
+    - Butuh minimal 8 poin (naik dari 6)
+    - Keunggulan minimal 4 poin dari arah lawan (bukan hanya 1)
+    - RSI harus mendukung arah
+    """
     if df_5m is None or len(df_5m) < 20: return None
     last   = df_5m.iloc[-1]
     prev   = df_5m.iloc[-2]
     price  = last["close"]
-    e3, e5, e9 = last["ema3"], last["ema5"], last["ema9"]
+    e3, e5, e9, e21 = last["ema3"], last["ema5"], last["ema9"], last["ema21"]
+    rsi    = last.get("rsi", 50)
     long_pts = short_pts = 0
 
-    if price > e3 > e5 > e9:   long_pts  += 4
-    elif price < e3 < e5 < e9: short_pts += 4
-    elif price > e5 > e9:      long_pts  += 2
-    elif price < e5 < e9:      short_pts += 2
+    # EMA stack — paling kuat
+    if price > e3 > e5 > e9 > e21:  long_pts  += 5
+    elif price < e3 < e5 < e9 < e21: short_pts += 5
+    elif price > e5 > e9 > e21:     long_pts  += 3
+    elif price < e5 < e9 < e21:     short_pts += 3
+    elif price > e9 > e21:          long_pts  += 1
+    elif price < e9 < e21:          short_pts += 1
 
+    # Momentum 5 candle
     mom5 = last.get("mom5", 0)
-    if mom5 > 0.002:    long_pts  += 3
-    elif mom5 < -0.002: short_pts += 3
+    if mom5 > 0.003:    long_pts  += 3
+    elif mom5 > 0.001:  long_pts  += 1
+    elif mom5 < -0.003: short_pts += 3
+    elif mom5 < -0.001: short_pts += 1
 
-    if last["macd_hist"] > prev["macd_hist"]: long_pts  += 2
-    else:                                     short_pts += 2
+    # MACD histogram — harus 2 candle searah
+    h_now  = last["macd_hist"]
+    h_prev = prev["macd_hist"]
+    if h_now > 0 and h_prev > 0 and h_now > h_prev:  long_pts  += 2
+    elif h_now < 0 and h_prev < 0 and h_now < h_prev: short_pts += 2
+    elif h_now > h_prev:                               long_pts  += 1
+    else:                                              short_pts += 1
 
-    if last["buy_ratio"] > 0.55 and last["close"] > last["open"]:   long_pts  += 2
-    elif last["buy_ratio"] < 0.45 and last["close"] < last["open"]: short_pts += 2
+    # Buy/sell pressure + candle arah
+    br = last.get("buy_ratio", 0.5)
+    if br > 0.58 and last["close"] > last["open"]:   long_pts  += 2
+    elif br < 0.42 and last["close"] < last["open"]: short_pts += 2
 
+    # RSI confirmation
+    if 48 <= rsi <= 68:   long_pts  += 2   # RSI zona bullish ideal
+    elif 32 <= rsi <= 52: short_pts += 2   # RSI zona bearish ideal
+    elif rsi > 72:        short_pts += 1   # RSI terlalu tinggi → bias SHORT
+    elif rsi < 28:        long_pts  += 1   # RSI terlalu rendah → bias LONG
+
+    # 15m higher timeframe
     if df_15m is not None and len(df_15m) >= 20:
         l15 = df_15m.iloc[-1]
-        if l15["ema9"] > l15["ema21"]: long_pts  += 2
-        else:                          short_pts += 2
+        e9_15  = l15.get("ema9",  l15["close"])
+        e21_15 = l15.get("ema21", l15["close"])
+        if e9_15 > e21_15: long_pts  += 2
+        else:              short_pts += 2
 
+    # BTC macro
     btc_t = _macro.get("btc_trend_5m", "UNKNOWN")
-    if btc_t in BULL_TRENDS:  long_pts  += 2
-    elif btc_t in BEAR_TRENDS: short_pts += 2
+    if btc_t in BULL_TRENDS:   long_pts  += 2
+    elif btc_t in BEAR_TRENDS:  short_pts += 2
 
-    if long_pts > short_pts and long_pts >= 6:  return "LONG"
-    if short_pts > long_pts and short_pts >= 6: return "SHORT"
+    # Keputusan: butuh ≥ 8 poin DAN keunggulan ≥ 4 dari lawan
+    margin = 4
+    if long_pts >= 8  and long_pts  - short_pts >= margin: return "LONG"
+    if short_pts >= 8 and short_pts - long_pts  >= margin: return "SHORT"
     return None
 
 
