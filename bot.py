@@ -78,7 +78,7 @@ if PAPER_TRADING:
 
 # ── CORE ─────────────────────────────────────────────────
 LEVERAGE              = 20
-ORDER_USDT            = 2
+ORDER_USDT            = 1
 MAX_POSITIONS         = 3
 
 # ── ATR MULTIPLIER ───────────────────────────────────────
@@ -157,18 +157,25 @@ HOLD_MULT_LOSS_SMALL  = 0.90         # Rugi kecil → 6.3 menit
 
 LOSS_BIG_THRESHOLD    = -0.003       # Rugi > 0.3% = besar
 
-# ── MOMENTUM EXIT (baru v15.5) ───────────────────────────
+# ── MOMENTUM EXIT (v15.5) ────────────────────────────────
 # Keluar dari posisi profit saat momentum melambat/berbalik
-# Lebih baik ambil profit kecil daripada tunggu habis waktu
-MOM_EXIT_PROFIT_MIN   = 0.0008       # Minimal profit 0.08% untuk trigger
-MOM_EXIT_TIME_MIN     = 0.30         # Sudah lewat minimal 30% waktu
+MOM_EXIT_PROFIT_MIN   = 0.0006       # Minimal profit 0.06%
+MOM_EXIT_TIME_MIN     = 0.35         # Sudah lewat minimal 35% waktu
 MOM_EXIT_SCORE_MAX    = 0            # Momentum <= 0 (netral atau negatif)
 
-# ── STAGNATION EXIT (baru v15.5) ─────────────────────────
-# Posisi tidak bergerak = buang slot → keluar lebih cepat
-STAG_CHECK_MIN        = 2.5          # Cek stagnasi setelah 2.5 menit
-STAG_PROFIT_MAX       = 0.0002       # "Stagnan" = profit < 0.02%
+# ── STAGNATION EXIT (v15.6 fix) ──────────────────────────
+# ONDOUSDT bug: profit 0.06% stuck 5 menit tidak keluar karena
+# STAG_PROFIT_MAX 0.02% terlalu ketat — harga lebih dari itu.
+# Fix: stagnasi = harga TIDAK NAIK dalam window terakhir,
+# bukan hanya kalau profit kecil.
+# Pakai 2 kondisi:
+# A) Profit kecil (< 0.05%) + sudah 2.5m + momentum netral → keluar
+# B) Profit ada tapi tidak bertambah selama 3 menit + sudah 55% waktu → keluar
+STAG_CHECK_MIN        = 2.5          # Cek mulai menit 2.5
+STAG_PROFIT_MAX       = 0.0005       # Kondisi A: profit < 0.05%
 STAG_MOM_MAX          = 0            # Dan momentum tidak positif
+STAG_STUCK_MIN        = 3.0          # Kondisi B: stuck selama 3 menit
+STAG_STUCK_TIME_RATIO = 0.55         # Dan sudah 55% dari max hold
 
 # ── SCAN & TIMING ────────────────────────────────────────
 SCAN_INTERVAL         = 3
@@ -199,8 +206,8 @@ FUNDING_TTL           = 30
 TOP_MOVERS_TTL        = 8
 
 # ── FILTER UTAMA ──────────────────────────────────────────
-MIN_SCORE             = 50       # v15.5: sedikit turun, TP1 lebih mudah dicapai
-MIN_ENTRY_SIGNALS     = 2
+MIN_SCORE             = 48       # v15.6: turun sedikit untuk frekuensi lebih baik
+MIN_ENTRY_SIGNALS     = 2        # Tetap 2 — sudah cukup ketat dari scoring baru
 MIN_FNG               = 15
 MAX_FNG_LONG          = 92
 MIN_BREADTH           = 0.0
@@ -2387,12 +2394,26 @@ def manage_positions():
                 continue
 
             # ── StagnationExit LONG ───────────────────────────
-            # Posisi tidak bergerak setelah 2.5+ menit → buang slot
-            if (not pos["tp1_hit"]
-                    and hold_min >= STAG_CHECK_MIN
-                    and abs(profit_pct) <= STAG_PROFIT_MAX
-                    and mom_score <= STAG_MOM_MAX):
-                close_trade(symbol, f"⏏️StagExit({profit_pct*100:+.3f}%)")
+            # Kondisi A: profit kecil + sudah 2.5m + momentum tidak positif
+            stag_a = (hold_min >= STAG_CHECK_MIN
+                      and abs(profit_pct) <= STAG_PROFIT_MAX
+                      and mom_score <= STAG_MOM_MAX)
+            # Kondisi B: profit ada tapi tidak bertambah (stuck) + sudah 55% waktu
+            # Track high water mark profit untuk deteksi stuck
+            if "profit_hwm" not in pos:
+                pos["profit_hwm"]      = profit_pct
+                pos["profit_hwm_time"] = hold_min
+            elif profit_pct > pos["profit_hwm"]:
+                pos["profit_hwm"]      = profit_pct
+                pos["profit_hwm_time"] = hold_min
+            stuck_duration = hold_min - pos["profit_hwm_time"]
+            stag_b = (profit_pct > 0
+                      and stuck_duration >= STAG_STUCK_MIN
+                      and time_ratio >= STAG_STUCK_TIME_RATIO
+                      and mom_score <= 0)
+            if not pos["tp1_hit"] and (stag_a or stag_b):
+                reason_tag = "A" if stag_a else f"B(stuck{stuck_duration:.1f}m)"
+                close_trade(symbol, f"⏏️StagExit{reason_tag}({profit_pct*100:+.3f}%)")
                 continue
 
             # Smart tighten trail: profit sudah ada + momentum berbalik confirmed
@@ -2497,11 +2518,23 @@ def manage_positions():
                 continue
 
             # ── StagnationExit SHORT ──────────────────────────
-            if (not pos["tp1_hit"]
-                    and hold_min >= STAG_CHECK_MIN
-                    and abs(profit_pct) <= STAG_PROFIT_MAX
-                    and mom_score <= STAG_MOM_MAX):
-                close_trade(symbol, f"⏏️StagExit({profit_pct*100:+.3f}%)")
+            stag_a = (hold_min >= STAG_CHECK_MIN
+                      and abs(profit_pct) <= STAG_PROFIT_MAX
+                      and mom_score <= STAG_MOM_MAX)
+            if "profit_hwm" not in pos:
+                pos["profit_hwm"]      = profit_pct
+                pos["profit_hwm_time"] = hold_min
+            elif profit_pct > pos["profit_hwm"]:
+                pos["profit_hwm"]      = profit_pct
+                pos["profit_hwm_time"] = hold_min
+            stuck_duration = hold_min - pos["profit_hwm_time"]
+            stag_b = (profit_pct > 0
+                      and stuck_duration >= STAG_STUCK_MIN
+                      and time_ratio >= STAG_STUCK_TIME_RATIO
+                      and mom_score <= 0)
+            if not pos["tp1_hit"] and (stag_a or stag_b):
+                reason_tag = "A" if stag_a else f"B(stuck{stuck_duration:.1f}m)"
+                close_trade(symbol, f"⏏️StagExit{reason_tag}({profit_pct*100:+.3f}%)")
                 continue
 
             # Smart tighten trail SHORT
