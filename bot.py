@@ -78,7 +78,7 @@ if PAPER_TRADING:
 
 # ── CORE ─────────────────────────────────────────────────
 LEVERAGE              = 20
-ORDER_USDT            = 1
+ORDER_USDT            = 2
 MAX_POSITIONS         = 3
 
 # ── ATR MULTIPLIER ───────────────────────────────────────
