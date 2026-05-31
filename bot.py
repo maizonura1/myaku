@@ -1507,9 +1507,11 @@ def determine_direction(df_5m, df_15m=None):
 def get_market_quality():
     """
     Market Quality score 0-100.
-    v15.6: Fix breadth 5% + MILD_BEAR scoring terlalu tinggi (77).
-    MEAN_REV mode = hard block entry.
-    Breadth ekstrem hanya bonus kalau BTC juga confirm arah tsb.
+
+    v15.7: MEAN_REV tidak lagi hard block 100%.
+    Kalau BTC SIDEWAYS tapi ada coin individual yang trending kuat
+    (terdeteksi dari breadth ekstrem), masih bisa entry.
+    Yang di-block total hanya kalau SEMUA kondisi jelek sekaligus.
     """
     btc_5m  = _macro.get("btc_trend_5m",  "UNKNOWN")
     btc_15m = _macro.get("btc_trend_15m", "UNKNOWN")
@@ -1518,43 +1520,41 @@ def get_market_quality():
     fng     = _macro.get("fng", 50)
     mode    = _macro.get("scalp_mode", "TREND")
 
-    # Hard block: MEAN_REV = jangan entry apapun
-    if mode == "MEAN_REV":
-        return 20   # di bawah MQ_MIN_ENTRY = skip
-
     btc_trends = [btc_5m, btc_15m, btc_1h]
     bull_count = sum(1 for t in btc_trends if t in BULL_TRENDS)
     bear_count = sum(1 for t in btc_trends if t in BEAR_TRENDS)
+    sideways_count = sum(1 for t in btc_trends if t == "SIDEWAYS")
     max_agree  = max(bull_count, bear_count)
 
-    # Hard block: BTC tidak ada agreement
-    if max_agree < 2:
-        return 28
+    # Hard block HANYA kalau semua kondisi jelek sekaligus:
+    # BTC semua SIDEWAYS + breadth abu-abu + mode MEAN_REV
+    all_btc_sideways = sideways_count >= 2
+    breadth_gray     = 0.38 <= breadth <= 0.62
+    if all_btc_sideways and breadth_gray and mode == "MEAN_REV":
+        return 20   # benar-benar tidak ada arah
 
-    # Hard block: breadth abu-abu
-    if 0.35 <= breadth <= 0.65:
-        return 35
+    # MEAN_REV dengan breadth ekstrem = ada arah di individual coin, tapi kurangi score
+    mean_rev_penalty = -15 if mode == "MEAN_REV" else 8
 
-    score = 50
+    score = 50 + mean_rev_penalty
 
     # BTC agreement
-    if max_agree == 3:   score += 25
+    if max_agree == 3:   score += 22
     elif max_agree == 2: score += 10
+    elif all_btc_sideways: score -= 15
 
-    # Breadth hanya bonus kalau selaras dengan BTC
-    if breadth >= 0.75 and bull_count >= 2:
-        score += 18   # bullish market + BTC bull
-    elif breadth <= 0.15 and bear_count >= 2:
-        score += 12   # bearish market + BTC bear (SHORT bisa valid)
-    elif breadth >= 0.65 and bull_count >= 1:
-        score += 8
-    elif breadth <= 0.25 and bear_count >= 1:
-        score += 5
-    elif breadth <= 0.15:
-        score -= 5    # breadth sangat rendah tapi BTC tidak bear = anomali
+    # Breadth — hanya bonus kalau selaras dengan BTC atau sangat ekstrem
+    if breadth >= 0.80 and bull_count >= 1:
+        score += 18
+    elif breadth <= 0.15 and bear_count >= 1:
+        score += 15
+    elif breadth >= 0.70 or breadth <= 0.20:
+        score += 8    # ada arah meski BTC mixed
+    elif breadth_gray:
+        score -= 12   # abu-abu = noise
 
     # F&G
-    if 28 <= fng <= 72:
+    if 25 <= fng <= 75:
         score += 5
     elif fng < 18 or fng > 88:
         score -= 12
@@ -1565,8 +1565,8 @@ def get_market_quality():
 
 
 # Threshold market quality untuk entry
-MQ_MIN_ENTRY     = 48    # v15.6: naik dari 45 — lebih selektif
-MQ_HIGH_QUALITY  = 70    # v15.6: naik dari 65
+MQ_MIN_ENTRY     = 42    # v15.7: turun dari 48 — lebih banyak entry
+MQ_HIGH_QUALITY  = 65    # di atas ini: score threshold lebih rendah
 
 
 # ════════════════════════════════════════════════════
@@ -1671,19 +1671,12 @@ def should_enter(symbol):
     is_strong_bear = (btc_5m == "BEAR" and btc_15m in BEAR_TRENDS
                       and breadth < 0.25 and btc_1h in BEAR_TRENDS)
 
-    # MEAN_REV: skip semua entry kecuali SHORT di strong bear market yang confirmed
-    if scalp_mode == "MEAN_REV":
-        if direction == "LONG":
-            _stats["skipped_mean_rev"] += 1
-            return None, "skip_MEAN_REV_LONG"
-        if direction == "SHORT":
-            # Untuk SHORT di MEAN_REV, butuh strong bear + BTC 5m harus BEAR (bukan MILD)
-            if not is_strong_bear:
-                _stats["skipped_mean_rev"] += 1
-                return None, f"skip_MEAN_REV_SHORT(bear={is_strong_bear},BTC5m={btc_5m})"
+    # MEAN_REV mode — sebelumnya block semua. Sekarang: izinkan entry
+    # kalau ada signal kuat di coin individual (akan dicek setelah scoring).
+    # Tandai saja untuk penalti score nanti.
+    mean_rev_active = (scalp_mode == "MEAN_REV")
 
     # Bear market: block LONG kalau kondisi benar-benar bearish
-    # Pakai is_strong_bear (bukan MILD_BEAR + breadth 30%)
     if BEAR_BLOCK_LONG and is_strong_bear and direction == "LONG":
         return None, f"bear_mkt_block_LONG(breadth={breadth*100:.0f}%)"
 
@@ -1697,20 +1690,24 @@ def should_enter(symbol):
 
     score, sigs = get_entry_score(symbol, df_5m, direction)
 
-    # Bear market bonus: hanya kalau benar-benar strong bear
+    # Bear market bonus
     if is_strong_bear and direction == "SHORT":
         score = min(100, score + BEAR_SHORT_SCORE_BONUS)
 
     min_score_now = get_session_min_score()
 
-    # Market Quality adjustment:
-    # Kalau market bagus (MQ >= 65): threshold turun 3 poin (lebih mudah entry)
-    # Kalau market biasa (45-65): threshold normal
-    # → mq sudah pasti >= MQ_MIN_ENTRY di sini karena sudah lolos gate di atas
+    # MEAN_REV: izinkan entry tapi butuh score lebih tinggi (signal harus lebih jelas)
+    if mean_rev_active:
+        min_score_now = max(min_score_now, 60)   # butuh score ≥ 60 di MEAN_REV
+        if score < 60:
+            _stats["skipped_mean_rev"] += 1
+            return None, f"skip_MEAN_REV(score={score}<60)"
+
+    # Market Quality adjustment
     if mq >= MQ_HIGH_QUALITY:
         min_score_now = max(MIN_SCORE - 3, min_score_now - 3)
-    elif mq < 55:
-        min_score_now = min_score_now + 5   # market kurang bagus: threshold naik 5
+    elif mq < 50:
+        min_score_now = min_score_now + 4
 
     if is_strong_bear and direction == "SHORT":
         min_score_now = min(min_score_now, BEAR_MIN_SCORE_SHORT)
