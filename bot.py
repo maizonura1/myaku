@@ -78,7 +78,7 @@ if PAPER_TRADING:
 
 # ── CORE ─────────────────────────────────────────────────
 LEVERAGE              = 20
-ORDER_USDT            = 2
+ORDER_USDT            = 1
 MAX_POSITIONS         = 3
 
 # ── ATR MULTIPLIER ───────────────────────────────────────
@@ -212,6 +212,11 @@ MIN_FNG               = 15
 MAX_FNG_LONG          = 92
 MIN_BREADTH           = 0.0
 MAX_SL_ATR_PCT        = 0.009
+
+# Hard cap dollar loss per trade — worst case tidak boleh lebih dari ini
+# Dengan $1 trade × 20x leverage, jika SL 0.5% → loss = $1 × 0.5% × 20 = $0.10
+# Set cap di $0.12 = SL max efektif 0.6% dengan leverage 20x
+MAX_LOSS_PER_TRADE_USD = 0.12
 
 # ── SPREAD ────────────────────────────────────────────────
 MAX_SPREAD_RATIO      = 0.28
@@ -982,17 +987,32 @@ def run_ta(df):
 
 
 def _calc_trend(df):
+    """
+    v15.6: Lebih konservatif — hanya BULL/BEAR kalau semua kondisi terpenuhi.
+    MILD hanya kalau cukup kuat, tidak sembarangan.
+    Ini penting karena TREND WR 52% PnL -2.54U menunjukkan
+    banyak entry di kondisi yang salah dikira TREND.
+    """
     if df is None or len(df) < 25: return "UNKNOWN"
     c     = df["close"]
     price = c.iloc[-1]
     ema9  = ta.trend.EMAIndicator(c, 9).ema_indicator().iloc[-1]
     ema21 = ta.trend.EMAIndicator(c, 21).ema_indicator().iloc[-1]
     ema50 = ta.trend.EMAIndicator(c, 50).ema_indicator().iloc[-1]
-    chg   = (price - c.iloc[-4]) / c.iloc[-4] * 100
-    if price > ema9 > ema21 > ema50 and chg > 0:   return "BULL"
-    elif price < ema9 < ema21 < ema50 and chg < 0: return "BEAR"
-    elif price > ema21 and chg > -0.2:             return "MILD_BULL"
-    elif price < ema21 and chg < 0.2:              return "MILD_BEAR"
+    # Pakai 6 candle terakhir untuk chg — lebih reliable dari 4
+    chg   = (price - c.iloc[-7]) / c.iloc[-7] * 100
+
+    # BULL: alignment ketat + pergerakan nyata ke atas
+    if price > ema9 > ema21 > ema50 and chg > 0.3:
+        return "BULL"
+    # BEAR: alignment ketat + pergerakan nyata ke bawah
+    elif price < ema9 < ema21 < ema50 and chg < -0.3:
+        return "BEAR"
+    # MILD hanya kalau pergerakan cukup signifikan
+    elif price > ema9 > ema21 and chg > 0.1:
+        return "MILD_BULL"
+    elif price < ema9 < ema21 and chg < -0.1:
+        return "MILD_BEAR"
     return "SIDEWAYS"
 
 
@@ -1005,7 +1025,16 @@ def calc_atr_levels(entry, atr, direction):
     raw_tp2_dist = atr * ATR_TP2_MULT
     raw_ic_dist  = atr * INSTANT_CUT_MULT
 
+    # Hard cap SL: tidak boleh lebih dari MAX_SL_PCT% dari entry
     sl_dist  = max(entry * MIN_SL_PCT, min(raw_sl_dist, entry * MAX_SL_PCT))
+
+    # Hard cap dollar loss: dengan leverage 20x dan ORDER_USDT $1,
+    # max loss per trade = ORDER_USDT × (sl_pct × LEVERAGE)
+    # Worst case v15.5: -$0.32 dari $1 trade = 32% loss = SL 1.6% × 20x
+    # Fix: cap SL sehingga max loss tidak lebih dari MAX_LOSS_PER_TRADE_USD
+    max_sl_dollar = MAX_LOSS_PER_TRADE_USD / LEVERAGE  # sebagai % dari modal per trade
+    sl_dist = min(sl_dist, entry * max_sl_dollar)
+
     tp1_dist = max(entry * MIN_TP1_PCT, raw_tp1_dist)
     tp2_dist = min(entry * MAX_TP2_PCT, raw_tp2_dist)
     tp2_dist = max(tp2_dist, tp1_dist * 1.4)
@@ -1478,17 +1507,10 @@ def determine_direction(df_5m, df_15m=None):
 def get_market_quality():
     """
     Market Quality score 0-100.
-
-    PENTING: Score rendah = bot TIDAK entry.
-    Desain baru: lebih mudah dapat score rendah (skip) di kondisi buruk,
-    lebih sulit dapat score tinggi (entry bebas).
-
-    Kondisi buruk yang langsung return score rendah:
-    - BTC semua TF tidak agree (choppy)
-    - Breadth di zona abu-abu (40-60%) = tidak ada arah
-    - F&G ekstrem + BTC mixed = berbahaya
+    v15.6: Fix breadth 5% + MILD_BEAR scoring terlalu tinggi (77).
+    MEAN_REV mode = hard block entry.
+    Breadth ekstrem hanya bonus kalau BTC juga confirm arah tsb.
     """
-    btc_1m  = _macro.get("btc_trend_1m",  "UNKNOWN")
     btc_5m  = _macro.get("btc_trend_5m",  "UNKNOWN")
     btc_15m = _macro.get("btc_trend_15m", "UNKNOWN")
     btc_1h  = _macro.get("btc_trend_1h",  "UNKNOWN")
@@ -1496,54 +1518,55 @@ def get_market_quality():
     fng     = _macro.get("fng", 50)
     mode    = _macro.get("scalp_mode", "TREND")
 
-    btc_trends = [btc_5m, btc_15m, btc_1h]   # pakai 3 TF utama, skip 1m (noise)
+    # Hard block: MEAN_REV = jangan entry apapun
+    if mode == "MEAN_REV":
+        return 20   # di bawah MQ_MIN_ENTRY = skip
+
+    btc_trends = [btc_5m, btc_15m, btc_1h]
     bull_count = sum(1 for t in btc_trends if t in BULL_TRENDS)
     bear_count = sum(1 for t in btc_trends if t in BEAR_TRENDS)
     max_agree  = max(bull_count, bear_count)
 
-    # ── Hard block conditions ─────────────────────────────
-    # 1. BTC semua TF tidak ada yang agree jelas (max agree < 2 dari 3 TF)
+    # Hard block: BTC tidak ada agreement
     if max_agree < 2:
-        return 30   # Langsung score rendah — market choppy
+        return 28
 
-    # 2. Breadth di zona abu-abu 35-65% = pasar terbagi, tidak ada arah
+    # Hard block: breadth abu-abu
     if 0.35 <= breadth <= 0.65:
-        return 38   # Masih di bawah MQ_MIN_ENTRY = skip entry
+        return 35
 
-    # ── Scoring normal ────────────────────────────────────
     score = 50
 
+    # BTC agreement
     if max_agree == 3:   score += 25
     elif max_agree == 2: score += 10
 
-    # Breadth ekstrem = arah jelas
-    if breadth >= 0.75 or breadth <= 0.20:
-        score += 20
-    elif breadth >= 0.65 or breadth <= 0.25:
-        score += 12
-    elif breadth >= 0.55 or breadth <= 0.35:
+    # Breadth hanya bonus kalau selaras dengan BTC
+    if breadth >= 0.75 and bull_count >= 2:
+        score += 18   # bullish market + BTC bull
+    elif breadth <= 0.15 and bear_count >= 2:
+        score += 12   # bearish market + BTC bear (SHORT bisa valid)
+    elif breadth >= 0.65 and bull_count >= 1:
+        score += 8
+    elif breadth <= 0.25 and bear_count >= 1:
         score += 5
+    elif breadth <= 0.15:
+        score -= 5    # breadth sangat rendah tapi BTC tidak bear = anomali
 
     # F&G
-    if 25 <= fng <= 75:
-        score += 5    # Normal range
-    elif fng < 15 or fng > 90:
-        score -= 15   # Ekstrem berbahaya
+    if 28 <= fng <= 72:
+        score += 5
+    elif fng < 18 or fng > 88:
+        score -= 12
     else:
-        score -= 5
-
-    # Mode
-    if mode == "TREND":
-        score += 8
-    else:
-        score -= 8
+        score -= 3
 
     return max(0, min(100, score))
 
 
 # Threshold market quality untuk entry
-MQ_MIN_ENTRY     = 45    # di bawah ini: skip semua entry
-MQ_HIGH_QUALITY  = 65    # di atas ini: izinkan entry dengan score lebih rendah
+MQ_MIN_ENTRY     = 48    # v15.6: naik dari 45 — lebih selektif
+MQ_HIGH_QUALITY  = 70    # v15.6: naik dari 65
 
 
 # ════════════════════════════════════════════════════
