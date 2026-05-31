@@ -1,27 +1,29 @@
 """
-Bot Scalping v15b — PAPER TRADE ENGINE (FIXED)
-================================================
-FIX dari v15:
-✅ INSTANT CUT berlaku SETIAP TICK — bukan cuma 8 tick pertama
-   Kalau minus walau -0.000001 pun, CUT! Tidak ada posisi bleeding
-✅ DIRECTION LOGIC diperbaiki — tidak bias SHORT
-   Wajib ada konfirmasi EMA + momentum + volume SELARAS
-   BTC SIDEWAYS → skip SHORT kecuali ada sinyal kuat
-✅ TRAILING UPDATE — trail ikut harga terus tiap tick
-✅ 150+ SYMBOLS — semua coin Binance Futures yang liquid
+Bot Scalping v15c — PAPER TRADE ENGINE (ROOT CAUSE FIXED)
+===========================================================
+FIX dari v15b — 3 root cause diperbaiki:
 
-[v15b FLIP MOD]
-✅ DIRECTION DIBALIK — kalau analisa LONG → eksekusi SHORT, dan sebaliknya
-   Logic scoring TIDAK diubah, hanya hasil akhirnya di-flip sebelum open posisi
-✅ FLIP FILTER — tolak entry kalau trend terlalu kuat untuk countertrend:
-   - Score > 65 → skip (sinyal terlalu dominan)
-   - BuyPow > 78% saat mau flip SHORT → skip
-   - SellPow > 78% saat mau flip LONG → skip
-   - Momentum > 0.3% → skip (trend masih berlari kencang)
-✅ COOLDOWN diperpanjang 20s saat FLIP aktif (vs 4s normal)
+ROOT CAUSE #1: IC KEGEDEAN
+  Dulu: IC = entry ± 0.25x ATR → bisa -0.2% sebelum cut
+  Fix:  IC = entry ± 0.08% FIXED → max loss -0.08% × 20lev = -$0.016/trade
+  
+ROOT CAUSE #2: TP1 TERLALU JAUH  
+  Dulu: TP1 = 1.2x ATR → susah kena, profit jarang hit
+  Fix:  TP1 = entry ± 0.12% FIXED → lebih sering kena, WR naik
 
-MODE: SIMULASI PENUH — tidak ada order nyata ke Binance
-API connect untuk harga live, tapi eksekusi hanya di log
+ROOT CAUSE #3: POSISI BLEEDING TIDAK DI-CUT
+  Dulu: Trail hanya update kalau price bergerak sesuai arah
+         Kalau melawan → trail diam → posisi bisa bleeding bebas
+  Fix:  HARD PNL GUARD — kalau pnl < -0.10% dari entry → CUT SEKARANG
+         Tidak peduli trail, tidak peduli IC, langsung potong
+
+LOGIKA BARU:
+  Entry → Profit? Trail ikut terus naik/turun
+  Entry → Minus -0.08%? IC cut langsung
+  Entry → Minus > -0.10% (any time)? Hard PNL guard cut
+  Profit → Trail → Harga balik? Trail stop
+  
+MODE: SIMULASI — tidak ada order nyata ke Binance
 """
 
 import os, time, math, threading, queue
@@ -38,105 +40,56 @@ load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
-# ═══════════════════════════════════════════
-#  CONFIG
-# ═══════════════════════════════════════════
-LEVERAGE         = 20
-ORDER_USDT       = 1.0
-MAX_POSITIONS    = 3
+# ═══════════════════════════════════════════════════════
+#  CONFIG v15c — TIGHT RISK, QUICK PROFIT
+# ═══════════════════════════════════════════════════════
+LEVERAGE       = 20
+ORDER_USDT     = 1.0
+MAX_POSITIONS  = 3
 
-ATR_SL_MULT      = 1.8
-ATR_TP1_MULT     = 1.2
-ATR_TP2_MULT     = 3.0
-ATR_TRAIL_MULT   = 0.5
+# ── FIXED % LEVELS (bukan ATR-based untuk SL/TP) ──────
+# Dengan leverage 20x:
+#   TP1 0.12% × 20 = +2.4% dari modal ($0.024 profit dari $1)
+#   IC  0.08% × 20 = -1.6% dari modal ($0.016 loss max per trade)
+#   Guard 0.10% × 20 = -2.0% dari modal ($0.020 hard max)
+TP1_PCT        = 0.0012   # +0.12% dari entry → TP1 partial
+TP2_PCT        = 0.0035   # +0.35% dari entry → TP2 full
+IC_PCT         = 0.0008   # -0.08% dari entry → instant cut
+HARD_LOSS_PCT  = 0.0010   # -0.10% dari entry → hard PNL guard (cut no matter what)
 
-MIN_SL_PCT       = 0.0010
-MAX_SL_PCT       = 0.0055
-MIN_TP1_PCT      = 0.0012
-MAX_TP2_PCT      = 0.0150
+# Trail: aktif setelah profit 0.05%, width 0.08%
+TRAIL_ACTIVATE = 0.0005   # Profit 0.05% baru trail on
+TRAIL_WIDTH    = 0.0008   # Trail ikut harga dengan jarak 0.08%
 
-TP1_CLOSE_RATIO  = 0.60
+# TP1 partial — tutup 60%, sisakan 40% untuk trail ke TP2
+TP1_RATIO      = 0.60
 
-# ── INSTANT CUT — berlaku SETIAP TICK ──────
-INSTANT_CUT_MULT = 0.25
+# Kecepatan
+SCAN_INTERVAL  = 1
+MONITOR_INT    = 0.25     # Monitor tiap 250ms
+SCAN_DELAY     = 0.015
+BATCH_SIZE     = 25
+MAX_WORKERS    = 12
+MAX_HOLD_SEC   = 180      # Max hold 3 menit
 
-# ── TRAIL: aktif sejak profit pertama (>0) ──
-TRAIL_ACTIVATE_PCT = 0.0001
+# Score threshold
+MIN_SCORE      = 38
+COOLDOWN_SEC   = 4
 
-SCAN_INTERVAL    = 1
-MONITOR_INTERVAL = 0.3
-SCAN_DELAY       = 0.015
-BATCH_SIZE       = 25
-MAX_WORKERS      = 12
-MAX_HOLD_SEC     = 240
+# Kill switch
+DAILY_LOSS     = -10.0    # Lebih ketat karena per-trade loss lebih kecil
+CONSEC_MAX     = 8
+CONSEC_PAUSE   = 30
 
-MIN_SCORE        = 35
-SYMBOL_COOLDOWN  = 4
+# Cache TTL
+TTL_5M         = 5
+TTL_15M        = 30
 
-DAILY_LOSS_LIMIT = -15.0
-CONSEC_MAX       = 7
-CONSEC_PAUSE     = 45
-
-TTL_1M  = 2
-TTL_5M  = 5
-TTL_15M = 30
-
-# ═══════════════════════════════════════════
-#  FLIP DIRECTION — UBAH INI JADI False UNTUK BALIK KE NORMAL
-# ═══════════════════════════════════════════
-FLIP_DIRECTION = True   # True = LONG→SHORT, SHORT→LONG
-
-# ── FILTER KHUSUS SAAT FLIP AKTIF ──────────
-# Countertrend trade tidak boleh masuk kalau trend terlalu kuat
-# Score terlalu tinggi = sinyal terlalu dominan = berbahaya di-flip
-FLIP_MAX_SCORE    = 65    # Tolak kalau score > 65 (trend terlalu kuat)
-FLIP_MAX_BUYPOW   = 0.78  # Tolak kalau buy ratio > 78% saat mau flip SHORT
-FLIP_MIN_SELLPOW  = 0.22  # Tolak kalau buy ratio < 22% saat mau flip LONG
-FLIP_MAX_MOM      = 0.003 # Tolak kalau momentum > 0.3% (terlalu kencang)
-FLIP_COOLDOWN     = 20    # Cooldown lebih panjang saat flip (detik)
-
-def flip(direction):
-    """Balik arah kalau FLIP_DIRECTION aktif."""
-    if not FLIP_DIRECTION:
-        return direction
-    return "SHORT" if direction == "LONG" else "LONG"
-
-def flip_filter_ok(direction_orig, score, df):
-    """
-    Filter entry untuk mode FLIP — tolak kalau trend terlalu kuat.
-    direction_orig = arah SEBELUM di-flip (hasil dari scoring).
-    Kalau return False → skip entry ini.
-    """
-    if not FLIP_DIRECTION:
-        return True
-
-    last = df.iloc[-1]
-    buy_r = last["buy_r"]
-    mom5  = abs(last["mom5"])
-
-    # Tolak kalau score terlalu tinggi — trend terlalu dominan
-    if score > FLIP_MAX_SCORE:
-        return False
-
-    # Mau flip ke SHORT (aslinya LONG) — tolak kalau buy pressure masih sangat tinggi
-    if direction_orig == "LONG" and buy_r > FLIP_MAX_BUYPOW:
-        return False
-
-    # Mau flip ke LONG (aslinya SHORT) — tolak kalau sell pressure masih sangat tinggi
-    if direction_orig == "SHORT" and buy_r < FLIP_MIN_SELLPOW:
-        return False
-
-    # Tolak kalau momentum terlalu kencang (trend masih berlari)
-    if mom5 > FLIP_MAX_MOM:
-        return False
-
-    return True
-
-# ═══════════════════════════════════════════
-#  SYMBOLS — 160 coins Binance Futures
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
+#  SYMBOLS — 158 coins
+# ═══════════════════════════════════════════════════════
 SYMBOLS = [
-    # Tier 1 — mega cap
+    # Tier 1 — mega cap, spread kecil
     "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT",
     "DOGEUSDT","AVAXUSDT","TRXUSDT","DOTUSDT","LINKUSDT","MATICUSDT",
     "LTCUSDT","SHIBUSDT","BCHUSDT","XLMUSDT","ATOMUSDT","UNIUSDT","ETCUSDT",
@@ -145,45 +98,42 @@ SYMBOLS = [
     "NEARUSDT","APTUSDT","ARBUSDT","OPUSDT","INJUSDT","SUIUSDT",
     "TIAUSDT","AAVEUSDT","RUNEUSDT","FILUSDT","LDOUSDT","STXUSDT",
     "MKRUSDT","SNXUSDT","CRVUSDT","COMPUSDT","GMXUSDT","PENDLEUSDT",
-    "DYDXUSDT","SUSHIUSDT","1INCHUSDT","BALUSDT","PERMUSDT",
+    "DYDXUSDT","SUSHIUSDT","1INCHUSDT","BALUSDT",
 
     # Tier 3 — mid cap momentum
     "1000PEPEUSDT","WIFUSDT","JUPUSDT","SEIUSDT","FETUSDT","RENDERUSDT",
     "WLDUSDT","ALGOUSDT","ICPUSDT","FTMUSDT","HBARUSDT","EGLDUSDT",
     "FLOWUSDT","THETAUSDT","KAVAUSDT","AXSUSDT","SANDUSDT","MANAUSDT",
-    "ENJUSDT","GALAUSDT","IMXUSDT","BLURUSDT","MASKUSDT","HIGHUSDT",
+    "ENJUSDT","GALAUSDT","IMXUSDT","MASKUSDT","HIGHUSDT",
     "ORDIUSDT","ARUSDT","KASUSDT","TONUSDT","TAOUSDT","ONDOUSDT",
-    "ENARUSDT","BOMEUSDT","WUSDT","JUPUSDT","EIGENUSDT","STRKUSDT",
+    "ENARUSDT","WUSDT","EIGENUSDT","STRKUSDT",
 
     # Tier 4 — altcoin liquid
     "JTOUSDT","RAYUSDT","GMTUSDT","APEUSDT","GRTUSDT","BATUSDT",
     "CHZUSDT","ZILUSDT","HOTUSDT","IOSTUSDT","VETUSDT","ICXUSDT",
     "ONTUSDT","QTUMUSDT","WAVESUSDT","XTZUSDT","NEOUSDT","DASHUSDT",
-    "ZECUSDT","XMRUSDT","RVNUSDT","DGBUSDT","SCUSDT","ANKRUSDT",
-    "CELRUSDT","CTSIUSDT","SKLUSDT","BANDUSDT","BLZUSDT","COTIUSDT",
-    "OGNUSDT","LINAUSDT","SFPUSDT","FLMUSDT","TLMUSDT","BNTUSDT",
-    "1000XECUSDT","PERPUSDT","LITUSDT","UNFIUSDT","DENTUSDT",
-    "OGNUSDT","AGLDUSDT","IDUSDT","GASUSDT","CFXUSDT","COMBOUSDT",
+    "ZECUSDT","RVNUSDT","ANKRUSDT","CELRUSDT","CTSIUSDT","SKLUSDT",
+    "BANDUSDT","BLZUSDT","COTIUSDT","OGNUSDT","LINAUSDT","SFPUSDT",
+    "FLMUSDT","TLMUSDT","BNTUSDT","1000XECUSDT","PERPUSDT","LITUSDT",
+    "UNFIUSDT","DENTUSDT","AGLDUSDT","CFXUSDT","COMBOUSDT",
     "POLYXUSDT","TRUUSDT","OCEANUSDT","AMBUSDT","RENUSDT","CVCUSDT",
     "VOXELUSDT","NMRUSDT","HOOKUSDT","GLMRUSDT","CKBUSDT","MOVRUSDT",
 
-    # Tier 5 — meme & new listings
+    # Tier 5 — meme & new
     "1000BONKUSDT","FLOKIUSDT","LUNCUSDT","JASMYUSDT","BEAMXUSDT",
     "MEMEUSDT","RONINUSDT","NOTUSDT","DOGSUSDT","CATIUSDT","PORTALUSDT",
-    "VANRYUSDT","XAIUSDT","ATAUSDT","PYTHUSDT","WIFUSDT","SEIUSDT",
-    "ALTUSDT","DYMUSDT","PIXELUSDT","ACEUSDT","MANTAUSDT","ZETAUSDT",
-    "SAFEUSDT","ENAUSDT","JUPUSDT","STRKUSDT","RUNEUSDT",
+    "VANRYUSDT","XAIUSDT","ATAUSDT","PYTHUSDT","ALTUSDT","DYMUSDT",
+    "PIXELUSDT","ACEUSDT","MANTAUSDT","ZETAUSDT","SAFEUSDT",
 
-    # Defi / Layer2
+    # DeFi
     "AAVEUSDT","UNIUSDT","DYDXUSDT","GMXUSDT","PENDLEUSDT","CRVUSDT",
     "MKRUSDT","COMPUSDT","SNXUSDT","1INCHUSDT","BALUSDT","SUSHIUSDT",
 ]
-# Deduplicate
 SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 #  STATE
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 paper_positions = {}
 trade_log       = []
 _ohlcv_cache    = {}
@@ -195,81 +145,67 @@ _executor       = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q       = queue.Queue()
 _hot_syms       = deque(maxlen=20)
 
-_macro = {"fng": 50, "btc_5m": "UNKNOWN", "last_fng": 0, "last_btc": 0}
-
-_ks = {
-    "active": False, "reason": "", "resume": 0,
-    "consec": 0, "daily_pnl": 0.0, "daily_reset": 0,
-}
-
+_macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
+_ks    = {"active": False, "reason": "", "resume": 0,
+          "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0,
     "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "tp1": 0, "tp2": 0, "sl": 0, "cut": 0, "force": 0,
-    "pnl_hist": deque(maxlen=200),
-    "start": time.time(),
+    "tp1": 0, "tp2": 0, "sl": 0, "cut": 0, "guard": 0, "force": 0,
+    "hist": deque(maxlen=200), "start": time.time(),
 }
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 #  UTILS
-# ═══════════════════════════════════════════
-def calc_qty(price):
+# ═══════════════════════════════════════════════════════
+def qty(price):
     return (ORDER_USDT * LEVERAGE) / price
 
-def get_price_live(symbol):
+def price_live(symbol):
     try:
         return float(client.futures_symbol_ticker(symbol=symbol)["price"])
     except:
         return 0.0
 
-def get_ticker_all():
+def tickers_all():
     global _ticker_cache, _ticker_ts
     now = time.time()
     if now - _ticker_ts < 5 and _ticker_cache:
         return _ticker_cache
     try:
-        tickers = client.futures_ticker()
-        new = {}
-        for t in tickers:
-            new[t["symbol"]] = {
-                "pct":  float(t["priceChangePercent"]),
-                "vol":  float(t["quoteVolume"]),
-                "last": float(t["lastPrice"]),
-            }
+        raw = client.futures_ticker()
+        new = {t["symbol"]: {
+            "pct": float(t["priceChangePercent"]),
+            "vol": float(t["quoteVolume"]),
+            "last": float(t["lastPrice"]),
+        } for t in raw}
         _ticker_cache = new
-        _ticker_ts = now
+        _ticker_ts    = now
         return new
     except:
         return _ticker_cache
 
-def cooldown_ok(sym):
-    if sym not in _sym_cooldown:
-        return True
-    cd = FLIP_COOLDOWN if FLIP_DIRECTION else SYMBOL_COOLDOWN
-    return (time.time() - _sym_cooldown[sym]) >= cd
+def ok_cooldown(sym):
+    return (time.time() - _sym_cooldown.get(sym, 0)) >= COOLDOWN_SEC
 
-def set_cooldown(sym):
+def set_cd(sym):
     _sym_cooldown[sym] = time.time()
 
-# ═══════════════════════════════════════════
-#  OHLCV CACHE
-# ═══════════════════════════════════════════
-def get_ohlcv(symbol, interval, limit=80):
+# ═══════════════════════════════════════════════════════
+#  OHLCV
+# ═══════════════════════════════════════════════════════
+def ohlcv(symbol, interval, limit=80):
     key = (symbol, interval)
     now = time.time()
-    ttl_map = {
-        Client.KLINE_INTERVAL_1MINUTE:  TTL_1M,
-        Client.KLINE_INTERVAL_5MINUTE:  TTL_5M,
-        Client.KLINE_INTERVAL_15MINUTE: TTL_15M,
-    }
-    ttl = ttl_map.get(interval, 10)
+    ttl = {Client.KLINE_INTERVAL_5MINUTE: TTL_5M,
+           Client.KLINE_INTERVAL_15MINUTE: TTL_15M}.get(interval, 10)
     if key in _ohlcv_cache:
         ts, df = _ohlcv_cache[key]
         if now - ts < ttl:
             return df
     try:
-        klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(klines, columns=[
+        kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+        df = pd.DataFrame(kl, columns=[
             "time","open","high","low","close","volume",
             "ct","qv","trades","tbbase","tbquote","ignore"])
         for c in ["open","high","low","close","volume","tbbase","tbquote"]:
@@ -278,356 +214,266 @@ def get_ohlcv(symbol, interval, limit=80):
         _ohlcv_cache[key] = (now, df)
         return df
     except:
-        if key in _ohlcv_cache:
-            return _ohlcv_cache[key][1]
-        return None
+        return _ohlcv_cache.get(key, (None, None))[1]
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 #  TA
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 def run_ta(df):
     c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
-    df["rsi"]      = ta.momentum.RSIIndicator(c, 14).rsi()
-    macd           = ta.trend.MACD(c, 12, 26, 9)
-    df["macd_h"]   = macd.macd_diff()
-    df["ema5"]     = ta.trend.EMAIndicator(c, 5).ema_indicator()
-    df["ema9"]     = ta.trend.EMAIndicator(c, 9).ema_indicator()
-    df["ema21"]    = ta.trend.EMAIndicator(c, 21).ema_indicator()
-    df["ema50"]    = ta.trend.EMAIndicator(c, 50).ema_indicator()
-    df["atr"]      = ta.volatility.AverageTrueRange(h, l, c, 14).average_true_range()
-    df["vol_ma"]   = v.rolling(20).mean()
-    df["vol_r"]    = v / df["vol_ma"].replace(0, 1)
-    df["buy_r"]    = df["tbbase"] / df["volume"].replace(0, 1)
-    df["body"]     = abs(c - df["open"])
-    df["range_"]   = h - l
-    df["body_r"]   = df["body"] / df["range_"].replace(0, 1)
-    df["mom3"]     = (c - c.shift(3)) / c.shift(3)
-    df["mom5"]     = (c - c.shift(5)) / c.shift(5)
-    df["hi_roll"]  = h.rolling(14).max()
-    df["lo_roll"]  = l.rolling(14).min()
+    df["rsi"]  = ta.momentum.RSIIndicator(c, 14).rsi()
+    df["mh"]   = ta.trend.MACD(c, 12, 26, 9).macd_diff()
+    df["e5"]   = ta.trend.EMAIndicator(c, 5).ema_indicator()
+    df["e9"]   = ta.trend.EMAIndicator(c, 9).ema_indicator()
+    df["e21"]  = ta.trend.EMAIndicator(c, 21).ema_indicator()
+    df["e50"]  = ta.trend.EMAIndicator(c, 50).ema_indicator()
+    df["atr"]  = ta.volatility.AverageTrueRange(h, l, c, 14).average_true_range()
+    df["vm"]   = v.rolling(20).mean()
+    df["vr"]   = v / df["vm"].replace(0, 1)
+    df["br"]   = df["tbbase"] / df["volume"].replace(0, 1)
+    df["body"] = abs(c - df["open"])
+    df["rng"]  = h - l
+    df["br2"]  = df["body"] / df["rng"].replace(0, 1)
+    df["m5"]   = (c - c.shift(5)) / c.shift(5)
+    df["m3"]   = (c - c.shift(3)) / c.shift(3)
     return df
 
-def calc_btc_trend():
+def btc_trend():
     try:
-        df = get_ohlcv("BTCUSDT", Client.KLINE_INTERVAL_5MINUTE, 60)
+        df = ohlcv("BTCUSDT", Client.KLINE_INTERVAL_5MINUTE, 60)
         if df is None or len(df) < 30:
             return "UNKNOWN"
-        df = run_ta(df.copy())
-        last = df.iloc[-1]
-        p, e5, e9, e21 = last["close"], last["ema5"], last["ema9"], last["ema21"]
-        mom5 = last["mom5"]
-        if p > e5 > e9 > e21 and mom5 > 0.001:
-            return "BULL"
-        if p < e5 < e9 < e21 and mom5 < -0.001:
-            return "BEAR"
-        if p > e9 > e21:
-            return "MILD_BULL"
-        if p < e9 < e21:
-            return "MILD_BEAR"
+        df  = run_ta(df.copy())
+        row = df.iloc[-1]
+        p, e5, e9, e21 = row["close"], row["e5"], row["e9"], row["e21"]
+        m5 = row["m5"]
+        if p > e5 > e9 > e21 and m5 > 0.001: return "BULL"
+        if p < e5 < e9 < e21 and m5 < -0.001: return "BEAR"
+        if p > e9 > e21: return "MILD_BULL"
+        if p < e9 < e21: return "MILD_BEAR"
         return "SIDEWAYS"
     except:
         return "UNKNOWN"
 
-# ═══════════════════════════════════════════
-#  ATR LEVELS
-# ═══════════════════════════════════════════
-def calc_levels(entry, atr, direction):
-    sl_d  = max(entry * MIN_SL_PCT, min(atr * ATR_SL_MULT, entry * MAX_SL_PCT))
-    tp1_d = max(entry * MIN_TP1_PCT, atr * ATR_TP1_MULT)
-    tp2_d = min(entry * MAX_TP2_PCT, atr * ATR_TP2_MULT)
-    tp2_d = max(tp2_d, tp1_d * 1.6)
-    ic_d  = atr * INSTANT_CUT_MULT
-
-    if direction == "LONG":
-        return {
-            "sl":       entry - sl_d,
-            "tp1":      entry + tp1_d,
-            "tp2":      entry + tp2_d,
-            "ic":       entry - ic_d,
-            "trail_sl": entry,
-            "sl_pct":   sl_d / entry,
-            "tp1_pct":  tp1_d / entry,
-        }
-    else:
-        return {
-            "sl":       entry + sl_d,
-            "tp1":      entry - tp1_d,
-            "tp2":      entry - tp2_d,
-            "ic":       entry + ic_d,
-            "trail_sl": entry,
-            "sl_pct":   sl_d / entry,
-            "tp1_pct":  tp1_d / entry,
-        }
-
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 #  KILL SWITCH
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 def ks_check():
-    ks = _ks
-    now = time.time()
-    if ks["active"] and now >= ks["resume"]:
-        ks["active"] = False
-        ks["consec"] = 0
-        print("  ✅ Kill switch cleared")
-    if ks["active"]:
-        return True, ks["reason"]
+    k, now = _ks, time.time()
+    if k["active"] and now >= k["resume"]:
+        k["active"] = False; k["consec"] = 0
+        print("  ✅ Kill switch off")
+    if k["active"]:
+        return True, k["reason"]
     day = now - (now % 86400)
-    if day > ks["daily_reset"]:
-        ks["daily_pnl"] = 0.0
-        ks["daily_reset"] = day
-    if ks["daily_pnl"] <= DAILY_LOSS_LIMIT:
-        ks["active"] = True
-        ks["reason"] = f"daily_loss({ks['daily_pnl']:.2f})"
-        ks["resume"] = day + 86400
-        print(f"  🚨 KS: daily loss {ks['daily_pnl']:.2f}")
-        return True, ks["reason"]
-    if ks["consec"] >= CONSEC_MAX:
-        ks["active"] = True
-        ks["reason"] = f"consec({ks['consec']})"
-        ks["resume"] = now + CONSEC_PAUSE
-        print(f"  🚨 KS: {ks['consec']} loss beruntun — pause {CONSEC_PAUSE}s")
-        return True, ks["reason"]
+    if day > k["day_reset"]:
+        k["daily"] = 0.0; k["day_reset"] = day
+    if k["daily"] <= DAILY_LOSS:
+        k["active"] = True; k["reason"] = f"daily({k['daily']:.2f})"
+        k["resume"] = day + 86400
+        return True, k["reason"]
+    if k["consec"] >= CONSEC_MAX:
+        k["active"] = True; k["reason"] = f"consec({k['consec']})"
+        k["resume"] = now + CONSEC_PAUSE
+        print(f"  🚨 {k['consec']} loss beruntun — pause {CONSEC_PAUSE}s")
+        return True, k["reason"]
     return False, ""
 
-def ks_update(pnl):
-    _ks["daily_pnl"] += pnl
-    if pnl < 0:
-        _ks["consec"] += 1
-    else:
-        _ks["consec"] = 0
+def ks_upd(pnl):
+    _ks["daily"] += pnl
+    _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
-# ═══════════════════════════════════════════
-#  ENTRY SCORE
-# ═══════════════════════════════════════════
-def get_direction_and_score(df):
-    """
-    Scoring tidak diubah sama sekali.
-    Flip direction dilakukan di luar fungsi ini (di scan_one).
-    """
-    if df is None or len(df) < 30:
+# ═══════════════════════════════════════════════════════
+#  SIGNAL ENGINE v15c — BALANCED DIRECTION
+# ═══════════════════════════════════════════════════════
+def signal(df):
+    if df is None or len(df) < 35:
         return None, 0, []
 
-    last  = df.iloc[-1]
+    row   = df.iloc[-1]
     prev  = df.iloc[-2]
     prev2 = df.iloc[-3]
-    prev3 = df.iloc[-4]
 
-    p    = last["close"]
-    e5   = last["ema5"]
-    e9   = last["ema9"]
-    e21  = last["ema21"]
-    e50  = last["ema50"]
-    rsi  = last["rsi"]
-    h_n  = last["macd_h"]
-    h_p  = prev["macd_h"]
-    h_p2 = prev2["macd_h"]
-    vol  = last["vol_r"]
-    br   = last["buy_r"]
-    m5   = last["mom5"]
-    m3   = last["mom3"]
-    br   = last["buy_r"]
-    body = last["body_r"]
-    btc  = _macro.get("btc_5m", "UNKNOWN")
+    p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
+    rsi   = row["rsi"]
+    mh    = row["mh"]
+    mh_p  = prev["mh"]
+    mh_p2 = prev2["mh"]
+    vr    = row["vr"]
+    br    = row["br"]
+    m5    = row["m5"]
+    m3    = row["m3"]
+    body  = row["br2"]
+    btc   = _macro["btc"]
 
-    long_pts = short_pts = 0
-    sigs_l = []
-    sigs_s = []
+    lp = sp = 0
+    sl = ss = []
 
-    # ══ A. EMA ALIGNMENT ══
-    if p > e5 > e9 > e21 > e50:
-        long_pts += 30; sigs_l.append("EMA_stack↑")
-    elif p > e5 > e9 > e21:
-        long_pts += 22; sigs_l.append("EMA_full↑")
-    elif p > e9 > e21:
-        long_pts += 14; sigs_l.append("EMA↑")
-    elif p > e9 and e9 > e21:
-        long_pts += 7
+    # ═ A. EMA stack ═══════════════════
+    if p > e5 > e9 > e21 > e50:   lp += 30; sl.append("EMA_stack↑")
+    elif p > e5 > e9 > e21:        lp += 22; sl.append("EMA↑↑")
+    elif p > e9 > e21:             lp += 14; sl.append("EMA↑")
+    elif p > e9:                   lp += 7
 
-    if p < e5 < e9 < e21 < e50:
-        short_pts += 30; sigs_s.append("EMA_stack↓")
-    elif p < e5 < e9 < e21:
-        short_pts += 22; sigs_s.append("EMA_full↓")
-    elif p < e9 < e21:
-        short_pts += 14; sigs_s.append("EMA↓")
-    elif p < e9 and e9 < e21:
-        short_pts += 7
+    if p < e5 < e9 < e21 < e50:   sp += 30; ss.append("EMA_stack↓")
+    elif p < e5 < e9 < e21:        sp += 22; ss.append("EMA↓↓")
+    elif p < e9 < e21:             sp += 14; ss.append("EMA↓")
+    elif p < e9:                   sp += 7
 
-    # ══ B. MOMENTUM ══
-    if m5 > 0.004:
-        long_pts += 22; sigs_l.append(f"Mom+{m5*100:.1f}%")
-    elif m5 > 0.002:
-        long_pts += 14; sigs_l.append(f"Mom+{m5*100:.1f}%")
-    elif m5 > 0.001:
-        long_pts += 7
+    # ═ B. Momentum — WAJIB selaras ════
+    if m5 > 0.005:    lp += 25; sl.append(f"Mom+{m5*100:.1f}%")
+    elif m5 > 0.003:  lp += 18; sl.append(f"Mom+{m5*100:.1f}%")
+    elif m5 > 0.001:  lp += 10
+    elif m5 < -0.001: lp = max(0, lp - 12)   # momentum berlawanan = penalti
 
-    if m5 < -0.004:
-        short_pts += 22; sigs_s.append(f"Mom{m5*100:.1f}%")
-    elif m5 < -0.002:
-        short_pts += 14; sigs_s.append(f"Mom{m5*100:.1f}%")
-    elif m5 < -0.001:
-        short_pts += 7
+    if m5 < -0.005:   sp += 25; ss.append(f"Mom{m5*100:.1f}%")
+    elif m5 < -0.003: sp += 18; ss.append(f"Mom{m5*100:.1f}%")
+    elif m5 < -0.001: sp += 10
+    elif m5 > 0.001:  sp = max(0, sp - 12)
 
-    if m5 > 0.001: short_pts = max(0, short_pts - 10)
-    if m5 < -0.001: long_pts = max(0, long_pts - 10)
+    # ═ C. MACD ════════════════════════
+    if mh_p <= 0 and mh > 0:       lp += 22; sl.append("MACD_X↑")   # crossover
+    elif mh > 0 and mh > mh_p > mh_p2: lp += 18; sl.append("MACD↑↑")
+    elif mh > 0 and mh > mh_p:     lp += 12; sl.append("MACD↑")
 
-    # ══ C. MACD ══
-    if h_n > 0 and h_n > h_p > h_p2:
-        long_pts += 18; sigs_l.append("MACD↑↑")
-    elif h_n > 0 and h_n > h_p:
-        long_pts += 12; sigs_l.append("MACD↑")
-    elif h_p <= 0 and h_n > 0:
-        long_pts += 20; sigs_l.append("MACD_X↑")
+    if mh_p >= 0 and mh < 0:       sp += 22; ss.append("MACD_X↓")
+    elif mh < 0 and mh < mh_p < mh_p2: sp += 18; ss.append("MACD↓↓")
+    elif mh < 0 and mh < mh_p:     sp += 12; ss.append("MACD↓")
 
-    if h_n < 0 and h_n < h_p < h_p2:
-        short_pts += 18; sigs_s.append("MACD↓↓")
-    elif h_n < 0 and h_n < h_p:
-        short_pts += 12; sigs_s.append("MACD↓")
-    elif h_p >= 0 and h_n < 0:
-        short_pts += 20; sigs_s.append("MACD_X↓")
+    # ═ D. Volume ══════════════════════
+    if vr >= 3.0:
+        lp += 15; sp += 15
+        sl.append(f"Vol{vr:.1f}x"); ss.append(f"Vol{vr:.1f}x")
+    elif vr >= 2.0: lp += 8; sp += 8
+    elif vr >= 1.5: lp += 4; sp += 4
+    elif vr < 0.8:  lp = max(0, lp - 5); sp = max(0, sp - 5)  # volume sepi = penalti
 
-    # ══ D. VOLUME ══
-    if vol >= 3.0:
-        long_pts += 12; short_pts += 12
-        sigs_l.append(f"Vol{vol:.1f}x"); sigs_s.append(f"Vol{vol:.1f}x")
-    elif vol >= 2.0:
-        long_pts += 7; short_pts += 7
-    elif vol >= 1.5:
-        long_pts += 3; short_pts += 3
+    # ═ E. Buy/Sell pressure ══════════
+    if br > 0.65:    lp += 15; sl.append(f"Buy{br:.0%}")
+    elif br > 0.57:  lp += 8
+    elif br < 0.43:  lp = max(0, lp - 10)
 
-    # ══ E. ORDER FLOW ══
-    if br > 0.62:
-        long_pts += 12; sigs_l.append(f"BuyPow{br:.0%}")
-    elif br > 0.55:
-        long_pts += 6
-    if br < 0.38:
-        short_pts += 12; sigs_s.append(f"SellPow{1-br:.0%}")
-    elif br < 0.45:
-        short_pts += 6
+    if br < 0.35:    sp += 15; ss.append(f"Sell{1-br:.0%}")
+    elif br < 0.43:  sp += 8
+    elif br > 0.57:  sp = max(0, sp - 10)
 
-    if br > 0.58: short_pts = max(0, short_pts - 8)
-    if br < 0.42: long_pts  = max(0, long_pts - 8)
+    # ═ F. RSI ═════════════════════════
+    if 48 < rsi < 65 and m5 > 0:   lp += 6   # RSI rising, not overbought
+    if 35 < rsi < 52 and m5 < 0:   sp += 6   # RSI falling, not oversold
+    if rsi > 72: lp = int(lp * 0.6)           # overbought → pangkas long
+    if rsi < 28: sp = int(sp * 0.6)           # oversold → pangkas short
 
-    # ══ F. RSI ══
-    if 40 <= rsi <= 60:
-        pass
-    elif rsi > 65:
-        long_pts = int(long_pts * 0.7)
-    elif rsi < 35:
-        short_pts = int(short_pts * 0.7)
+    # ═ G. Candle body ═════════════════
+    if row["close"] > row["open"] and body > 0.6: lp += 6
+    if row["close"] < row["open"] and body > 0.6: sp += 6
 
-    if 50 < rsi < 70 and long_pts > short_pts:
-        long_pts += 5
-    if 30 < rsi < 50 and short_pts > long_pts:
-        short_pts += 5
-
-    # ══ G. CANDLE BODY ══
-    if last["close"] > last["open"] and body > 0.55:
-        long_pts += 5
-    if last["close"] < last["open"] and body > 0.55:
-        short_pts += 5
-
-    # ══ H. BTC CONTEXT ══
+    # ═ H. BTC alignment — BOBOT BESAR ═
     if btc == "BULL":
-        long_pts  += 10
-        short_pts  = max(0, short_pts - 15)
+        lp += 12
+        sp  = max(0, sp - 20)   # Melawan BTC bull = -20 poin
     elif btc == "MILD_BULL":
-        long_pts  += 5
-        short_pts  = max(0, short_pts - 8)
+        lp += 6
+        sp  = max(0, sp - 10)
     elif btc == "BEAR":
-        short_pts += 10
-        long_pts   = max(0, long_pts - 15)
+        sp += 12
+        lp  = max(0, lp - 20)
     elif btc == "MILD_BEAR":
-        short_pts += 5
-        long_pts   = max(0, long_pts - 8)
-    elif btc == "SIDEWAYS":
+        sp += 6
+        lp  = max(0, lp - 10)
+    elif btc in ("SIDEWAYS", "UNKNOWN"):
+        # Sideways: naikkan threshold, tidak ada tambahan poin
         pass
 
-    # ══ DECISION ══
-    gap = abs(long_pts - short_pts)
-    btc_sideways = (btc == "SIDEWAYS" or btc == "UNKNOWN")
-    min_score_req = 45 if btc_sideways else MIN_SCORE
+    # ═ DECISION ═══════════════════════
+    btc_sw = btc in ("SIDEWAYS", "UNKNOWN")
+    thresh = 50 if btc_sw else MIN_SCORE  # lebih ketat saat BTC sideways
+    gap    = abs(lp - sp)
 
-    if long_pts > short_pts and long_pts >= min_score_req and gap >= 10:
-        return "LONG", long_pts, sigs_l[:3]
-    if short_pts > long_pts and short_pts >= min_score_req and gap >= 10:
-        return "SHORT", short_pts, sigs_s[:3]
+    # Gap minimal 15 poin — supaya tidak entry saat ambiguous
+    if lp > sp and lp >= thresh and gap >= 15:
+        return "LONG", lp, sl[:3]
+    if sp > lp and sp >= thresh and gap >= 15:
+        return "SHORT", sp, ss[:3]
+    return None, max(lp, sp), []
 
-    return None, max(long_pts, short_pts), []
-
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 #  PAPER OPEN
-# ═══════════════════════════════════════════
-def paper_open(symbol, direction, score, signals, atr, price):
+# ═══════════════════════════════════════════════════════
+def paper_open(sym, direction, score, sigs, price):
     with _lock:
-        if symbol in paper_positions:
+        if sym in paper_positions or len(paper_positions) >= MAX_POSITIONS:
             return
-        if len(paper_positions) >= MAX_POSITIONS:
-            return
-        paper_positions[symbol] = {"_reserved": True}
+        paper_positions[sym] = {"_r": True}
 
-    entry = price
-    qty   = calc_qty(entry)
-    lv    = calc_levels(entry, atr, direction)
+    q = qty(price)
+
+    # Levels berdasarkan FIXED %
+    if direction == "LONG":
+        ic      = price * (1 - IC_PCT)
+        hard_sl = price * (1 - HARD_LOSS_PCT)
+        tp1     = price * (1 + TP1_PCT)
+        tp2     = price * (1 + TP2_PCT)
+        trail   = price * (1 - TRAIL_WIDTH)  # initial trail = dekat entry
+    else:
+        ic      = price * (1 + IC_PCT)
+        hard_sl = price * (1 + HARD_LOSS_PCT)
+        tp1     = price * (1 - TP1_PCT)
+        tp2     = price * (1 - TP2_PCT)
+        trail   = price * (1 + TRAIL_WIDTH)
 
     pos = {
-        "side":       direction,
-        "entry":      entry,
-        "qty":        qty,
-        "qty_remain": qty,
-        "sl":         lv["sl"],
-        "tp1":        lv["tp1"],
-        "tp2":        lv["tp2"],
-        "ic":         lv["ic"],
-        "trail_sl":   lv["trail_sl"],
-        "peak":       entry,
-        "trail_on":   False,
-        "tp1_hit":    False,
-        "be_on":      False,
-        "open_time":  time.time(),
-        "atr":        atr,
-        "score":      score,
-        "signals":    signals,
+        "side":      direction,
+        "entry":     price,
+        "qty":       q,
+        "qty_rem":   q,
+        "ic":        ic,
+        "hard_sl":   hard_sl,   # ← BARU: hard PNL guard, selalu aktif
+        "tp1":       tp1,
+        "tp2":       tp2,
+        "trail_sl":  trail,
+        "peak":      price,
+        "trail_on":  False,
+        "tp1_hit":   False,
+        "be_on":     False,
+        "open_time": time.time(),
+        "score":     score,
+        "sigs":      sigs,
     }
     with _lock:
-        paper_positions[symbol] = pos
+        paper_positions[sym] = pos
 
-    d   = "🟢" if direction == "LONG" else "🔴"
-    sl  = lv["sl_pct"] * 100
-    tp1 = lv["tp1_pct"] * 100
-    ic_pct = (INSTANT_CUT_MULT * atr / entry) * 100
-    flip_tag = " [FLIPPED]" if FLIP_DIRECTION else ""
-    print(f"\n  {d} [PAPER] [{symbol}] {direction} @{entry:.5g}{flip_tag}")
-    print(f"     SL:{sl:.2f}% | TP1:{tp1:.2f}% | IC:±{ic_pct:.2f}% | Score:{score}")
-    print(f"     Trail: INSTANT | Cut: EVERY TICK | Sigs: {' | '.join(signals)}")
+    d = "🟢" if direction == "LONG" else "🔴"
+    print(f"\n  {d} [PAPER] {sym} {direction} @{price:.6g}")
+    print(f"     IC:±{IC_PCT*100:.2f}% | Guard:±{HARD_LOSS_PCT*100:.2f}% | TP1:+{TP1_PCT*100:.2f}% | TP2:+{TP2_PCT*100:.2f}%")
+    print(f"     Trail: ON sejak +{TRAIL_ACTIVATE*100:.2f}% profit | Score:{score} | {' | '.join(sigs)}")
     _stats["trades"] += 1
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 #  PAPER CLOSE
-# ═══════════════════════════════════════════
-def paper_close(symbol, reason, price=None):
+# ═══════════════════════════════════════════════════════
+def paper_close(sym, reason, price=None):
     with _lock:
-        pos = paper_positions.pop(symbol, None)
-    if pos is None or pos.get("_reserved"):
+        pos = paper_positions.pop(sym, None)
+    if pos is None or pos.get("_r"):
         return
 
     if price is None:
-        price = get_price_live(symbol)
+        price = price_live(sym)
 
     side  = pos["side"]
     entry = pos["entry"]
-    qty_r = pos.get("qty_remain", pos["qty"])
+    qr    = pos.get("qty_rem", pos["qty"])
+    pnl   = (price - entry) * qr if side == "LONG" else (entry - price) * qr
+    pct   = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
+    hold  = time.time() - pos["open_time"]
+    e     = "🟢" if pnl >= 0 else "🔴"
 
-    pnl = (price - entry) * qty_r if side == "LONG" else (entry - price) * qty_r
-    pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
-    hold = time.time() - pos["open_time"]
-    e   = "🟢" if pnl >= 0 else "🔴"
-
-    print(f"  {e} [PAPER] [{symbol}] CLOSE — {reason}")
-    print(f"     {entry:.5g} → {price:.5g} ({pct:+.2f}%) | {hold:.0f}s | PnL:{pnl:+.4f}U")
+    print(f"  {e} [PAPER] {sym} {side} CLOSE — {reason}")
+    print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
     _stats["pnl"] += pnl
-    _stats["pnl_hist"].append(pnl)
-    ks_update(pnl)
+    _stats["hist"].append(pnl)
+    ks_upd(pnl)
 
     if pnl >= 0:
         _stats["wins"] += 1
@@ -636,261 +482,238 @@ def paper_close(symbol, reason, price=None):
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
-    if "TP1"   in reason: _stats["tp1"]   += 1
-    if "TP2"   in reason: _stats["tp2"]   += 1
-    if "SL"    in reason: _stats["sl"]    += 1
-    if "Cut"   in reason: _stats["cut"]   += 1
-    if "Force" in reason: _stats["force"] += 1
+    r = reason
+    if "TP1"   in r: _stats["tp1"]   += 1
+    if "TP2"   in r: _stats["tp2"]   += 1
+    if "SL"    in r: _stats["sl"]    += 1
+    if "Cut"   in r: _stats["cut"]   += 1
+    if "Guard" in r: _stats["guard"] += 1
+    if "Force" in r: _stats["force"] += 1
 
     trade_log.append({
-        "sym": symbol, "side": side,
-        "entry": round(entry, 6), "exit": round(price, 6),
-        "pnl": round(pnl, 4), "reason": reason, "hold": int(hold),
+        "sym": sym, "side": side,
+        "entry": round(entry, 7), "exit": round(price, 7),
+        "pnl": round(pnl, 5), "reason": reason, "hold": int(hold),
     })
-    set_cooldown(symbol)
-    _hot_syms.appendleft(symbol)
+    set_cd(sym)
+    _hot_syms.appendleft(sym)
     _rescan_q.put(1)
     print_inline()
 
-# ═══════════════════════════════════════════
-#  PARTIAL TP1
-# ═══════════════════════════════════════════
-def paper_tp1(symbol, price):
-    pos = paper_positions.get(symbol)
-    if pos is None or pos.get("tp1_hit") or pos.get("_reserved"):
+def paper_tp1(sym, price):
+    pos = paper_positions.get(sym)
+    if pos is None or pos.get("tp1_hit") or pos.get("_r"):
         return
 
     side  = pos["side"]
     entry = pos["entry"]
-    close_qty = pos["qty"] * TP1_CLOSE_RATIO
-    pnl = (price - entry) * close_qty if side == "LONG" else (entry - price) * close_qty
-    hold = time.time() - pos["open_time"]
+    cq    = pos["qty"] * TP1_RATIO
+    pnl   = (price - entry) * cq if side == "LONG" else (entry - price) * cq
+    hold  = time.time() - pos["open_time"]
 
-    print(f"  🎯 [PAPER] [{symbol}] TP1 ({hold:.0f}s) | PnL:{pnl:+.4f}U")
-    pos["tp1_hit"]    = True
-    pos["qty_remain"] = pos["qty"] * (1 - TP1_CLOSE_RATIO)
-    pos["be_on"]      = True
+    print(f"  🎯 [PAPER] {sym} TP1 @{price:.6g} hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
 
-    atr = pos["atr"]
+    pos["tp1_hit"] = True
+    pos["qty_rem"] = pos["qty"] * (1 - TP1_RATIO)
+    pos["be_on"]   = True
+    # Setelah TP1: geser hard_sl ke break even, trail lebih ketat
     if side == "LONG":
-        pos["sl"]       = entry * 1.0001
-        pos["trail_sl"] = price - atr * ATR_TRAIL_MULT * 0.8
+        pos["hard_sl"]  = entry * 1.00005   # BE + tiny buffer
+        pos["trail_sl"] = price * (1 - TRAIL_WIDTH * 0.7)
     else:
-        pos["sl"]       = entry * 0.9999
-        pos["trail_sl"] = price + atr * ATR_TRAIL_MULT * 0.8
-
-    pos["peak"]      = price
-    pos["trail_on"]  = True
+        pos["hard_sl"]  = entry * 0.99995
+        pos["trail_sl"] = price * (1 + TRAIL_WIDTH * 0.7)
+    pos["peak"]    = price
+    pos["trail_on"] = True
 
     _stats["pnl"] += pnl
-    _stats["pnl_hist"].append(pnl)
+    _stats["hist"].append(pnl)
     _stats["wins"] += 1
     _stats["tp1"]  += 1
-    ks_update(pnl)
+    ks_upd(pnl)
     if pnl > _stats["best"]: _stats["best"] = pnl
     trade_log.append({
-        "sym": symbol, "side": side,
-        "entry": round(entry, 6), "exit": round(price, 6),
-        "pnl": round(pnl, 4), "reason": "TP1", "hold": int(hold),
+        "sym": sym, "side": side,
+        "entry": round(entry, 7), "exit": round(price, 7),
+        "pnl": round(pnl, 5), "reason": "TP1", "hold": int(hold),
     })
     print_inline()
 
-# ═══════════════════════════════════════════
-#  POSITION MONITOR
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
+#  MONITOR — MULTI-LAYER PROTECTION
+# ═══════════════════════════════════════════════════════
 def monitor_positions():
-    for symbol in list(paper_positions.keys()):
-        pos = paper_positions.get(symbol)
-        if pos is None or pos.get("_reserved"):
+    for sym in list(paper_positions.keys()):
+        pos = paper_positions.get(sym)
+        if pos is None or pos.get("_r"):
             continue
 
-        price = get_price_live(symbol)
-        if price == 0:
+        px    = price_live(sym)
+        if px == 0:
             continue
 
         side  = pos["side"]
         entry = pos["entry"]
-        atr   = pos["atr"]
         hold  = time.time() - pos["open_time"]
 
-        # ══ FORCE CLOSE ══
+        # ─── FORCE CLOSE ───────────────────────────
         if hold >= MAX_HOLD_SEC:
-            paper_close(symbol, "Force", price)
-            continue
+            paper_close(sym, "Force", px); continue
 
         if side == "LONG":
-            profit_pct = (price - entry) / entry
+            prof_pct = (px - entry) / entry
 
-            # ══ INSTANT CUT ══
-            if not pos["tp1_hit"] and price <= pos["ic"]:
-                paper_close(symbol, "LightningCut", price)
-                continue
+            # ─── LAYER 1: INSTANT CUT ──────────────
+            # Harga turun melewati IC → potong LANGSUNG
+            if px <= pos["ic"]:
+                paper_close(sym, "LightningCut", px); continue
 
-            # ══ TP1 ══
-            if not pos["tp1_hit"] and price >= pos["tp1"]:
-                paper_tp1(symbol, price)
-                continue
+            # ─── LAYER 2: HARD PNL GUARD ───────────
+            # Ini baru di v15c: bahkan kalau IC belum kena,
+            # kalau PnL sudah -HARD_LOSS_PCT → potong
+            if not pos["tp1_hit"] and px <= pos["hard_sl"]:
+                paper_close(sym, "HardGuard", px); continue
 
-            # ══ TRAIL ══
-            if profit_pct > TRAIL_ACTIVATE_PCT:
-                if not pos["trail_on"]:
-                    pos["trail_on"] = True
-                    pos["trail_sl"] = price - atr * ATR_TRAIL_MULT
-                    pos["peak"]     = price
+            # ─── TP1 ────────────────────────────────
+            if not pos["tp1_hit"] and px >= pos["tp1"]:
+                paper_tp1(sym, px); continue
 
-                if price > pos["peak"]:
-                    pos["peak"]     = price
-                    new_trail       = price - atr * ATR_TRAIL_MULT
-                    pos["trail_sl"] = max(pos["trail_sl"], new_trail)
+            # ─── TRAIL: aktif sejak profit TRAIL_ACTIVATE ──
+            if prof_pct >= TRAIL_ACTIVATE and not pos["trail_on"]:
+                pos["trail_on"] = True
+                pos["peak"]     = px
+                pos["trail_sl"] = px * (1 - TRAIL_WIDTH)
+                # Setelah trail on: hard_sl ikut naik ke break even
+                pos["hard_sl"]  = entry * 1.00005
 
-            # ══ TRAIL STOP ══
-            if pos["trail_on"] and price <= pos["trail_sl"]:
+            # Update trail ikut harga naik
+            if pos["trail_on"] and px > pos["peak"]:
+                pos["peak"]     = px
+                new_t           = px * (1 - TRAIL_WIDTH)
+                pos["trail_sl"] = max(pos["trail_sl"], new_t)
+                # Hard sl juga naik (trailing BE)
+                new_hard        = px * (1 - TRAIL_WIDTH * 1.5)
+                pos["hard_sl"]  = max(pos["hard_sl"], new_hard)
+
+            # ─── TRAIL STOP ─────────────────────────
+            if pos["trail_on"] and px <= pos["trail_sl"]:
                 tag = "TrailBE" if pos["be_on"] else "TrailStop"
-                paper_close(symbol, tag, price)
-                continue
+                paper_close(sym, tag, px); continue
 
-            # ══ TP2 ══
-            if pos["tp1_hit"] and price >= pos["tp2"]:
-                paper_close(symbol, "TP2", price)
-                continue
+            # ─── TP2 ────────────────────────────────
+            if pos["tp1_hit"] and px >= pos["tp2"]:
+                paper_close(sym, "TP2", px); continue
 
-            # ══ HARD SL ══
-            if price <= pos["sl"]:
-                paper_close(symbol, "SL", price)
-                continue
-
-            pnl_now = (price - entry) * pos.get("qty_remain", pos["qty"])
-            tsl = f"TSL:{pos['trail_sl']:.5g}" if pos["trail_on"] else f"IC:{pos['ic']:.5g}"
+            pnl_now = (px - entry) * pos.get("qty_rem", pos["qty"])
+            tsl = f"T:{pos['trail_sl']:.5g}" if pos["trail_on"] else f"IC:{pos['ic']:.5g}"
             tp  = f"TP2:{pos['tp2']:.5g}" if pos["tp1_hit"] else f"TP1:{pos['tp1']:.5g}"
-            print(f"  📌 [PAPER] [{symbol}] L@{entry:.5g}→{price:.5g} "
-                  f"({profit_pct*100:+.2f}%) {pnl_now:+.3f}U {hold:.0f}s | {tsl} {tp}")
+            print(f"  📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s {tsl} {tp}")
 
         else:  # SHORT
-            profit_pct = (entry - price) / entry
+            prof_pct = (entry - px) / entry
 
-            # ══ INSTANT CUT ══
-            if not pos["tp1_hit"] and price >= pos["ic"]:
-                paper_close(symbol, "LightningCut", price)
-                continue
+            # ─── LAYER 1: INSTANT CUT ──────────────
+            if px >= pos["ic"]:
+                paper_close(sym, "LightningCut", px); continue
 
-            # ══ TP1 ══
-            if not pos["tp1_hit"] and price <= pos["tp1"]:
-                paper_tp1(symbol, price)
-                continue
+            # ─── LAYER 2: HARD PNL GUARD ───────────
+            if not pos["tp1_hit"] and px >= pos["hard_sl"]:
+                paper_close(sym, "HardGuard", px); continue
 
-            # ══ TRAIL ══
-            if profit_pct > TRAIL_ACTIVATE_PCT:
-                if not pos["trail_on"]:
-                    pos["trail_on"] = True
-                    pos["trail_sl"] = price + atr * ATR_TRAIL_MULT
-                    pos["peak"]     = price
+            # ─── TP1 ────────────────────────────────
+            if not pos["tp1_hit"] and px <= pos["tp1"]:
+                paper_tp1(sym, px); continue
 
-                if price < pos["peak"]:
-                    pos["peak"]     = price
-                    new_trail       = price + atr * ATR_TRAIL_MULT
-                    pos["trail_sl"] = min(pos["trail_sl"], new_trail)
+            # ─── TRAIL ──────────────────────────────
+            if prof_pct >= TRAIL_ACTIVATE and not pos["trail_on"]:
+                pos["trail_on"] = True
+                pos["peak"]     = px
+                pos["trail_sl"] = px * (1 + TRAIL_WIDTH)
+                pos["hard_sl"]  = entry * 0.99995
 
-            # ══ TRAIL STOP ══
-            if pos["trail_on"] and price >= pos["trail_sl"]:
+            if pos["trail_on"] and px < pos["peak"]:
+                pos["peak"]     = px
+                new_t           = px * (1 + TRAIL_WIDTH)
+                pos["trail_sl"] = min(pos["trail_sl"], new_t)
+                new_hard        = px * (1 + TRAIL_WIDTH * 1.5)
+                pos["hard_sl"]  = min(pos["hard_sl"], new_hard)
+
+            # ─── TRAIL STOP ─────────────────────────
+            if pos["trail_on"] and px >= pos["trail_sl"]:
                 tag = "TrailBE" if pos["be_on"] else "TrailStop"
-                paper_close(symbol, tag, price)
-                continue
+                paper_close(sym, tag, px); continue
 
-            # ══ TP2 ══
-            if pos["tp1_hit"] and price <= pos["tp2"]:
-                paper_close(symbol, "TP2", price)
-                continue
+            # ─── TP2 ────────────────────────────────
+            if pos["tp1_hit"] and px <= pos["tp2"]:
+                paper_close(sym, "TP2", px); continue
 
-            # ══ HARD SL ══
-            if price >= pos["sl"]:
-                paper_close(symbol, "SL", price)
-                continue
-
-            pnl_now = (entry - price) * pos.get("qty_remain", pos["qty"])
-            tsl = f"TSL:{pos['trail_sl']:.5g}" if pos["trail_on"] else f"IC:{pos['ic']:.5g}"
+            pnl_now = (entry - px) * pos.get("qty_rem", pos["qty"])
+            tsl = f"T:{pos['trail_sl']:.5g}" if pos["trail_on"] else f"IC:{pos['ic']:.5g}"
             tp  = f"TP2:{pos['tp2']:.5g}" if pos["tp1_hit"] else f"TP1:{pos['tp1']:.5g}"
-            print(f"  📌 [PAPER] [{symbol}] S@{entry:.5g}→{price:.5g} "
-                  f"({profit_pct*100:+.2f}%) {pnl_now:+.3f}U {hold:.0f}s | {tsl} {tp}")
+            print(f"  📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s {tsl} {tp}")
 
-# ═══════════════════════════════════════════
-#  SCAN
-# ═══════════════════════════════════════════
-def scan_one(symbol):
+# ═══════════════════════════════════════════════════════
+#  SCANNER
+# ═══════════════════════════════════════════════════════
+def scan_one(sym):
     try:
         time.sleep(SCAN_DELAY)
-        if not cooldown_ok(symbol):
-            return None
-        tickers = _ticker_cache
-        if symbol in tickers and tickers[symbol]["vol"] < 200_000:
-            return None
-        df = get_ohlcv(symbol, Client.KLINE_INTERVAL_5MINUTE, 80)
-        if df is None or len(df) < 35:
-            return None
+        if not ok_cooldown(sym): return None
+        tk = _ticker_cache
+        if sym in tk and tk[sym]["vol"] < 200_000: return None
+
+        df = ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 80)
+        if df is None or len(df) < 35: return None
         df = run_ta(df.copy())
 
-        atr   = df["atr"].iloc[-1]
-        price = df["close"].iloc[-1]
-        if price == 0 or atr / price > 0.015:
-            return None
+        px  = df["close"].iloc[-1]
+        atr = df["atr"].iloc[-1]
+        if px == 0 or atr / px > 0.02: return None  # skip terlalu volatile
 
-        direction, score, signals = get_direction_and_score(df)
-        if direction is None or len(signals) < 1:
-            return None
+        dir_, sc, sigs = signal(df)
+        if dir_ is None or len(sigs) < 1: return None
 
-        # ══ FILTER FLIP — tolak kalau trend terlalu kuat untuk countertrend ══
-        if not flip_filter_ok(direction, score, df):
-            return None
-
-        # ══ FLIP DIRECTION DI SINI ══
-        # Scoring tetap sama, hanya arah eksekusinya yang dibalik
-        direction = flip(direction)
-
-        return (symbol, direction, score, signals, atr, price)
+        return (sym, dir_, sc, sigs, px)
     except:
         return None
 
-def scan_batch(symbols):
-    results = []
-    futures = {_executor.submit(scan_one, s): s for s in symbols[:BATCH_SIZE]}
+def scan_batch(syms):
+    res = []
+    fut = {_executor.submit(scan_one, s): s for s in syms[:BATCH_SIZE]}
     try:
-        for f in as_completed(futures, timeout=10):
+        for f in as_completed(fut, timeout=10):
             try:
                 r = f.result(timeout=2)
-                if r:
-                    results.append(r)
-            except:
-                pass
+                if r: res.append(r)
+            except: pass
     except:
-        for f in futures:
+        for f in fut:
             if f.done():
                 try:
                     r = f.result(timeout=0)
-                    if r: results.append(r)
-                except:
-                    pass
-    return results
+                    if r: res.append(r)
+                except: pass
+    return res
 
-def get_top_movers(symbols, n=40):
-    tickers = get_ticker_all()
-    sym_set = set(symbols)
-    movers  = []
-    for sym, d in tickers.items():
-        if sym not in sym_set or d["vol"] < 300_000:
-            continue
-        movers.append((sym, abs(d["pct"])))
-    movers.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in movers[:n]]
+def top_movers(syms, n=50):
+    tk  = tickers_all()
+    ss  = set(syms)
+    mv  = [(s, abs(d["pct"])) for s, d in tk.items()
+           if s in ss and d["vol"] >= 200_000]
+    mv.sort(key=lambda x: x[1], reverse=True)
+    return [s for s, _ in mv[:n]]
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 #  STATS
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 def print_inline():
-    n  = _stats["wins"] + _stats["losses"]
-    wr = _stats["wins"] / n * 100 if n else 0
+    n   = _stats["wins"] + _stats["losses"]
+    wr  = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
-    e  = "💚" if pnl >= 0 else "🔴"
-    print(f"     ┌─ [PAPER] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
-    print(f"     └─ TP1:{_stats['tp1']} TP2:{_stats['tp2']} SL:{_stats['sl']} Cut:{_stats['cut']} Force:{_stats['force']}")
+    e   = "💚" if pnl >= 0 else "🔴"
+    print(f"     ┌ {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"     └ TP1:{_stats['tp1']} TP2:{_stats['tp2']} SL:{_stats['sl']} "
+          f"Cut:{_stats['cut']} Guard:{_stats['guard']} Force:{_stats['force']}")
 
 def print_full():
     n    = _stats["wins"] + _stats["losses"]
@@ -900,100 +723,91 @@ def print_full():
     tph  = n / sess if sess > 0 else 0
     e    = "💚" if pnl >= 0 else "🔴"
 
-    pnls = list(_stats["pnl_hist"])
-    sharpe = mdd = 0.0
+    pnls  = list(_stats["hist"])
+    sh = md = 0.0
     if len(pnls) >= 5:
-        arr = np.array(pnls)
-        std = float(np.std(arr))
-        sharpe = float(np.mean(arr)) / std if std > 0 else 0.0
+        a  = np.array(pnls)
+        sd = float(np.std(a))
+        sh = float(np.mean(a)) / sd if sd > 0 else 0.0
     if len(pnls) >= 2:
-        eq   = np.cumsum(pnls)
-        peak = np.maximum.accumulate(eq)
-        mdd  = float(np.min(eq - peak))
+        eq = np.cumsum(pnls)
+        md = float(np.min(eq - np.maximum.accumulate(eq)))
 
-    flip_status = "ON ✅" if FLIP_DIRECTION else "OFF"
+    max_loss_theory = ORDER_USDT * HARD_LOSS_PCT * LEVERAGE
+    max_win_theory  = ORDER_USDT * TP1_PCT * LEVERAGE * TP1_RATIO
+
     print(f"\n  {'─'*62}")
-    print(f"  🧪 PAPER v15b FLIP={flip_status} — {sess*60:.0f}m | {tph:.1f}T/jam | {len(SYMBOLS)} symbols")
-    print(f"  🎯 {n}T | WR:{wr:.0f}% | W:{_stats['wins']} L:{_stats['losses']}")
-    print(f"  {e} PnL:{pnl:+.4f}U | Best:{_stats['best']:+.4f} Worst:{_stats['worst']:+.4f}")
-    print(f"  📐 Sharpe:{sharpe:.2f} | MaxDD:{mdd:.4f}U")
-    print(f"  TP1:{_stats['tp1']} TP2:{_stats['tp2']} SL:{_stats['sl']} ⚡Cut:{_stats['cut']} ⏰Force:{_stats['force']}")
-    print(f"  KS: consec={_ks['consec']} daily={_ks['daily_pnl']:+.2f} | BTC:{_macro['btc_5m']}")
+    print(f"  🧪 PAPER v15c — {sess*60:.0f}m | {tph:.1f}T/jam | {len(SYMBOLS)}symbols")
+    print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
+    print(f"  {e} PnL:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
+    print(f"  📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
+    print(f"  Theory max loss/trade: -{max_loss_theory:.4f}U | max profit TP1: +{max_win_theory:.4f}U")
+    print(f"  TP1:{_stats['tp1']} TP2:{_stats['tp2']} SL:{_stats['sl']} "
+          f"⚡Cut:{_stats['cut']} 🛡️Guard:{_stats['guard']} ⏰Force:{_stats['force']}")
+    print(f"  KS: consec={_ks['consec']} daily={_ks['daily']:+.4f} | BTC:{_macro['btc']}")
     if trade_log:
         print(f"  📋 Last 5:")
         for t in trade_log[-5:]:
             em = "🟢" if t["pnl"] > 0 else "🔴"
-            print(f"     {em} {t['sym']:<14} {t['side']} {t['pnl']:+.4f}U {t['hold']}s — {t['reason']}")
+            print(f"     {em} {t['sym']:<14} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
     print(f"  {'─'*62}")
 
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 #  THREADS
-# ═══════════════════════════════════════════
-def monitor_thread():
+# ═══════════════════════════════════════════════════════
+def t_monitor():
     while True:
         try:
-            if paper_positions:
-                monitor_positions()
+            if paper_positions: monitor_positions()
         except Exception as e:
-            print(f"  ❌ Monitor: {e}")
-        time.sleep(MONITOR_INTERVAL)
+            print(f"  ❌ mon:{e}")
+        time.sleep(MONITOR_INT)
 
-def rescan_thread(symbols_active):
+def t_rescan(syms):
     while True:
         try:
             _rescan_q.get(timeout=30)
             time.sleep(0.2)
             slots = MAX_POSITIONS - len(paper_positions)
-            if slots <= 0:
-                continue
-            killed, _ = ks_check()
-            if killed:
-                continue
+            if slots <= 0: continue
+            if ks_check()[0]: continue
             hot  = [s for s in _hot_syms if s not in paper_positions]
-            rest = [s for s in symbols_active if s not in paper_positions and s not in hot]
-            results = scan_batch((hot + rest)[:35])
-            if results:
-                results.sort(key=lambda x: x[2], reverse=True)
-                for sym, dir_, sc, sigs, atr, price in results[:slots]:
-                    if len(paper_positions) >= MAX_POSITIONS:
-                        break
-                    paper_open(sym, dir_, sc, sigs, atr, price)
-        except queue.Empty:
-            pass
-        except Exception as e:
-            print(f"  ❌ Rescan: {e}")
+            rest = [s for s in syms if s not in paper_positions and s not in hot]
+            res  = scan_batch((hot + rest)[:35])
+            if res:
+                res.sort(key=lambda x: x[2], reverse=True)
+                for sym, d, sc, sg, px in res[:slots]:
+                    if len(paper_positions) >= MAX_POSITIONS: break
+                    paper_open(sym, d, sc, sg, px)
+        except queue.Empty: pass
+        except Exception as e: print(f"  ❌ rescan:{e}")
 
-def macro_thread():
+def t_macro():
     while True:
         try:
-            _macro["btc_5m"] = calc_btc_trend()
-            _macro["last_btc"] = time.time()
-        except:
-            pass
+            _macro["btc"] = btc_trend()
+        except: pass
         try:
             if time.time() - _macro["last_fng"] > 300:
                 d = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5).json()["data"][0]
                 _macro["fng"] = int(d["value"])
                 _macro["last_fng"] = time.time()
-        except:
-            pass
+        except: pass
         time.sleep(5)
 
-# ═══════════════════════════════════════════
-#  MAIN LOOP
-# ═══════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════
 def run_bot():
-    flip_status = "ON — analisa LONG→SHORT, SHORT→LONG" if FLIP_DIRECTION else "OFF — normal"
-    print("╔══════════════════════════════════════════════════════╗")
-    print("║  🧪 BOT SCALPING v15b FLIP — PAPER TRADE             ║")
-    print("║  ⚠️  SIMULASI — TIDAK ADA ORDER NYATA KE BINANCE      ║")
-    print("╠══════════════════════════════════════════════════════╣")
-    print(f"║  Modal: ${ORDER_USDT}/pos × {LEVERAGE}x | Max {MAX_POSITIONS} posisi               ║")
-    print(f"║  FLIP: {flip_status:<46}║")
-    if FLIP_DIRECTION:
-        print(f"║  Filter: MaxScore={FLIP_MAX_SCORE} | MaxMom={FLIP_MAX_MOM*100:.1f}% | CD={FLIP_COOLDOWN}s    ║")
-    print(f"║  Symbols: {len(SYMBOLS)} coins                                ║")
-    print("╚══════════════════════════════════════════════════════╝")
+    print("╔═══════════════════════════════════════════════════════╗")
+    print("║  🧪 PAPER TRADE v15c — TIGHT RISK FIXED               ║")
+    print("║  ⚠️  SIMULASI — NO REAL ORDERS TO BINANCE              ║")
+    print("╠═══════════════════════════════════════════════════════╣")
+    print(f"║  ${ORDER_USDT}/pos ×{LEVERAGE}x | IC:±{IC_PCT*100:.2f}% | Guard:±{HARD_LOSS_PCT*100:.2f}% | TP1:+{TP1_PCT*100:.2f}%  ║")
+    print(f"║  Max loss/trade: -{ORDER_USDT*HARD_LOSS_PCT*LEVERAGE:.4f}U (hard cap)          ║")
+    print(f"║  Target profit TP1: +{ORDER_USDT*TP1_PCT*LEVERAGE*TP1_RATIO:.4f}U per trade           ║")
+    print(f"║  {len(SYMBOLS)} symbols | monitor tiap {MONITOR_INT*1000:.0f}ms                     ║")
+    print("╚═══════════════════════════════════════════════════════╝")
 
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"]
@@ -1003,75 +817,64 @@ def run_bot():
         syms = list(dict.fromkeys(SYMBOLS))
     print(f"\n  ✅ {len(syms)} symbols valid")
 
-    threading.Thread(target=monitor_thread, daemon=True).start()
-    threading.Thread(target=rescan_thread, args=(syms,), daemon=True).start()
-    threading.Thread(target=macro_thread, daemon=True).start()
+    threading.Thread(target=t_monitor, daemon=True).start()
+    threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
+    threading.Thread(target=t_macro, daemon=True).start()
     print("  🔧 Threads: monitor ✅ rescan ✅ macro ✅")
 
-    print("  ⏳ Init macro...")
+    print("  ⏳ Init 4s...")
     time.sleep(4)
-    get_ticker_all()
+    tickers_all()
+    print(f"  📊 BTC:{_macro['btc']} F&G:{_macro['fng']}\n")
 
-    print(f"  📊 BTC:{_macro['btc_5m']} | F&G:{_macro['fng']}")
-    print(f"\n  🚀 GO!\n")
-
-    cycle    = 0
-    scan_idx = 0
-    n_batch  = math.ceil(len(syms) / BATCH_SIZE)
+    cycle = scan_idx = 0
+    n_bat = math.ceil(len(syms) / BATCH_SIZE)
 
     while True:
         cycle += 1
         slots = MAX_POSITIONS - len(paper_positions)
 
         print(f"\n{'═'*57}")
-        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC:{_macro['btc_5m']} F&G:{_macro['fng']} "
-              f"Pos:({len(paper_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
+        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC:{_macro['btc']} F&G:{_macro['fng']} "
+              f"({len(paper_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
 
-        killed, ks_r = ks_check()
-        if killed:
-            print(f"  🚨 KS: {ks_r}")
-            time.sleep(SCAN_INTERVAL)
-            continue
+        if (k := ks_check())[0]:
+            print(f"  🚨 KS:{k[1]}"); time.sleep(SCAN_INTERVAL); continue
 
         if slots > 0:
-            top   = get_top_movers(syms, n=50)
-            top   = [s for s in top if s not in paper_positions]
-            b_s   = scan_idx * BATCH_SIZE
-            reg   = [s for s in syms[b_s:b_s+BATCH_SIZE]
-                     if s not in paper_positions and s not in top]
-            scan_idx = (scan_idx + 1) % n_batch
-            scan_list = top[:25] + reg[:15]
+            mv  = top_movers(syms, 50)
+            mv  = [s for s in mv if s not in paper_positions]
+            bs  = scan_idx * BATCH_SIZE
+            reg = [s for s in syms[bs:bs+BATCH_SIZE]
+                   if s not in paper_positions and s not in mv]
+            scan_idx = (scan_idx + 1) % n_bat
+            scan_list = mv[:25] + reg[:15]
 
             print(f"  🔍 {len(scan_list)} syms | {slots} slot kosong")
-            try:
-                results = scan_batch(scan_list)
-            except:
-                results = []
+            try: res = scan_batch(scan_list)
+            except: res = []
 
-            if results:
-                results.sort(key=lambda x: x[2], reverse=True)
-                print(f"  🎯 {len(results)} setup!")
-                for sym, dir_, sc, sigs, atr, price in results[:slots]:
-                    if len(paper_positions) >= MAX_POSITIONS:
-                        break
-                    print(f"     ⭐ {sym} {dir_} Score:{sc} | {' | '.join(sigs)}")
-                    paper_open(sym, dir_, sc, sigs, atr, price)
-            else:
-                if len(paper_positions) == 0:
-                    print(f"  ⚠️  No setup — wide scan...")
-                    try:
-                        r2 = scan_batch([s for s in syms if s not in paper_positions][:50])
-                    except:
-                        r2 = []
-                    if r2:
-                        r2.sort(key=lambda x: x[2], reverse=True)
-                        sym, dir_, sc, sigs, atr, price = r2[0]
-                        print(f"     ⭐ best: {sym} {dir_} Score:{sc}")
-                        paper_open(sym, dir_, sc, sigs, atr, price)
-                    else:
-                        print(f"  ⏳ Market flat — menunggu...")
+            if res:
+                res.sort(key=lambda x: x[2], reverse=True)
+                print(f"  🎯 {len(res)} setup!")
+                for sym, d, sc, sg, px in res[:slots]:
+                    if len(paper_positions) >= MAX_POSITIONS: break
+                    print(f"     ⭐ {sym} {d} Score:{sc} {' | '.join(sg)}")
+                    paper_open(sym, d, sc, sg, px)
+            elif len(paper_positions) == 0:
+                print("  ⚠️  Wide scan...")
+                try:
+                    r2 = scan_batch([s for s in syms if s not in paper_positions][:50])
+                except: r2 = []
+                if r2:
+                    r2.sort(key=lambda x: x[2], reverse=True)
+                    sym, d, sc, sg, px = r2[0]
+                    print(f"     ⭐ best: {sym} {d} Score:{sc}")
+                    paper_open(sym, d, sc, sg, px)
                 else:
-                    print(f"  ⏳ No new setup | {len(paper_positions)} pos aktif")
+                    print("  ⏳ Market flat — tunggu...")
+            else:
+                print(f"  ⏳ {len(paper_positions)} pos aktif")
         else:
             print(f"  ✅ Full ({MAX_POSITIONS}/{MAX_POSITIONS})")
 
@@ -1079,7 +882,6 @@ def run_bot():
             print_full()
 
         time.sleep(SCAN_INTERVAL)
-
 
 if __name__ == "__main__":
     run_bot()
