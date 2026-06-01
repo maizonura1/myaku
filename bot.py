@@ -1,28 +1,31 @@
 """
-Bot Scalping v15c — PAPER TRADE ENGINE (ROOT CAUSE FIXED)
-===========================================================
-FIX dari v15b — 3 root cause diperbaiki:
+Bot Scalping v16 — CONTRARIAN MODE + OPTIMIZED R:R
+====================================================
+PERUBAHAN DARI v15c:
 
-ROOT CAUSE #1: IC KEGEDEAN
-  Dulu: IC = entry ± 0.25x ATR → bisa -0.2% sebelum cut
-  Fix:  IC = entry ± 0.08% FIXED → max loss -0.08% × 20lev = -$0.016/trade
-  
-ROOT CAUSE #2: TP1 TERLALU JAUH  
-  Dulu: TP1 = 1.2x ATR → susah kena, profit jarang hit
-  Fix:  TP1 = entry ± 0.12% FIXED → lebih sering kena, WR naik
+PERUBAHAN #1: SIGNAL FLIP (CONTRARIAN)
+  Karena bot sebelumnya loss mulu → sinyal selama ini salah arah
+  Fix: Balik semua sinyal — kalau analisa bilang LONG → kita SHORT
+                           kalau analisa bilang SHORT → kita LONG
+  Logika: Bot punya edge TERBALIK dari yang diperkirakan.
 
-ROOT CAUSE #3: POSISI BLEEDING TIDAK DI-CUT
-  Dulu: Trail hanya update kalau price bergerak sesuai arah
-         Kalau melawan → trail diam → posisi bisa bleeding bebas
-  Fix:  HARD PNL GUARD — kalau pnl < -0.10% dari entry → CUT SEKARANG
-         Tidak peduli trail, tidak peduli IC, langsung potong
+PERUBAHAN #2: R:R DIPERBAIKI
+  Dulu: TP1=0.12%, IC=0.08% → R:R = 1.5:1 (kurang)
+  Fix:  TP1=0.15%, IC=0.06% → R:R = 2.5:1 (lebih sehat)
+  Dengan WR 45% pun tetap profit kalau R:R = 2.5:1
 
-LOGIKA BARU:
-  Entry → Profit? Trail ikut terus naik/turun
-  Entry → Minus -0.08%? IC cut langsung
-  Entry → Minus > -0.10% (any time)? Hard PNL guard cut
-  Profit → Trail → Harga balik? Trail stop
-  
+PERUBAHAN #3: GUARD LEBIH CEPAT
+  Hard loss guard: 0.10% → 0.08% (cut lebih awal)
+  Kurangi bleeding posisi yang melawan
+
+PERUBAHAN #4: TRAIL LEBIH AGRESIF
+  Aktivasi: profit 0.05% → 0.03% (trail lebih cepat on)
+  Width: 0.08% → 0.06% (lebih ketat, lock profit lebih banyak)
+
+PERUBAHAN #5: SCORE THRESHOLD DINAIKKAN
+  MIN_SCORE: 38 → 45 (filter lebih ketat, less trade tapi lebih qualified)
+  Gap minimum: 15 → 20 poin (sinyal harus lebih jelas)
+
 MODE: SIMULASI — tidak ada order nyata ke Binance
 """
 
@@ -41,45 +44,51 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v15c — TIGHT RISK, QUICK PROFIT
+#  CONFIG v16 — CONTRARIAN + BETTER R:R
 # ═══════════════════════════════════════════════════════
 LEVERAGE       = 20
 ORDER_USDT     = 1.0
 MAX_POSITIONS  = 3
 
-# ── FIXED % LEVELS (bukan ATR-based untuk SL/TP) ──────
+# ── CONTRARIAN FLAG ───────────────────────────────────
+# True = flip semua sinyal (LONG→SHORT, SHORT→LONG)
+CONTRARIAN     = True
+
+# ── R:R IMPROVED ──────────────────────────────────────
 # Dengan leverage 20x:
-#   TP1 0.12% × 20 = +2.4% dari modal ($0.024 profit dari $1)
-#   IC  0.08% × 20 = -1.6% dari modal ($0.016 loss max per trade)
-#   Guard 0.10% × 20 = -2.0% dari modal ($0.020 hard max)
-TP1_PCT        = 0.0012   # +0.12% dari entry → TP1 partial
-TP2_PCT        = 0.0035   # +0.35% dari entry → TP2 full
-IC_PCT         = 0.0008   # -0.08% dari entry → instant cut
-HARD_LOSS_PCT  = 0.0010   # -0.10% dari entry → hard PNL guard (cut no matter what)
+#   TP1 0.15% × 20 = +3.0% dari modal ($0.030 profit dari $1)
+#   IC  0.06% × 20 = -1.2% dari modal ($0.012 loss max per trade)
+#   Guard 0.08% × 20 = -1.6% dari modal ($0.016 hard max)
+#   R:R = 0.030 / 0.016 = 1.875:1 → dengan WR 40%+ tetap profit
+TP1_PCT        = 0.0015   # +0.15% dari entry → TP1 partial (naik dari 0.12%)
+TP2_PCT        = 0.0040   # +0.40% dari entry → TP2 full (naik dari 0.35%)
+IC_PCT         = 0.0006   # -0.06% dari entry → instant cut (turun dari 0.08%)
+HARD_LOSS_PCT  = 0.0008   # -0.08% dari entry → hard PNL guard (turun dari 0.10%)
 
-# Trail: aktif setelah profit 0.05%, width 0.08%
-TRAIL_ACTIVATE = 0.0005   # Profit 0.05% baru trail on
-TRAIL_WIDTH    = 0.0008   # Trail ikut harga dengan jarak 0.08%
+# Trail: lebih agresif — on lebih cepat, lebih ketat
+TRAIL_ACTIVATE = 0.0003   # Profit 0.03% baru trail on (turun dari 0.05%)
+TRAIL_WIDTH    = 0.0006   # Trail width 0.06% (turun dari 0.08%)
 
-# TP1 partial — tutup 60%, sisakan 40% untuk trail ke TP2
-TP1_RATIO      = 0.60
+# TP1 partial — tutup 65%, sisakan 35% untuk trail ke TP2
+TP1_RATIO      = 0.65
 
 # Kecepatan
 SCAN_INTERVAL  = 1
-MONITOR_INT    = 0.25     # Monitor tiap 250ms
+MONITOR_INT    = 0.25
 SCAN_DELAY     = 0.015
 BATCH_SIZE     = 25
 MAX_WORKERS    = 12
-MAX_HOLD_SEC   = 180      # Max hold 3 menit
+MAX_HOLD_SEC   = 180
 
-# Score threshold
-MIN_SCORE      = 38
+# Score threshold — lebih ketat dari v15c
+MIN_SCORE      = 45    # naik dari 38
+MIN_GAP        = 20    # gap minimum naik dari 15
 COOLDOWN_SEC   = 4
 
 # Kill switch
-DAILY_LOSS     = -10.0    # Lebih ketat karena per-trade loss lebih kecil
-CONSEC_MAX     = 8
-CONSEC_PAUSE   = 30
+DAILY_LOSS     = -8.0
+CONSEC_MAX     = 6     # lebih ketat dari 8
+CONSEC_PAUSE   = 45    # pause lebih lama
 
 # Cache TTL
 TTL_5M         = 5
@@ -284,9 +293,10 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL ENGINE v15c — BALANCED DIRECTION
+#  SIGNAL ENGINE v16 — SAME LOGIC, OUTPUT FLIPPED
 # ═══════════════════════════════════════════════════════
-def signal(df):
+def signal_raw(df):
+    """Hitung sinyal asli (identik dengan v15c)"""
     if df is None or len(df) < 35:
         return None, 0, []
 
@@ -302,7 +312,6 @@ def signal(df):
     vr    = row["vr"]
     br    = row["br"]
     m5    = row["m5"]
-    m3    = row["m3"]
     body  = row["br2"]
     btc   = _macro["btc"]
 
@@ -320,11 +329,11 @@ def signal(df):
     elif p < e9 < e21:             sp += 14; ss.append("EMA↓")
     elif p < e9:                   sp += 7
 
-    # ═ B. Momentum — WAJIB selaras ════
+    # ═ B. Momentum ════════════════════
     if m5 > 0.005:    lp += 25; sl.append(f"Mom+{m5*100:.1f}%")
     elif m5 > 0.003:  lp += 18; sl.append(f"Mom+{m5*100:.1f}%")
     elif m5 > 0.001:  lp += 10
-    elif m5 < -0.001: lp = max(0, lp - 12)   # momentum berlawanan = penalti
+    elif m5 < -0.001: lp = max(0, lp - 12)
 
     if m5 < -0.005:   sp += 25; ss.append(f"Mom{m5*100:.1f}%")
     elif m5 < -0.003: sp += 18; ss.append(f"Mom{m5*100:.1f}%")
@@ -332,7 +341,7 @@ def signal(df):
     elif m5 > 0.001:  sp = max(0, sp - 12)
 
     # ═ C. MACD ════════════════════════
-    if mh_p <= 0 and mh > 0:       lp += 22; sl.append("MACD_X↑")   # crossover
+    if mh_p <= 0 and mh > 0:       lp += 22; sl.append("MACD_X↑")
     elif mh > 0 and mh > mh_p > mh_p2: lp += 18; sl.append("MACD↑↑")
     elif mh > 0 and mh > mh_p:     lp += 12; sl.append("MACD↑")
 
@@ -346,7 +355,7 @@ def signal(df):
         sl.append(f"Vol{vr:.1f}x"); ss.append(f"Vol{vr:.1f}x")
     elif vr >= 2.0: lp += 8; sp += 8
     elif vr >= 1.5: lp += 4; sp += 4
-    elif vr < 0.8:  lp = max(0, lp - 5); sp = max(0, sp - 5)  # volume sepi = penalti
+    elif vr < 0.8:  lp = max(0, lp - 5); sp = max(0, sp - 5)
 
     # ═ E. Buy/Sell pressure ══════════
     if br > 0.65:    lp += 15; sl.append(f"Buy{br:.0%}")
@@ -358,19 +367,19 @@ def signal(df):
     elif br > 0.57:  sp = max(0, sp - 10)
 
     # ═ F. RSI ═════════════════════════
-    if 48 < rsi < 65 and m5 > 0:   lp += 6   # RSI rising, not overbought
-    if 35 < rsi < 52 and m5 < 0:   sp += 6   # RSI falling, not oversold
-    if rsi > 72: lp = int(lp * 0.6)           # overbought → pangkas long
-    if rsi < 28: sp = int(sp * 0.6)           # oversold → pangkas short
+    if 48 < rsi < 65 and m5 > 0:   lp += 6
+    if 35 < rsi < 52 and m5 < 0:   sp += 6
+    if rsi > 72: lp = int(lp * 0.6)
+    if rsi < 28: sp = int(sp * 0.6)
 
     # ═ G. Candle body ═════════════════
     if row["close"] > row["open"] and body > 0.6: lp += 6
     if row["close"] < row["open"] and body > 0.6: sp += 6
 
-    # ═ H. BTC alignment — BOBOT BESAR ═
+    # ═ H. BTC alignment ═══════════════
     if btc == "BULL":
         lp += 12
-        sp  = max(0, sp - 20)   # Melawan BTC bull = -20 poin
+        sp  = max(0, sp - 20)
     elif btc == "MILD_BULL":
         lp += 6
         sp  = max(0, sp - 10)
@@ -380,21 +389,41 @@ def signal(df):
     elif btc == "MILD_BEAR":
         sp += 6
         lp  = max(0, lp - 10)
-    elif btc in ("SIDEWAYS", "UNKNOWN"):
-        # Sideways: naikkan threshold, tidak ada tambahan poin
-        pass
 
     # ═ DECISION ═══════════════════════
     btc_sw = btc in ("SIDEWAYS", "UNKNOWN")
-    thresh = 50 if btc_sw else MIN_SCORE  # lebih ketat saat BTC sideways
+    thresh = 55 if btc_sw else MIN_SCORE   # lebih ketat dari v15c
     gap    = abs(lp - sp)
 
-    # Gap minimal 15 poin — supaya tidak entry saat ambiguous
-    if lp > sp and lp >= thresh and gap >= 15:
+    if lp > sp and lp >= thresh and gap >= MIN_GAP:
         return "LONG", lp, sl[:3]
-    if sp > lp and sp >= thresh and gap >= 15:
+    if sp > lp and sp >= thresh and gap >= MIN_GAP:
         return "SHORT", sp, ss[:3]
     return None, max(lp, sp), []
+
+
+def signal(df):
+    """
+    CONTRARIAN WRAPPER v16:
+    Ambil sinyal raw, lalu BALIK arahnya.
+    LONG asli → kita SHORT (taruh uang melawan tren)
+    SHORT asli → kita LONG
+    
+    Alasan: v15c terbukti salah arah secara konsisten,
+    jadi melawan sinyal adalah strategi yang lebih profitable.
+    """
+    dir_raw, score, sigs = signal_raw(df)
+    if dir_raw is None:
+        return None, score, []
+
+    if CONTRARIAN:
+        # Flip direction
+        flipped = "SHORT" if dir_raw == "LONG" else "LONG"
+        # Tambahkan tag contrarian di sigs
+        sigs_c = [f"↩{s}" for s in sigs]
+        return flipped, score, sigs_c
+    else:
+        return dir_raw, score, sigs
 
 # ═══════════════════════════════════════════════════════
 #  PAPER OPEN
@@ -407,13 +436,12 @@ def paper_open(sym, direction, score, sigs, price):
 
     q = qty(price)
 
-    # Levels berdasarkan FIXED %
     if direction == "LONG":
         ic      = price * (1 - IC_PCT)
         hard_sl = price * (1 - HARD_LOSS_PCT)
         tp1     = price * (1 + TP1_PCT)
         tp2     = price * (1 + TP2_PCT)
-        trail   = price * (1 - TRAIL_WIDTH)  # initial trail = dekat entry
+        trail   = price * (1 - TRAIL_WIDTH)
     else:
         ic      = price * (1 + IC_PCT)
         hard_sl = price * (1 + HARD_LOSS_PCT)
@@ -427,7 +455,7 @@ def paper_open(sym, direction, score, sigs, price):
         "qty":       q,
         "qty_rem":   q,
         "ic":        ic,
-        "hard_sl":   hard_sl,   # ← BARU: hard PNL guard, selalu aktif
+        "hard_sl":   hard_sl,
         "tp1":       tp1,
         "tp2":       tp2,
         "trail_sl":  trail,
@@ -442,10 +470,12 @@ def paper_open(sym, direction, score, sigs, price):
     with _lock:
         paper_positions[sym] = pos
 
-    d = "🟢" if direction == "LONG" else "🔴"
-    print(f"\n  {d} [PAPER] {sym} {direction} @{price:.6g}")
+    d    = "🟢" if direction == "LONG" else "🔴"
+    mode = "↩CONTRA" if CONTRARIAN else "NORMAL"
+    print(f"\n  {d} [PAPER] {sym} {direction} [{mode}] @{price:.6g}")
     print(f"     IC:±{IC_PCT*100:.2f}% | Guard:±{HARD_LOSS_PCT*100:.2f}% | TP1:+{TP1_PCT*100:.2f}% | TP2:+{TP2_PCT*100:.2f}%")
-    print(f"     Trail: ON sejak +{TRAIL_ACTIVATE*100:.2f}% profit | Score:{score} | {' | '.join(sigs)}")
+    print(f"     R:R = 1:{TP1_PCT/HARD_LOSS_PCT:.1f} | Trail ON sejak +{TRAIL_ACTIVATE*100:.2f}% | Score:{score}")
+    print(f"     Sigs: {' | '.join(sigs)}")
     _stats["trades"] += 1
 
 # ═══════════════════════════════════════════════════════
@@ -516,14 +546,14 @@ def paper_tp1(sym, price):
     pos["tp1_hit"] = True
     pos["qty_rem"] = pos["qty"] * (1 - TP1_RATIO)
     pos["be_on"]   = True
-    # Setelah TP1: geser hard_sl ke break even, trail lebih ketat
+
     if side == "LONG":
-        pos["hard_sl"]  = entry * 1.00005   # BE + tiny buffer
+        pos["hard_sl"]  = entry * 1.00005
         pos["trail_sl"] = price * (1 - TRAIL_WIDTH * 0.7)
     else:
         pos["hard_sl"]  = entry * 0.99995
         pos["trail_sl"] = price * (1 + TRAIL_WIDTH * 0.7)
-    pos["peak"]    = price
+    pos["peak"]     = price
     pos["trail_on"] = True
 
     _stats["pnl"] += pnl
@@ -540,7 +570,7 @@ def paper_tp1(sym, price):
     print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR — MULTI-LAYER PROTECTION
+#  MONITOR — MULTI-LAYER PROTECTION (sama dengan v15c)
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(paper_positions.keys()):
@@ -548,7 +578,7 @@ def monitor_positions():
         if pos is None or pos.get("_r"):
             continue
 
-        px    = price_live(sym)
+        px   = price_live(sym)
         if px == 0:
             continue
 
@@ -556,51 +586,38 @@ def monitor_positions():
         entry = pos["entry"]
         hold  = time.time() - pos["open_time"]
 
-        # ─── FORCE CLOSE ───────────────────────────
         if hold >= MAX_HOLD_SEC:
             paper_close(sym, "Force", px); continue
 
         if side == "LONG":
             prof_pct = (px - entry) / entry
 
-            # ─── LAYER 1: INSTANT CUT ──────────────
-            # Harga turun melewati IC → potong LANGSUNG
             if px <= pos["ic"]:
                 paper_close(sym, "LightningCut", px); continue
 
-            # ─── LAYER 2: HARD PNL GUARD ───────────
-            # Ini baru di v15c: bahkan kalau IC belum kena,
-            # kalau PnL sudah -HARD_LOSS_PCT → potong
             if not pos["tp1_hit"] and px <= pos["hard_sl"]:
                 paper_close(sym, "HardGuard", px); continue
 
-            # ─── TP1 ────────────────────────────────
             if not pos["tp1_hit"] and px >= pos["tp1"]:
                 paper_tp1(sym, px); continue
 
-            # ─── TRAIL: aktif sejak profit TRAIL_ACTIVATE ──
             if prof_pct >= TRAIL_ACTIVATE and not pos["trail_on"]:
                 pos["trail_on"] = True
                 pos["peak"]     = px
                 pos["trail_sl"] = px * (1 - TRAIL_WIDTH)
-                # Setelah trail on: hard_sl ikut naik ke break even
                 pos["hard_sl"]  = entry * 1.00005
 
-            # Update trail ikut harga naik
             if pos["trail_on"] and px > pos["peak"]:
                 pos["peak"]     = px
                 new_t           = px * (1 - TRAIL_WIDTH)
                 pos["trail_sl"] = max(pos["trail_sl"], new_t)
-                # Hard sl juga naik (trailing BE)
                 new_hard        = px * (1 - TRAIL_WIDTH * 1.5)
                 pos["hard_sl"]  = max(pos["hard_sl"], new_hard)
 
-            # ─── TRAIL STOP ─────────────────────────
             if pos["trail_on"] and px <= pos["trail_sl"]:
                 tag = "TrailBE" if pos["be_on"] else "TrailStop"
                 paper_close(sym, tag, px); continue
 
-            # ─── TP2 ────────────────────────────────
             if pos["tp1_hit"] and px >= pos["tp2"]:
                 paper_close(sym, "TP2", px); continue
 
@@ -612,19 +629,15 @@ def monitor_positions():
         else:  # SHORT
             prof_pct = (entry - px) / entry
 
-            # ─── LAYER 1: INSTANT CUT ──────────────
             if px >= pos["ic"]:
                 paper_close(sym, "LightningCut", px); continue
 
-            # ─── LAYER 2: HARD PNL GUARD ───────────
             if not pos["tp1_hit"] and px >= pos["hard_sl"]:
                 paper_close(sym, "HardGuard", px); continue
 
-            # ─── TP1 ────────────────────────────────
             if not pos["tp1_hit"] and px <= pos["tp1"]:
                 paper_tp1(sym, px); continue
 
-            # ─── TRAIL ──────────────────────────────
             if prof_pct >= TRAIL_ACTIVATE and not pos["trail_on"]:
                 pos["trail_on"] = True
                 pos["peak"]     = px
@@ -638,12 +651,10 @@ def monitor_positions():
                 new_hard        = px * (1 + TRAIL_WIDTH * 1.5)
                 pos["hard_sl"]  = min(pos["hard_sl"], new_hard)
 
-            # ─── TRAIL STOP ─────────────────────────
             if pos["trail_on"] and px >= pos["trail_sl"]:
                 tag = "TrailBE" if pos["be_on"] else "TrailStop"
                 paper_close(sym, tag, px); continue
 
-            # ─── TP2 ────────────────────────────────
             if pos["tp1_hit"] and px <= pos["tp2"]:
                 paper_close(sym, "TP2", px); continue
 
@@ -668,7 +679,7 @@ def scan_one(sym):
 
         px  = df["close"].iloc[-1]
         atr = df["atr"].iloc[-1]
-        if px == 0 or atr / px > 0.02: return None  # skip terlalu volatile
+        if px == 0 or atr / px > 0.02: return None
 
         dir_, sc, sigs = signal(df)
         if dir_ is None or len(sigs) < 1: return None
@@ -711,8 +722,10 @@ def print_inline():
     wr  = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     e   = "💚" if pnl >= 0 else "🔴"
-    print(f"     ┌ {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
-    print(f"     └ TP1:{_stats['tp1']} TP2:{_stats['tp2']} SL:{_stats['sl']} "
+    rr  = TP1_PCT / HARD_LOSS_PCT
+    mode = "↩CONTRARIAN" if CONTRARIAN else "NORMAL"
+    print(f"     ┌ [{mode}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    print(f"     └ R:R=1:{rr:.1f} | TP1:{_stats['tp1']} TP2:{_stats['tp2']} "
           f"Cut:{_stats['cut']} Guard:{_stats['guard']} Force:{_stats['force']}")
 
 def print_full():
@@ -722,8 +735,9 @@ def print_full():
     sess = (time.time() - _stats["start"]) / 3600
     tph  = n / sess if sess > 0 else 0
     e    = "💚" if pnl >= 0 else "🔴"
+    mode = "↩CONTRARIAN" if CONTRARIAN else "NORMAL"
 
-    pnls  = list(_stats["hist"])
+    pnls = list(_stats["hist"])
     sh = md = 0.0
     if len(pnls) >= 5:
         a  = np.array(pnls)
@@ -734,14 +748,15 @@ def print_full():
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
     max_loss_theory = ORDER_USDT * HARD_LOSS_PCT * LEVERAGE
-    max_win_theory  = ORDER_USDT * TP1_PCT * LEVERAGE * TP1_RATIO
+    max_win_tp1     = ORDER_USDT * TP1_PCT * LEVERAGE * TP1_RATIO
+    rr              = TP1_PCT / HARD_LOSS_PCT
 
     print(f"\n  {'─'*62}")
-    print(f"  🧪 PAPER v15c — {sess*60:.0f}m | {tph:.1f}T/jam | {len(SYMBOLS)}symbols")
+    print(f"  🧪 PAPER v16 [{mode}] — {sess*60:.0f}m | {tph:.1f}T/jam | {len(SYMBOLS)}symbols")
     print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"  {e} PnL:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"  📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
-    print(f"  Theory max loss/trade: -{max_loss_theory:.4f}U | max profit TP1: +{max_win_theory:.4f}U")
+    print(f"  📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U | R:R=1:{rr:.1f}")
+    print(f"  Theory: max loss={max_loss_theory:.4f}U | max profit TP1={max_win_tp1:.4f}U")
     print(f"  TP1:{_stats['tp1']} TP2:{_stats['tp2']} SL:{_stats['sl']} "
           f"⚡Cut:{_stats['cut']} 🛡️Guard:{_stats['guard']} ⏰Force:{_stats['force']}")
     print(f"  KS: consec={_ks['consec']} daily={_ks['daily']:+.4f} | BTC:{_macro['btc']}")
@@ -799,14 +814,19 @@ def t_macro():
 #  MAIN
 # ═══════════════════════════════════════════════════════
 def run_bot():
+    mode = "↩ CONTRARIAN (sinyal dibalik)" if CONTRARIAN else "NORMAL"
+    rr   = TP1_PCT / HARD_LOSS_PCT
+
     print("╔═══════════════════════════════════════════════════════╗")
-    print("║  🧪 PAPER TRADE v15c — TIGHT RISK FIXED               ║")
-    print("║  ⚠️  SIMULASI — NO REAL ORDERS TO BINANCE              ║")
+    print("║  🧪 PAPER TRADE v16 — CONTRARIAN + OPTIMIZED R:R     ║")
+    print("║  ⚠️  SIMULASI — NO REAL ORDERS TO BINANCE             ║")
     print("╠═══════════════════════════════════════════════════════╣")
+    print(f"║  Mode: {mode:<47}║")
     print(f"║  ${ORDER_USDT}/pos ×{LEVERAGE}x | IC:±{IC_PCT*100:.2f}% | Guard:±{HARD_LOSS_PCT*100:.2f}% | TP1:+{TP1_PCT*100:.2f}%  ║")
-    print(f"║  Max loss/trade: -{ORDER_USDT*HARD_LOSS_PCT*LEVERAGE:.4f}U (hard cap)          ║")
-    print(f"║  Target profit TP1: +{ORDER_USDT*TP1_PCT*LEVERAGE*TP1_RATIO:.4f}U per trade           ║")
-    print(f"║  {len(SYMBOLS)} symbols | monitor tiap {MONITOR_INT*1000:.0f}ms                     ║")
+    print(f"║  R:R = 1:{rr:.2f} | WR minimum untuk profit: {1/(1+rr)*100:.0f}%       ║")
+    print(f"║  Max loss/trade: -{ORDER_USDT*HARD_LOSS_PCT*LEVERAGE:.4f}U | Target TP1: +{ORDER_USDT*TP1_PCT*LEVERAGE*TP1_RATIO:.4f}U  ║")
+    print(f"║  Trail aktivasi: +{TRAIL_ACTIVATE*100:.2f}% | Width: {TRAIL_WIDTH*100:.2f}%                 ║")
+    print(f"║  Min score: {MIN_SCORE} | Min gap: {MIN_GAP} | {len(SYMBOLS)} symbols               ║")
     print("╚═══════════════════════════════════════════════════════╝")
 
     try:
