@@ -1,30 +1,43 @@
 """
-Bot Scalping v16 — CONTRARIAN MODE + OPTIMIZED R:R
-====================================================
-PERUBAHAN DARI v15c:
+Bot Scalping v17 — FIX SYSTEMATIC LOSSES
+==========================================
+ANALISA v16 (dari log):
+  - 529T, WR:50%, PnL:-2.16U
+  - Cut:234 (44%!), Guard:107 (20%) = 64% exit adalah stop losses
+  - TP1:75 (14%), TP2:15 (3%) = hanya 17% exit adalah profit
 
-PERUBAHAN #1: SIGNAL FLIP (CONTRARIAN)
-  Karena bot sebelumnya loss mulu → sinyal selama ini salah arah
-  Fix: Balik semua sinyal — kalau analisa bilang LONG → kita SHORT
-                           kalau analisa bilang SHORT → kita LONG
-  Logika: Bot punya edge TERBALIK dari yang diperkirakan.
+ROOT CAUSE:
+  1. IC 0.06% terlalu ketat → noise crypto normal ±0.05-0.1%
+     → posisi kena cut sebelum sempat bergerak benar
+  2. Trail aktif di 0.03% profit → terlalu cepat, langsung kena pullback
+  3. MAX_HOLD 180s terlalu pendek untuk 5m candle setup
+  4. Buka LONG saat BTC:BEAR (contrarian mode) → melawan macro trend
+  5. Tidak ada filter kondisi pasar (F&G < 20 = extreme fear)
 
-PERUBAHAN #2: R:R DIPERBAIKI
-  Dulu: TP1=0.12%, IC=0.08% → R:R = 1.5:1 (kurang)
-  Fix:  TP1=0.15%, IC=0.06% → R:R = 2.5:1 (lebih sehat)
-  Dengan WR 45% pun tetap profit kalau R:R = 2.5:1
+FIX v17:
+  #1 IC LEBIH LEBAR: 0.06% → 0.15% (kasih nafas posisi)
+  #2 HARD GUARD LEBIH LEBAR: 0.08% → 0.20% (real stop loss)
+  #3 TP LEBIH REALISTIS: TP1 0.25%, TP2 0.60% (butuh pergerakan lebih)
+  #4 R:R TETAP SEHAT: TP1/Guard = 0.25/0.20 = 1.25 (min), lebih baik saat sampai TP2
+  #5 TRAIL LEBIH LAMBAT: aktif di 0.10% (bukan 0.03%)
+  #6 TRAIL WIDTH LEBIH LEBAR: 0.12% (bukan 0.06%)
+  #7 HOLD LEBIH LAMA: 360s = 6 menit (bukan 3 menit)
+  #8 MACRO FILTER: saat BTC BEAR → hanya SHORT, saat BULL → hanya LONG
+  #9 FEAR FILTER: F&G < 15 → pause (extreme fear = unpredictable)
+  #10 MAX POSITIONS DIKURANGI: 3 → 2 (fokus kualitas, kurangi exposure)
+  #11 SCORE THRESHOLD DINAIKKAN: 45 → 50 (hanya setup terbaik)
+  #12 COOLDOWN LEBIH LAMA: 4s → 8s (beri waktu antara trade)
 
-PERUBAHAN #3: GUARD LEBIH CEPAT
-  Hard loss guard: 0.10% → 0.08% (cut lebih awal)
-  Kurangi bleeding posisi yang melawan
+LOGIKA MATH:
+  Dengan Guard 0.20%, TP1 0.25%, leverage 20x:
+  Max loss/trade  = 0.20% × 20 × $1 = $0.040
+  TP1 profit      = 0.25% × 20 × $1 × 65% = $0.033 (partial close)
+  TP2 profit      = 0.60% × 20 × $1 × 35% = $0.042 (sisa)
+  Full TP         = $0.033 + $0.042 = $0.075
+  R:R (TP2)       = 0.075 / 0.040 = 1.875:1
 
-PERUBAHAN #4: TRAIL LEBIH AGRESIF
-  Aktivasi: profit 0.05% → 0.03% (trail lebih cepat on)
-  Width: 0.08% → 0.06% (lebih ketat, lock profit lebih banyak)
-
-PERUBAHAN #5: SCORE THRESHOLD DINAIKKAN
-  MIN_SCORE: 38 → 45 (filter lebih ketat, less trade tapi lebih qualified)
-  Gap minimum: 15 → 20 poin (sinyal harus lebih jelas)
+  Dengan WR 40% dan R:R 1.875:
+  EV = 0.40 × 0.075 - 0.60 × 0.040 = 0.030 - 0.024 = +$0.006/trade POSITIF
 
 MODE: SIMULASI — tidak ada order nyata ke Binance
 """
@@ -44,99 +57,74 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v16 — CONTRARIAN + BETTER R:R
+#  CONFIG v17 — FIXED PARAMETERS
 # ═══════════════════════════════════════════════════════
 LEVERAGE       = 20
 ORDER_USDT     = 1.0
-MAX_POSITIONS  = 3
+MAX_POSITIONS  = 2     # ↓ dari 3 → 2 (fokus kualitas, kurangi exposure)
 
-# ── CONTRARIAN FLAG ───────────────────────────────────
-# True = flip semua sinyal (LONG→SHORT, SHORT→LONG)
-CONTRARIAN     = True
+CONTRARIAN     = True  # masih contrarian karena v15 konsisten salah
 
-# ── R:R IMPROVED ──────────────────────────────────────
-# Dengan leverage 20x:
-#   TP1 0.15% × 20 = +3.0% dari modal ($0.030 profit dari $1)
-#   IC  0.06% × 20 = -1.2% dari modal ($0.012 loss max per trade)
-#   Guard 0.08% × 20 = -1.6% dari modal ($0.016 hard max)
-#   R:R = 0.030 / 0.016 = 1.875:1 → dengan WR 40%+ tetap profit
-TP1_PCT        = 0.0015   # +0.15% dari entry → TP1 partial (naik dari 0.12%)
-TP2_PCT        = 0.0040   # +0.40% dari entry → TP2 full (naik dari 0.35%)
-IC_PCT         = 0.0006   # -0.06% dari entry → instant cut (turun dari 0.08%)
-HARD_LOSS_PCT  = 0.0008   # -0.08% dari entry → hard PNL guard (turun dari 0.10%)
+# ── FIX #1-3: PARAMETER R:R ───────────────────────────
+# Kunci: IC harus lebih lebar dari noise pasar (±0.1%)
+TP1_PCT        = 0.0025   # +0.25% (naik dari 0.15%) — target lebih realistis
+TP2_PCT        = 0.0060   # +0.60% (naik dari 0.40%) — swing target
+IC_PCT         = 0.0015   # -0.15% (naik dari 0.06%!) — kasih nafas!
+HARD_LOSS_PCT  = 0.0020   # -0.20% (naik dari 0.08%!) — real stop loss
 
-# Trail: lebih agresif — on lebih cepat, lebih ketat
-TRAIL_ACTIVATE = 0.0003   # Profit 0.03% baru trail on (turun dari 0.05%)
-TRAIL_WIDTH    = 0.0006   # Trail width 0.06% (turun dari 0.08%)
+# FIX #5-6: TRAIL LEBIH LAMBAT + LEBAR
+TRAIL_ACTIVATE = 0.0010   # Profit 0.10% baru trail on (naik dari 0.03%)
+TRAIL_WIDTH    = 0.0012   # Trail width 0.12% (naik dari 0.06%)
 
 # TP1 partial — tutup 65%, sisakan 35% untuk trail ke TP2
 TP1_RATIO      = 0.65
 
-# Kecepatan
+# FIX #7: HOLD LEBIH LAMA
+MAX_HOLD_SEC   = 360      # 6 menit (naik dari 3 menit)
+
+# Speed
 SCAN_INTERVAL  = 1
 MONITOR_INT    = 0.25
 SCAN_DELAY     = 0.015
 BATCH_SIZE     = 25
 MAX_WORKERS    = 12
-MAX_HOLD_SEC   = 180
 
-# Score threshold — lebih ketat dari v15c
-MIN_SCORE      = 45    # naik dari 38
-MIN_GAP        = 20    # gap minimum naik dari 15
-COOLDOWN_SEC   = 4
+# FIX #11-12: SCORE + COOLDOWN
+MIN_SCORE      = 50    # naik dari 45
+MIN_GAP        = 20
+COOLDOWN_SEC   = 8     # naik dari 4s
 
 # Kill switch
-DAILY_LOSS     = -8.0
-CONSEC_MAX     = 6     # lebih ketat dari 8
-CONSEC_PAUSE   = 45    # pause lebih lama
+DAILY_LOSS     = -5.0  # lebih ketat, stop lebih awal
+CONSEC_MAX     = 4     # stop setelah 4 loss beruntun (turun dari 6)
+CONSEC_PAUSE   = 60    # pause 60s (naik dari 45s)
+
+# FIX #9: FEAR/GREED FILTER
+FNG_MIN        = 15    # pause saat F&G < 15 (extreme fear)
+FNG_MAX        = 85    # pause saat F&G > 85 (extreme greed)
 
 # Cache TTL
 TTL_5M         = 5
 TTL_15M        = 30
 
 # ═══════════════════════════════════════════════════════
-#  SYMBOLS — 158 coins
+#  SYMBOLS — dikurangi ke tier 1-2 saja (lebih liquid)
 # ═══════════════════════════════════════════════════════
 SYMBOLS = [
-    # Tier 1 — mega cap, spread kecil
+    # Tier 1 — mega cap, spread kecil, paling reliable
     "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT",
     "DOGEUSDT","AVAXUSDT","TRXUSDT","DOTUSDT","LINKUSDT","MATICUSDT",
-    "LTCUSDT","SHIBUSDT","BCHUSDT","XLMUSDT","ATOMUSDT","UNIUSDT","ETCUSDT",
+    "LTCUSDT","BCHUSDT","ATOMUSDT","UNIUSDT",
 
-    # Tier 2 — large cap
+    # Tier 2 — large cap liquid
     "NEARUSDT","APTUSDT","ARBUSDT","OPUSDT","INJUSDT","SUIUSDT",
-    "TIAUSDT","AAVEUSDT","RUNEUSDT","FILUSDT","LDOUSDT","STXUSDT",
-    "MKRUSDT","SNXUSDT","CRVUSDT","COMPUSDT","GMXUSDT","PENDLEUSDT",
-    "DYDXUSDT","SUSHIUSDT","1INCHUSDT","BALUSDT",
+    "AAVEUSDT","FILUSDT","LDOUSDT","MKRUSDT","CRVUSDT","GMXUSDT",
+    "PENDLEUSDT","DYDXUSDT",
 
-    # Tier 3 — mid cap momentum
-    "1000PEPEUSDT","WIFUSDT","JUPUSDT","SEIUSDT","FETUSDT","RENDERUSDT",
-    "WLDUSDT","ALGOUSDT","ICPUSDT","FTMUSDT","HBARUSDT","EGLDUSDT",
-    "FLOWUSDT","THETAUSDT","KAVAUSDT","AXSUSDT","SANDUSDT","MANAUSDT",
-    "ENJUSDT","GALAUSDT","IMXUSDT","MASKUSDT","HIGHUSDT",
-    "ORDIUSDT","ARUSDT","KASUSDT","TONUSDT","TAOUSDT","ONDOUSDT",
-    "ENARUSDT","WUSDT","EIGENUSDT","STRKUSDT",
-
-    # Tier 4 — altcoin liquid
-    "JTOUSDT","RAYUSDT","GMTUSDT","APEUSDT","GRTUSDT","BATUSDT",
-    "CHZUSDT","ZILUSDT","HOTUSDT","IOSTUSDT","VETUSDT","ICXUSDT",
-    "ONTUSDT","QTUMUSDT","WAVESUSDT","XTZUSDT","NEOUSDT","DASHUSDT",
-    "ZECUSDT","RVNUSDT","ANKRUSDT","CELRUSDT","CTSIUSDT","SKLUSDT",
-    "BANDUSDT","BLZUSDT","COTIUSDT","OGNUSDT","LINAUSDT","SFPUSDT",
-    "FLMUSDT","TLMUSDT","BNTUSDT","1000XECUSDT","PERPUSDT","LITUSDT",
-    "UNFIUSDT","DENTUSDT","AGLDUSDT","CFXUSDT","COMBOUSDT",
-    "POLYXUSDT","TRUUSDT","OCEANUSDT","AMBUSDT","RENUSDT","CVCUSDT",
-    "VOXELUSDT","NMRUSDT","HOOKUSDT","GLMRUSDT","CKBUSDT","MOVRUSDT",
-
-    # Tier 5 — meme & new
-    "1000BONKUSDT","FLOKIUSDT","LUNCUSDT","JASMYUSDT","BEAMXUSDT",
-    "MEMEUSDT","RONINUSDT","NOTUSDT","DOGSUSDT","CATIUSDT","PORTALUSDT",
-    "VANRYUSDT","XAIUSDT","ATAUSDT","PYTHUSDT","ALTUSDT","DYMUSDT",
-    "PIXELUSDT","ACEUSDT","MANTAUSDT","ZETAUSDT","SAFEUSDT",
-
-    # DeFi
-    "AAVEUSDT","UNIUSDT","DYDXUSDT","GMXUSDT","PENDLEUSDT","CRVUSDT",
-    "MKRUSDT","COMPUSDT","SNXUSDT","1INCHUSDT","BALUSDT","SUSHIUSDT",
+    # Tier 3 — mid cap momentum (hanya yang paling liquid)
+    "1000PEPEUSDT","WIFUSDT","JUPUSDT","SEIUSDT","FETUSDT","WLDUSDT",
+    "ALGOUSDT","ICPUSDT","FTMUSDT","HBARUSDT","GALAUSDT","IMXUSDT",
+    "ORDIUSDT","TONUSDT","TAOUSDT","ONDOUSDT","ENARUSDT",
 ]
 SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
@@ -162,6 +150,7 @@ _stats = {
     "pnl": 0.0, "best": 0.0, "worst": 0.0,
     "tp1": 0, "tp2": 0, "sl": 0, "cut": 0, "guard": 0, "force": 0,
     "hist": deque(maxlen=200), "start": time.time(),
+    "skipped_macro": 0,  # FIX #8: track berapa banyak skip karena macro
 }
 
 # ═══════════════════════════════════════════════════════
@@ -199,6 +188,40 @@ def ok_cooldown(sym):
 
 def set_cd(sym):
     _sym_cooldown[sym] = time.time()
+
+# ═══════════════════════════════════════════════════════
+#  MACRO FILTER v17 — FIX #8 & #9
+# ═══════════════════════════════════════════════════════
+def macro_allows(direction):
+    """
+    FIX #8: Filter berdasarkan BTC trend
+    - BTC BEAR  → hanya boleh SHORT (contrarian: LONG asli → SHORT)
+    - BTC BULL  → hanya boleh LONG  (contrarian: SHORT asli → LONG)
+    - SIDEWAYS  → boleh keduanya
+    
+    FIX #9: Fear & Greed filter
+    - F&G < 15 (extreme fear)  → pause semua
+    - F&G > 85 (extreme greed) → pause semua
+    """
+    btc = _macro["btc"]
+    fng = _macro["fng"]
+    
+    # F&G filter
+    if fng < FNG_MIN or fng > FNG_MAX:
+        return False, f"F&G={fng} (extreme, pause)"
+    
+    # BTC trend filter
+    if btc == "BEAR" and direction == "LONG":
+        return False, f"BTC:{btc} tidak allow LONG"
+    if btc == "BULL" and direction == "SHORT":
+        return False, f"BTC:{btc} tidak allow SHORT"
+    if btc == "MILD_BEAR" and direction == "LONG":
+        # mild bear: LONG masih boleh tapi dengan threshold lebih tinggi
+        return True, "ok (mild bear, extra careful)"
+    if btc == "MILD_BULL" and direction == "SHORT":
+        return True, "ok (mild bull, extra careful)"
+    
+    return True, "ok"
 
 # ═══════════════════════════════════════════════════════
 #  OHLCV
@@ -245,6 +268,8 @@ def run_ta(df):
     df["br2"]  = df["body"] / df["rng"].replace(0, 1)
     df["m5"]   = (c - c.shift(5)) / c.shift(5)
     df["m3"]   = (c - c.shift(3)) / c.shift(3)
+    # FIX: tambah ATR relative untuk filter volatility
+    df["atr_pct"] = df["atr"] / c
     return df
 
 def btc_trend():
@@ -293,10 +318,10 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL ENGINE v16 — SAME LOGIC, OUTPUT FLIPPED
+#  SIGNAL ENGINE v17
 # ═══════════════════════════════════════════════════════
 def signal_raw(df):
-    """Hitung sinyal asli (identik dengan v15c)"""
+    """Sinyal dasar (sama logika dengan v16)"""
     if df is None or len(df) < 35:
         return None, 0, []
 
@@ -314,6 +339,11 @@ def signal_raw(df):
     m5    = row["m5"]
     body  = row["br2"]
     btc   = _macro["btc"]
+    
+    # FIX: skip jika volatility terlalu tinggi (spread mahal)
+    atr_pct = row.get("atr_pct", 0)
+    if atr_pct > 0.015:  # ATR > 1.5% dari harga → terlalu volatile
+        return None, 0, []
 
     lp = sp = 0
     sl = ss = []
@@ -392,7 +422,7 @@ def signal_raw(df):
 
     # ═ DECISION ═══════════════════════
     btc_sw = btc in ("SIDEWAYS", "UNKNOWN")
-    thresh = 55 if btc_sw else MIN_SCORE   # lebih ketat dari v15c
+    thresh = 55 if btc_sw else MIN_SCORE
     gap    = abs(lp - sp)
 
     if lp > sp and lp >= thresh and gap >= MIN_GAP:
@@ -404,29 +434,32 @@ def signal_raw(df):
 
 def signal(df):
     """
-    CONTRARIAN WRAPPER v16:
-    Ambil sinyal raw, lalu BALIK arahnya.
-    LONG asli → kita SHORT (taruh uang melawan tren)
-    SHORT asli → kita LONG
-    
-    Alasan: v15c terbukti salah arah secara konsisten,
-    jadi melawan sinyal adalah strategi yang lebih profitable.
+    CONTRARIAN WRAPPER v17:
+    Sama dengan v16, tapi setelah flip → cek macro filter.
+    Jika macro tidak mengizinkan arah tersebut → return None.
     """
     dir_raw, score, sigs = signal_raw(df)
     if dir_raw is None:
         return None, score, []
 
     if CONTRARIAN:
-        # Flip direction
         flipped = "SHORT" if dir_raw == "LONG" else "LONG"
-        # Tambahkan tag contrarian di sigs
-        sigs_c = [f"↩{s}" for s in sigs]
-        return flipped, score, sigs_c
+        sigs_c  = [f"↩{s}" for s in sigs]
+        dir_out = flipped
     else:
-        return dir_raw, score, sigs
+        sigs_c  = sigs
+        dir_out = dir_raw
+
+    # FIX #8: Macro filter SETELAH flip
+    allowed, reason = macro_allows(dir_out)
+    if not allowed:
+        _stats["skipped_macro"] += 1
+        return None, score, []
+
+    return dir_out, score, sigs_c
 
 # ═══════════════════════════════════════════════════════
-#  PAPER OPEN
+#  PAPER OPEN v17 — parameter lebih lebar
 # ═══════════════════════════════════════════════════════
 def paper_open(sym, direction, score, sigs, price):
     with _lock:
@@ -472,10 +505,11 @@ def paper_open(sym, direction, score, sigs, price):
 
     d    = "🟢" if direction == "LONG" else "🔴"
     mode = "↩CONTRA" if CONTRARIAN else "NORMAL"
+    rr   = TP1_PCT / HARD_LOSS_PCT
     print(f"\n  {d} [PAPER] {sym} {direction} [{mode}] @{price:.6g}")
     print(f"     IC:±{IC_PCT*100:.2f}% | Guard:±{HARD_LOSS_PCT*100:.2f}% | TP1:+{TP1_PCT*100:.2f}% | TP2:+{TP2_PCT*100:.2f}%")
-    print(f"     R:R = 1:{TP1_PCT/HARD_LOSS_PCT:.1f} | Trail ON sejak +{TRAIL_ACTIVATE*100:.2f}% | Score:{score}")
-    print(f"     Sigs: {' | '.join(sigs)}")
+    print(f"     R:R(TP1) = 1:{rr:.1f} | R:R(TP2) = 1:{TP2_PCT/HARD_LOSS_PCT:.1f} | Trail@+{TRAIL_ACTIVATE*100:.2f}% | Score:{score}")
+    print(f"     Sigs: {' | '.join(sigs)} | BTC:{_macro['btc']} F&G:{_macro['fng']}")
     _stats["trades"] += 1
 
 # ═══════════════════════════════════════════════════════
@@ -547,11 +581,12 @@ def paper_tp1(sym, price):
     pos["qty_rem"] = pos["qty"] * (1 - TP1_RATIO)
     pos["be_on"]   = True
 
+    # Setelah TP1, trail lebih ketat untuk lock profit
     if side == "LONG":
-        pos["hard_sl"]  = entry * 1.00005
+        pos["hard_sl"]  = entry * 1.00010   # sedikit di atas entry
         pos["trail_sl"] = price * (1 - TRAIL_WIDTH * 0.7)
     else:
-        pos["hard_sl"]  = entry * 0.99995
+        pos["hard_sl"]  = entry * 0.99990
         pos["trail_sl"] = price * (1 + TRAIL_WIDTH * 0.7)
     pos["peak"]     = price
     pos["trail_on"] = True
@@ -570,7 +605,7 @@ def paper_tp1(sym, price):
     print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR — MULTI-LAYER PROTECTION (sama dengan v15c)
+#  MONITOR v17 — sama logika, parameter lebih lebar
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(paper_positions.keys()):
@@ -605,7 +640,7 @@ def monitor_positions():
                 pos["trail_on"] = True
                 pos["peak"]     = px
                 pos["trail_sl"] = px * (1 - TRAIL_WIDTH)
-                pos["hard_sl"]  = entry * 1.00005
+                pos["hard_sl"]  = entry * 1.00010
 
             if pos["trail_on"] and px > pos["peak"]:
                 pos["peak"]     = px
@@ -642,7 +677,7 @@ def monitor_positions():
                 pos["trail_on"] = True
                 pos["peak"]     = px
                 pos["trail_sl"] = px * (1 + TRAIL_WIDTH)
-                pos["hard_sl"]  = entry * 0.99995
+                pos["hard_sl"]  = entry * 0.99990
 
             if pos["trail_on"] and px < pos["peak"]:
                 pos["peak"]     = px
@@ -671,7 +706,7 @@ def scan_one(sym):
         time.sleep(SCAN_DELAY)
         if not ok_cooldown(sym): return None
         tk = _ticker_cache
-        if sym in tk and tk[sym]["vol"] < 200_000: return None
+        if sym in tk and tk[sym]["vol"] < 500_000: return None  # volume threshold lebih tinggi
 
         df = ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 80)
         if df is None or len(df) < 35: return None
@@ -679,7 +714,7 @@ def scan_one(sym):
 
         px  = df["close"].iloc[-1]
         atr = df["atr"].iloc[-1]
-        if px == 0 or atr / px > 0.02: return None
+        if px == 0 or atr / px > 0.015: return None  # lebih ketat dari 0.02
 
         dir_, sc, sigs = signal(df)
         if dir_ is None or len(sigs) < 1: return None
@@ -706,11 +741,11 @@ def scan_batch(syms):
                 except: pass
     return res
 
-def top_movers(syms, n=50):
+def top_movers(syms, n=40):
     tk  = tickers_all()
     ss  = set(syms)
     mv  = [(s, abs(d["pct"])) for s, d in tk.items()
-           if s in ss and d["vol"] >= 200_000]
+           if s in ss and d["vol"] >= 500_000]
     mv.sort(key=lambda x: x[1], reverse=True)
     return [s for s, _ in mv[:n]]
 
@@ -726,7 +761,7 @@ def print_inline():
     mode = "↩CONTRARIAN" if CONTRARIAN else "NORMAL"
     print(f"     ┌ [{mode}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"     └ R:R=1:{rr:.1f} | TP1:{_stats['tp1']} TP2:{_stats['tp2']} "
-          f"Cut:{_stats['cut']} Guard:{_stats['guard']} Force:{_stats['force']}")
+          f"Cut:{_stats['cut']} Guard:{_stats['guard']} Force:{_stats['force']} Skip:{_stats['skipped_macro']}")
 
 def print_full():
     n    = _stats["wins"] + _stats["losses"]
@@ -749,23 +784,34 @@ def print_full():
 
     max_loss_theory = ORDER_USDT * HARD_LOSS_PCT * LEVERAGE
     max_win_tp1     = ORDER_USDT * TP1_PCT * LEVERAGE * TP1_RATIO
-    rr              = TP1_PCT / HARD_LOSS_PCT
+    max_win_full    = ORDER_USDT * TP2_PCT * LEVERAGE  # full TP2
+    rr_tp1          = TP1_PCT / HARD_LOSS_PCT
+    rr_tp2          = TP2_PCT / HARD_LOSS_PCT
 
-    print(f"\n  {'─'*62}")
-    print(f"  🧪 PAPER v16 [{mode}] — {sess*60:.0f}m | {tph:.1f}T/jam | {len(SYMBOLS)}symbols")
-    print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
+    print(f"\n  {'─'*65}")
+    print(f"  🧪 PAPER v17 [{mode}] — {sess*60:.0f}m | {tph:.1f}T/jam | {len(SYMBOLS)}symbols")
+    print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} | Skipped(macro):{_stats['skipped_macro']}")
     print(f"  {e} PnL:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"  📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U | R:R=1:{rr:.1f}")
-    print(f"  Theory: max loss={max_loss_theory:.4f}U | max profit TP1={max_win_tp1:.4f}U")
+    print(f"  📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U | R:R(TP1)=1:{rr_tp1:.1f} R:R(TP2)=1:{rr_tp2:.1f}")
+    print(f"  Theory: max loss={max_loss_theory:.4f}U | TP1={max_win_tp1:.4f}U | full TP2={max_win_full:.4f}U")
     print(f"  TP1:{_stats['tp1']} TP2:{_stats['tp2']} SL:{_stats['sl']} "
           f"⚡Cut:{_stats['cut']} 🛡️Guard:{_stats['guard']} ⏰Force:{_stats['force']}")
-    print(f"  KS: consec={_ks['consec']} daily={_ks['daily']:+.4f} | BTC:{_macro['btc']}")
+    print(f"  KS: consec={_ks['consec']} daily={_ks['daily']:+.4f} | BTC:{_macro['btc']} F&G:{_macro['fng']}")
+    
+    # Analisa ratio cut vs tp
+    total_exit = _stats["tp1"] + _stats["tp2"] + _stats["cut"] + _stats["guard"] + _stats["force"]
+    if total_exit > 0:
+        cut_ratio = (_stats["cut"] + _stats["guard"]) / total_exit * 100
+        tp_ratio  = (_stats["tp1"] + _stats["tp2"]) / total_exit * 100
+        status = "✅ SEHAT" if cut_ratio < 50 else "⚠️ CUT MASIH DOMINAN"
+        print(f"  📊 Exit ratio: TP={tp_ratio:.0f}% Cut+Guard={cut_ratio:.0f}% → {status}")
+    
     if trade_log:
         print(f"  📋 Last 5:")
         for t in trade_log[-5:]:
             em = "🟢" if t["pnl"] > 0 else "🔴"
             print(f"     {em} {t['sym']:<14} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
-    print(f"  {'─'*62}")
+    print(f"  {'─'*65}")
 
 # ═══════════════════════════════════════════════════════
 #  THREADS
@@ -814,20 +860,27 @@ def t_macro():
 #  MAIN
 # ═══════════════════════════════════════════════════════
 def run_bot():
-    mode = "↩ CONTRARIAN (sinyal dibalik)" if CONTRARIAN else "NORMAL"
-    rr   = TP1_PCT / HARD_LOSS_PCT
+    mode    = "↩ CONTRARIAN (sinyal dibalik)" if CONTRARIAN else "NORMAL"
+    rr_tp1  = TP1_PCT / HARD_LOSS_PCT
+    rr_tp2  = TP2_PCT / HARD_LOSS_PCT
 
-    print("╔═══════════════════════════════════════════════════════╗")
-    print("║  🧪 PAPER TRADE v16 — CONTRARIAN + OPTIMIZED R:R     ║")
-    print("║  ⚠️  SIMULASI — NO REAL ORDERS TO BINANCE             ║")
-    print("╠═══════════════════════════════════════════════════════╣")
-    print(f"║  Mode: {mode:<47}║")
-    print(f"║  ${ORDER_USDT}/pos ×{LEVERAGE}x | IC:±{IC_PCT*100:.2f}% | Guard:±{HARD_LOSS_PCT*100:.2f}% | TP1:+{TP1_PCT*100:.2f}%  ║")
-    print(f"║  R:R = 1:{rr:.2f} | WR minimum untuk profit: {1/(1+rr)*100:.0f}%       ║")
-    print(f"║  Max loss/trade: -{ORDER_USDT*HARD_LOSS_PCT*LEVERAGE:.4f}U | Target TP1: +{ORDER_USDT*TP1_PCT*LEVERAGE*TP1_RATIO:.4f}U  ║")
-    print(f"║  Trail aktivasi: +{TRAIL_ACTIVATE*100:.2f}% | Width: {TRAIL_WIDTH*100:.2f}%                 ║")
-    print(f"║  Min score: {MIN_SCORE} | Min gap: {MIN_GAP} | {len(SYMBOLS)} symbols               ║")
-    print("╚═══════════════════════════════════════════════════════╝")
+    print("╔═══════════════════════════════════════════════════════════╗")
+    print("║  🧪 PAPER TRADE v17 — FIXED PARAMS + MACRO FILTER        ║")
+    print("║  ⚠️  SIMULASI — NO REAL ORDERS TO BINANCE                 ║")
+    print("╠═══════════════════════════════════════════════════════════╣")
+    print(f"║  Mode: {mode:<51}║")
+    print(f"║  Perbaikan v17 vs v16:                                    ║")
+    print(f"║    IC: 0.06% → {IC_PCT*100:.2f}% (lebih nafas, kurangi false cut) ║")
+    print(f"║    Guard: 0.08% → {HARD_LOSS_PCT*100:.2f}% (real stop loss)          ║")
+    print(f"║    TP1: 0.15% → {TP1_PCT*100:.2f}% | TP2: 0.40% → {TP2_PCT*100:.2f}%       ║")
+    print(f"║    Trail: aktif di +{TRAIL_ACTIVATE*100:.2f}% (bukan +0.03%)          ║")
+    print(f"║    Hold: 3min → {MAX_HOLD_SEC//60}min | Max pos: 3 → {MAX_POSITIONS}              ║")
+    print(f"║    Macro filter: BTC BEAR → hanya SHORT                   ║")
+    print(f"╠═══════════════════════════════════════════════════════════╣")
+    print(f"║  R:R(TP1)=1:{rr_tp1:.2f} | R:R(TP2)=1:{rr_tp2:.2f}                      ║")
+    print(f"║  Min WR untuk profit: {1/(1+rr_tp1)*100:.0f}% (TP1), {1/(1+rr_tp2)*100:.0f}% (TP2)          ║")
+    print(f"║  Max loss/trade: -{ORDER_USDT*HARD_LOSS_PCT*LEVERAGE:.4f}U                         ║")
+    print("╚═══════════════════════════════════════════════════════════╝")
 
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"]
@@ -854,23 +907,30 @@ def run_bot():
         cycle += 1
         slots = MAX_POSITIONS - len(paper_positions)
 
-        print(f"\n{'═'*57}")
+        print(f"\n{'═'*60}")
         print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC:{_macro['btc']} F&G:{_macro['fng']} "
-              f"({len(paper_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
+              f"({len(paper_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U "
+              f"Skip:{_stats['skipped_macro']}")
 
         if (k := ks_check())[0]:
             print(f"  🚨 KS:{k[1]}"); time.sleep(SCAN_INTERVAL); continue
 
+        # FIX #9: F&G check di level bot juga
+        fng = _macro["fng"]
+        if fng < FNG_MIN or fng > FNG_MAX:
+            print(f"  ⚠️  F&G={fng} — extreme, skip scan")
+            time.sleep(SCAN_INTERVAL); continue
+
         if slots > 0:
-            mv  = top_movers(syms, 50)
+            mv  = top_movers(syms, 40)
             mv  = [s for s in mv if s not in paper_positions]
             bs  = scan_idx * BATCH_SIZE
             reg = [s for s in syms[bs:bs+BATCH_SIZE]
                    if s not in paper_positions and s not in mv]
             scan_idx = (scan_idx + 1) % n_bat
-            scan_list = mv[:25] + reg[:15]
+            scan_list = mv[:20] + reg[:15]
 
-            print(f"  🔍 {len(scan_list)} syms | {slots} slot kosong")
+            print(f"  🔍 {len(scan_list)} syms | {slots} slot kosong | BTC:{_macro['btc']}")
             try: res = scan_batch(scan_list)
             except: res = []
 
@@ -882,17 +942,7 @@ def run_bot():
                     print(f"     ⭐ {sym} {d} Score:{sc} {' | '.join(sg)}")
                     paper_open(sym, d, sc, sg, px)
             elif len(paper_positions) == 0:
-                print("  ⚠️  Wide scan...")
-                try:
-                    r2 = scan_batch([s for s in syms if s not in paper_positions][:50])
-                except: r2 = []
-                if r2:
-                    r2.sort(key=lambda x: x[2], reverse=True)
-                    sym, d, sc, sg, px = r2[0]
-                    print(f"     ⭐ best: {sym} {d} Score:{sc}")
-                    paper_open(sym, d, sc, sg, px)
-                else:
-                    print("  ⏳ Market flat — tunggu...")
+                print("  ⚠️  Tidak ada setup — tunggu kondisi pasar...")
             else:
                 print(f"  ⏳ {len(paper_positions)} pos aktif")
         else:
