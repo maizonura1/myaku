@@ -1,22 +1,21 @@
 """
-Bot Scalping v18.5 — TREND FOLLOWING & LET PROFIT RUN (LIVE)
+Bot Scalping v19.0 — TREND FOLLOWING & LET PROFIT RUN (LIVE)
 ====================================================
 - LIVE MODE: Order nyata ke Binance Futures Testnet/Live.
 - TREND FOLLOWING: Mengikuti arah momentum indikator (Inverse dimatikan).
 - EXTREME PROFIT: Profit +0.10% langsung bungkus.
-- IMPATIENT LOSS: Hold 15 detik → kalau MINUS langsung cut, kalau PLUS tahan.
+- IMPATIENT PROFIT: Hold 15 detik → kalau PLUS langsung bungkus, kalau MINUS tahan.
 - HARD SL: -0.2% jaring pengaman terakhir.
 
 ⚠️  PERINGATAN: Bot ini melakukan order NYATA ke Binance.
     Pastikan API Key memiliki izin Trading Futures.
     Gunakan Testnet dulu sebelum ke akun live.
 
-CHANGELOG v18.5 (PERBAIKAN LOGIKA LOSS KE PROFIT):
+CHANGELOG v19.0 (PERBAIKAN LOGIKA LOSS KE PROFIT):
   - INVERSE_MODE  -> DI-SET FALSE (mengikuti tren yang benar)
-  - ImpatientProfit -> DIGANTI menjadi ImpatientLoss
-  - Posisi minus setelah 15 detik: dipotong (cut loss cepat)
-  - Posisi plus setelah 15 detik: ditahan hingga menyentuh ExtremeProfit / ForceTimeout
-  - Target ExtremeProfit dinaikkan sedikit ke +0.10% agar profit maksimal
+  - ImpatientLoss -> DIGANTI menjadi ImpatientProfit
+  - Posisi plus setelah 15 detik: langsung dibungkus (take profit cepat)
+  - Posisi minus setelah 15 detik: ditahan hingga menyentuh breakeven/ForceTimeout/HardSL
 """
 
 import os, time, math, threading, queue
@@ -40,7 +39,7 @@ client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"  # ← Ganti ke li
 # ───────────────────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v18.5 - TREND FOLLOWING
+#  CONFIG v19.0 - TREND FOLLOWING
 # ═══════════════════════════════════════════════════════
 INVERSE_MODE   = False  # SUDAH DIUBAH: Searah dengan tren indikator
 
@@ -101,7 +100,7 @@ _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0, "impatient_loss": 0, "force": 0, # Diubah ke impatient_loss
+    "extreme_tp": 0, "hard_sl": 0, "impatient_profit": 0, "force": 0, # Diubah ke impatient_profit
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -468,11 +467,11 @@ def live_close(sym, reason, close_px=None):
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
-    # TRACKING STATISTIK BARU
-    if   "ExtremeProfit" in reason: _stats["extreme_tp"]     += 1
-    elif "HardSL"        in reason: _stats["hard_sl"]        += 1
-    elif "ImpatientLoss" in reason: _stats["impatient_loss"] += 1
-    elif "Force"         in reason: _stats["force"]          += 1
+    # TRACKING STATISTIK BARU (ImpatientProfit)
+    if   "ExtremeProfit"   in reason: _stats["extreme_tp"]       += 1
+    elif "HardSL"          in reason: _stats["hard_sl"]          += 1
+    elif "ImpatientProfit" in reason: _stats["impatient_profit"] += 1
+    elif "Force"           in reason: _stats["force"]            += 1
 
     trade_log.append({
         "sym":    sym,
@@ -490,7 +489,7 @@ def live_close(sym, reason, close_px=None):
     print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR — IMPATIENT LOSS LOGIC (DIBALIK SUPAYA PROFIT)
+#  MONITOR — IMPATIENT PROFIT LOGIC (DIBALIK)
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -526,15 +525,15 @@ def monitor_positions():
             live_close(sym, "HardSL")
             continue
 
-        # 4. ✅ IMPATIENT LOSS (Logika yang Dibalik)
+        # 4. ✅ IMPATIENT PROFIT (v19.0 - Logika Dibalik)
         #    Setelah 15 detik:
-        #    - Kalau MINUS → Langsung cut/buang supaya tidak membesar (ImpatientLoss)
-        #    - Kalau PLUS → TAHAN, biarkan lari sampai ExtremeProfit atau ForceTimeout
+        #    - Kalau PLUS  → langsung close, ambil profit sebelum balik
+        #    - Kalau MINUS → tahan, tunggu recovery
         if hold >= 15:
-            if prof_pct < 0:
-                live_close(sym, "ImpatientLoss")
+            if prof_pct > 0:
+                live_close(sym, "ImpatientProfit")  # ambil profit kecil sebelum balik
                 continue
-            # Jika plus, biarkan berlanjut (jangan ditutup)
+            # Jika minus, biarkan berlanjut (tunggu recovery)
 
         # Print log berjalan
         pnl_now = (px - entry) * pos["qty"] if side == "LONG" else (entry - px) * pos["qty"]
@@ -587,10 +586,10 @@ def print_inline():
     wr  = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     e   = "💚" if pnl >= 0 else "🔴"
-    # LABEL DIUBAH MENJADI Imp-Loss
-    print(f"     ┌ [v18.5 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    # LABEL DIUBAH MENJADI Imp-Profit
+    print(f"     ┌ [v19.0 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"     └ Ex-Profit:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']} "
-          f"Imp-Loss:{_stats['impatient_loss']} Force:{_stats['force']}")
+          f"Imp-Profit:{_stats['impatient_profit']} Force:{_stats['force']}")
 
 def print_full():
     n    = _stats["wins"] + _stats["losses"]
@@ -610,7 +609,7 @@ def print_full():
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
     print(f"\n  {'─'*62}")
-    print(f"  🚀 LIVE v18.5 [TREND FOLLOWING] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"  🚀 LIVE v19.0 [TREND FOLLOWING] — {sess*60:.0f}m | {tph:.1f}T/jam")
     print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"  {e} PnL:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"  📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
@@ -695,8 +694,8 @@ def get_tradable_symbols():
     for s in info["symbols"]:
         sym = s["symbol"]
 
-        if not sym.endswith("USDT"):          continue
-        if s["status"] != "TRADING":          continue
+        if not sym.endswith("USDT"):         continue
+        if s["status"] != "TRADING":         continue
         if s.get("contractType") != "PERPETUAL": continue
 
         px = tickers.get(sym, 0)
@@ -745,13 +744,13 @@ def run_bot():
     mode_str   = "TESTNET" if is_testnet else "⚠️  LIVE REAL MONEY ⚠️"
 
     print("╔═══════════════════════════════════════════════════════╗")
-    print(f"║  🚀 LIVE TRADE v18.5 — TREND FOLLOWING LOGIC          ║")
+    print(f"║  🚀 LIVE TRADE v19.0 — TREND FOLLOWING LOGIC          ║")
     print(f"║  MODE: {mode_str:<47}║")
     print("╠═══════════════════════════════════════════════════════╣")
     print(f"║  Order      : ${ORDER_USDT} notional × {LEVERAGE}x leverage             ║")
-    print(f"║  Target     : +{EXTREME_PROFIT_PCT*100:.2f}% per trade                      ║")
+    print(f"║  Target     : +{EXTREME_PROFIT_PCT*100:.2f}% per trade                       ║")
     print(f"║  Hard SL    : -{HARD_SL_PCT*100:.2f}%                               ║")
-    print(f"║  Impatient  : 15s → MINUS buang, PLUS tahan terus    ║")
+    print(f"║  Impatient  : 15s → PLUS bungkus, MINUS tahan terus  ║")
     print(f"║  Jaring akhir: Extreme Profit atau ForceTimeout 60s  ║")
     print("╚═══════════════════════════════════════════════════════╝\n")
 
@@ -764,7 +763,7 @@ def run_bot():
     SYMBOLS[:] = syms 
     print(f"  ✅ {len(syms)} simbol siap ditrading")
 
-    threading.Thread(target=t_monitor,          daemon=True).start()
+    threading.Thread(target=t_monitor,         daemon=True).start()
     threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
     threading.Thread(target=t_macro,            daemon=True).start()
 
