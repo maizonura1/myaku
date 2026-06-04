@@ -1,21 +1,22 @@
 """
-Bot Scalping v18.4 — INVERSE EXTREME PROFIT MODE (LIVE)
+Bot Scalping v18.5 — TREND FOLLOWING & LET PROFIT RUN (LIVE)
 ====================================================
 - LIVE MODE: Order nyata ke Binance Futures Testnet/Live.
-- INVERSE MODE: Sinyal LONG dieksekusi SHORT, sinyal SHORT dieksekusi LONG.
-- EXTREME PROFIT: Profit +0.05% langsung bungkus.
-- IMPATIENT PROFIT: Hold 5 detik → kalau PLUS langsung bungkus, kalau MINUS tahan (biarkan Hard SL).
-- HARD SL: 0.2% jaring pengaman terakhir.
+- TREND FOLLOWING: Mengikuti arah momentum indikator (Inverse dimatikan).
+- EXTREME PROFIT: Profit +0.10% langsung bungkus.
+- IMPATIENT LOSS: Hold 15 detik → kalau MINUS langsung cut, kalau PLUS tahan.
+- HARD SL: -0.2% jaring pengaman terakhir.
 
 ⚠️  PERINGATAN: Bot ini melakukan order NYATA ke Binance.
     Pastikan API Key memiliki izin Trading Futures.
     Gunakan Testnet dulu sebelum ke akun live.
 
-CHANGELOG v18.4:
-  - ImpatientLoss  → DIHAPUS (posisi minus tidak langsung diclose)
-  - ImpatientWin   → DIGANTI menjadi ImpatientProfit
-  - Posisi minus setelah 5 detik: ditahan, diserahkan ke Hard SL (-0.2%) atau ExtremeProfit
-  - Stat key: impatient_cut → impatient_profit
+CHANGELOG v18.5 (PERBAIKAN LOGIKA LOSS KE PROFIT):
+  - INVERSE_MODE  -> DI-SET FALSE (mengikuti tren yang benar)
+  - ImpatientProfit -> DIGANTI menjadi ImpatientLoss
+  - Posisi minus setelah 15 detik: dipotong (cut loss cepat)
+  - Posisi plus setelah 15 detik: ditahan hingga menyentuh ExtremeProfit / ForceTimeout
+  - Target ExtremeProfit dinaikkan sedikit ke +0.10% agar profit maksimal
 """
 
 import os, time, math, threading, queue
@@ -39,15 +40,15 @@ client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"  # ← Ganti ke li
 # ───────────────────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v18.4 - INVERSE EXTREME PROFIT
+#  CONFIG v18.5 - TREND FOLLOWING
 # ═══════════════════════════════════════════════════════
-INVERSE_MODE   = True
+INVERSE_MODE   = False  # SUDAH DIUBAH: Searah dengan tren indikator
 
 LEVERAGE       = 20
 ORDER_USDT     = 2.0
 MAX_POSITIONS  = 3
 
-EXTREME_PROFIT_PCT = 0.0005  # +0.05%
+EXTREME_PROFIT_PCT = 0.0010  # +0.10% (dinaikkan karena kita membiarkan profit jalan)
 HARD_SL_PCT        = 0.0020  # -0.20%
 
 MIN_BASE_VOL   = 25_000_000
@@ -75,8 +76,6 @@ TTL_15M        = 30
 # ═══════════════════════════════════════════════════════
 #  SYMBOLS & STATE
 # ═══════════════════════════════════════════════════════
-# ✅ v18.4: SYMBOLS diisi dinamis saat startup via get_tradable_symbols()
-# Daftar ini hanya fallback jika exchange_info gagal diambil
 SYMBOLS_FALLBACK = [
     "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
     "TRXUSDT", "DOTUSDT", "LINKUSDT", "LTCUSDT", "ATOMUSDT",
@@ -84,15 +83,15 @@ SYMBOLS_FALLBACK = [
     "SUIUSDT", "SEIUSDT", "FETUSDT", "WLDUSDT", "AAVEUSDT",
     "ORDIUSDT", "TONUSDT", "1000PEPEUSDT", "WIFUSDT", "JUPUSDT",
 ]
-SYMBOLS = []  # Diisi oleh get_tradable_symbols() saat run_bot()
+SYMBOLS = []
 
-live_positions  = {}   # sym -> {side, entry, qty, open_time, score, sigs, atr, order_id}
+live_positions  = {}
 trade_log       = []
 _ohlcv_cache    = {}
 _sym_cooldown   = {}
 _ticker_cache   = {}
 _ticker_ts      = 0
-_sym_info       = {}   # Cache precision info per symbol
+_sym_info       = {}
 _lock           = threading.Lock()
 _executor       = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q       = queue.Queue()
@@ -102,8 +101,7 @@ _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    # ✅ v18.4: impatient_cut diganti impatient_profit
-    "extreme_tp": 0, "hard_sl": 0, "impatient_profit": 0, "force": 0,
+    "extreme_tp": 0, "hard_sl": 0, "impatient_loss": 0, "force": 0, # Diubah ke impatient_loss
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -470,11 +468,11 @@ def live_close(sym, reason, close_px=None):
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
-    # ✅ v18.4: tracking reason yang diperbarui
-    if   "ExtremeProfit"    in reason: _stats["extreme_tp"]      += 1
-    elif "HardSL"           in reason: _stats["hard_sl"]         += 1
-    elif "ImpatientProfit"  in reason: _stats["impatient_profit"] += 1
-    elif "Force"            in reason: _stats["force"]           += 1
+    # TRACKING STATISTIK BARU
+    if   "ExtremeProfit" in reason: _stats["extreme_tp"]     += 1
+    elif "HardSL"        in reason: _stats["hard_sl"]        += 1
+    elif "ImpatientLoss" in reason: _stats["impatient_loss"] += 1
+    elif "Force"         in reason: _stats["force"]          += 1
 
     trade_log.append({
         "sym":    sym,
@@ -492,7 +490,7 @@ def live_close(sym, reason, close_px=None):
     print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR — IMPATIENT PROFIT LOGIC (v18.4)
+#  MONITOR — IMPATIENT LOSS LOGIC (DIBALIK SUPAYA PROFIT)
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -508,58 +506,40 @@ def monitor_positions():
         entry = pos["entry"]
         hold  = time.time() - pos["open_time"]
 
-        # Force close jika terlalu lama
+        # 1. Force close jika terlalu lama (60 detik)
         if hold >= MAX_HOLD_SEC:
             live_close(sym, "ForceTimeout")
             continue
 
         if side == "LONG":
             prof_pct = (px - entry) / entry
-
-            # 1. Extreme Profit → bungkus langsung
-            if prof_pct >= EXTREME_PROFIT_PCT:
-                live_close(sym, "ExtremeProfit"); continue
-
-            # 2. Hard SL → jaring pengaman terakhir
-            if prof_pct <= -HARD_SL_PCT:
-                live_close(sym, "HardSL"); continue
-
-            # 3. ✅ IMPATIENT PROFIT (v18.4)
-            #    Setelah 5 detik:
-            #    - Kalau PLUS sekecil apapun → bungkus (ImpatientProfit)
-            #    - Kalau MINUS → TAHAN, biarkan Hard SL atau ExtremeProfit yang handle
-            if hold >= 5:
-                if prof_pct > 0:
-                    live_close(sym, "ImpatientProfit")
-                    continue
-                # minus = tidak diclose, lanjut monitor
-
-            pnl_now = (px - entry) * pos["qty"]
-            print(f"  📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s")
-
-        else:  # SHORT
+        else: # SHORT
             prof_pct = (entry - px) / entry
 
-            # 1. Extreme Profit → bungkus langsung
-            if prof_pct >= EXTREME_PROFIT_PCT:
-                live_close(sym, "ExtremeProfit"); continue
+        # 2. Extreme Profit → target tercapai, bungkus langsung
+        if prof_pct >= EXTREME_PROFIT_PCT:
+            live_close(sym, "ExtremeProfit")
+            continue
 
-            # 2. Hard SL → jaring pengaman terakhir
-            if prof_pct <= -HARD_SL_PCT:
-                live_close(sym, "HardSL"); continue
+        # 3. Hard SL → jaring pengaman terakhir dari kebangkrutan
+        if prof_pct <= -HARD_SL_PCT:
+            live_close(sym, "HardSL")
+            continue
 
-            # 3. ✅ IMPATIENT PROFIT (v18.4)
-            #    Setelah 5 detik:
-            #    - Kalau PLUS sekecil apapun → bungkus (ImpatientProfit)
-            #    - Kalau MINUS → TAHAN, biarkan Hard SL atau ExtremeProfit yang handle
-            if hold >= 5:
-                if prof_pct > 0:
-                    live_close(sym, "ImpatientProfit")
-                    continue
-                # minus = tidak diclose, lanjut monitor
+        # 4. ✅ IMPATIENT LOSS (Logika yang Dibalik)
+        #    Setelah 15 detik:
+        #    - Kalau MINUS → Langsung cut/buang supaya tidak membesar (ImpatientLoss)
+        #    - Kalau PLUS → TAHAN, biarkan lari sampai ExtremeProfit atau ForceTimeout
+        if hold >= 15:
+            if prof_pct < 0:
+                live_close(sym, "ImpatientLoss")
+                continue
+            # Jika plus, biarkan berlanjut (jangan ditutup)
 
-            pnl_now = (entry - px) * pos["qty"]
-            print(f"  📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s")
+        # Print log berjalan
+        pnl_now = (px - entry) * pos["qty"] if side == "LONG" else (entry - px) * pos["qty"]
+        side_char = "L" if side == "LONG" else "S"
+        print(f"  📌 {sym} {side_char}@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s")
 
 # ═══════════════════════════════════════════════════════
 #  SCANNER
@@ -568,12 +548,9 @@ def scan_one(sym):
     try:
         time.sleep(SCAN_DELAY)
         if not ok_cooldown(sym): return None
-        # Pakai ticker yang ada; kalau kosong, fetch dulu
-        tk = _ticker_cache if _ticker_cache else tickers_all()
+        tk = _ticker_cache
         if sym in tk and tk[sym]["vol"] < MIN_BASE_VOL: return None
-        df = ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100)
-        if df is None or len(df) < 55: return None
-        df  = run_ta(df.copy())
+        df  = run_ta(ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100).copy())
         px  = df["close"].iloc[-2]
         atr = df["atr"].iloc[-2]
         if px == 0 or atr / px > 0.03: return None
@@ -582,8 +559,7 @@ def scan_one(sym):
         px_live = price_live(sym)
         if px_live == 0: return None
         return (sym, dir_, sc, sigs, px_live, atr_val)
-    except Exception as e:
-        print(f"  ⚠️  scan_one {sym}: {e}")
+    except:
         return None
 
 def scan_batch(syms):
@@ -611,10 +587,10 @@ def print_inline():
     wr  = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     e   = "💚" if pnl >= 0 else "🔴"
-    # ✅ v18.4: label Imp-Cut → Imp-Profit
-    print(f"     ┌ [v18.4 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    # LABEL DIUBAH MENJADI Imp-Loss
+    print(f"     ┌ [v18.5 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"     └ Ex-Profit:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']} "
-          f"Imp-Profit:{_stats['impatient_profit']} Force:{_stats['force']}")
+          f"Imp-Loss:{_stats['impatient_loss']} Force:{_stats['force']}")
 
 def print_full():
     n    = _stats["wins"] + _stats["losses"]
@@ -634,7 +610,7 @@ def print_full():
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
     print(f"\n  {'─'*62}")
-    print(f"  🚀 LIVE v18.4 [INVERSE EXTREME PROFIT] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"  🚀 LIVE v18.5 [TREND FOLLOWING] — {sess*60:.0f}m | {tph:.1f}T/jam")
     print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"  {e} PnL:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"  📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
@@ -698,18 +674,10 @@ def t_macro():
 #  MAIN
 # ═══════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════
-#  SYMBOL FILTER — hanya simbol yang bisa diorder dengan modal kita
+#  SYMBOL FILTER
 # ═══════════════════════════════════════════════════════
 def get_tradable_symbols():
-    """
-    Ambil semua simbol USDT-margined futures dari Binance, lalu filter:
-    1. Status TRADING
-    2. Hanya pair xxxUSDT (bukan BUSD, USDC, dsb)
-    3. Notional cukup: (ORDER_USDT × LEVERAGE) / harga >= stepSize minimum
-       dan notional value >= MIN_NOTIONAL Binance (biasanya $100, testnet $50)
-    Mengembalikan list simbol yang siap diorder.
-    """
-    MIN_NOTIONAL_USD = ORDER_USDT * LEVERAGE  # modal efektif kita per trade
+    MIN_NOTIONAL_USD = ORDER_USDT * LEVERAGE 
 
     print(f"  🔍 Scanning simbol Binance Futures (notional min: ${MIN_NOTIONAL_USD:.0f})...")
 
@@ -727,18 +695,15 @@ def get_tradable_symbols():
     for s in info["symbols"]:
         sym = s["symbol"]
 
-        # Hanya USDT pairs, status TRADING
         if not sym.endswith("USDT"):          continue
         if s["status"] != "TRADING":          continue
         if s.get("contractType") != "PERPETUAL": continue
 
-        # Ambil harga live
         px = tickers.get(sym, 0)
         if px == 0:
             skipped_price.append(sym)
             continue
 
-        # Ambil stepSize dari LOT_SIZE filter
         step = 0.001
         min_notional_filter = 0
         for f in s["filters"]:
@@ -747,16 +712,12 @@ def get_tradable_symbols():
             if f["filterType"] == "MIN_NOTIONAL":
                 min_notional_filter = float(f.get("notional", 0))
 
-        # Hitung qty yang akan kita order
         raw_qty = (ORDER_USDT * LEVERAGE) / px
         precision = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
         actual_qty = round(math.floor(raw_qty / step) * step, precision)
 
-        # Notional aktual setelah pembulatan
         actual_notional = actual_qty * px
 
-        # Cek apakah notional cukup (Binance minimum $100, testnet $50)
-        # Pakai threshold lebih longgar: notional kita >= 50 USD
         threshold = max(min_notional_filter, 50.0)
 
         if actual_qty <= 0 or actual_notional < threshold:
@@ -765,7 +726,6 @@ def get_tradable_symbols():
 
         tradable.append(sym)
 
-    # Sort: prioritaskan yang volume tinggi (sudah ada di ticker)
     vol_map = {t["symbol"]: float(t["quoteVolume"]) for t in client.futures_ticker()
                if t["symbol"] in set(tradable)}
     tradable.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
@@ -773,7 +733,6 @@ def get_tradable_symbols():
     print(f"  ✅ {len(tradable)} simbol lolos filter notional")
     print(f"  ⏭  {len(skipped_notional)} dilewati (notional terlalu kecil untuk modal $2×{LEVERAGE}x):")
     if skipped_notional:
-        # Tampilkan sebagian saja agar tidak banjir log
         shown = skipped_notional[:10]
         more  = len(skipped_notional) - len(shown)
         print(f"     {', '.join(shown)}{f' ... +{more} lainnya' if more else ''}")
@@ -786,14 +745,14 @@ def run_bot():
     mode_str   = "TESTNET" if is_testnet else "⚠️  LIVE REAL MONEY ⚠️"
 
     print("╔═══════════════════════════════════════════════════════╗")
-    print(f"║  🚀 LIVE TRADE v18.4 — INVERSE EXTREME PROFIT         ║")
+    print(f"║  🚀 LIVE TRADE v18.5 — TREND FOLLOWING LOGIC          ║")
     print(f"║  MODE: {mode_str:<47}║")
     print("╠═══════════════════════════════════════════════════════╣")
     print(f"║  Order      : ${ORDER_USDT} notional × {LEVERAGE}x leverage             ║")
     print(f"║  Target     : +{EXTREME_PROFIT_PCT*100:.2f}% per trade                      ║")
-    print(f"║  Hard SL    : -{HARD_SL_PCT*100:.2f}%                                ║")
-    print(f"║  Impatient  : 5s → PLUS bungkus, MINUS tahan terus   ║")
-    print(f"║  Jaring akhir: Hard SL -0.2% atau ForceTimeout 60s   ║")
+    print(f"║  Hard SL    : -{HARD_SL_PCT*100:.2f}%                               ║")
+    print(f"║  Impatient  : 15s → MINUS buang, PLUS tahan terus    ║")
+    print(f"║  Jaring akhir: Extreme Profit atau ForceTimeout 60s  ║")
     print("╚═══════════════════════════════════════════════════════╝\n")
 
     if not is_testnet:
@@ -801,9 +760,8 @@ def run_bot():
         print("  Tekan Ctrl+C dalam 5 detik untuk batalkan...")
         time.sleep(5)
 
-    # ✅ v18.4: filter dinamis — hanya simbol yang notional-nya cukup untuk $2×20x
     syms = get_tradable_symbols()
-    SYMBOLS[:] = syms  # update global agar t_rescan bisa pakai list terbaru
+    SYMBOLS[:] = syms 
     print(f"  ✅ {len(syms)} simbol siap ditrading")
 
     threading.Thread(target=t_monitor,          daemon=True).start()
@@ -833,10 +791,6 @@ def run_bot():
             continue
 
         if slots > 0:
-            # Pastikan ticker cache terisi
-            if not _ticker_cache:
-                tickers_all()
-
             mv = top_movers(syms, 20)
             mv = [s for s in mv if s not in live_positions]
 
@@ -845,15 +799,10 @@ def run_bot():
             scan_idx  = (scan_idx + 1) % n_bat
             scan_list = mv[:15] + reg[:10]
 
-            print(f"  🔎 Scan {len(scan_list)} syms (mv:{len(mv[:15])} reg:{len(reg[:10])}) | pool:{len(syms)}")
-
             try:
                 res = scan_batch(scan_list)
-            except Exception as e:
-                print(f"  ❌ scan_batch error: {e}")
+            except:
                 res = []
-
-            print(f"  📊 Sinyal ditemukan: {len(res)}")
 
             if res:
                 res.sort(key=lambda x: x[2], reverse=True)
@@ -863,12 +812,10 @@ def run_bot():
                     print(f"     ⭐ {sym} {d} Score:{sc} ATR:{atr:.5g} {' | '.join(sg)}")
                     live_open(sym, d, sc, sg, px, atr)
             elif len(live_positions) == 0:
-                print(f"  🔎 No signal, fallback scan semua {len(syms)} syms...")
                 try:
                     r2 = scan_batch([s for s in syms if s not in live_positions])
                 except:
                     r2 = []
-                print(f"  📊 Fallback sinyal: {len(r2)}")
                 if r2:
                     r2.sort(key=lambda x: x[2], reverse=True)
                     sym, d, sc, sg, px, atr = r2[0]
