@@ -1,12 +1,10 @@
 """
-Bot Scalping v18.4 — LIVE EXECUTION (INVERSE EXTREME)
+Bot Scalping v18.5 — LIVE EXECUTION (SAFE MARGIN & ANTI-GHOST)
 ====================================================
-- LIVE TRADING: Mengeksekusi order MARKET sungguhan ke Binance Futures.
-- AUTO PRECISION: Mengambil data desimal otomatis dari Binance.
-- FEE CALCULATION: PnL sudah dikurangi taker fee (0.10% round-trip).
-- INVERSE MODE: Sinyal LONG -> Eksekusi SHORT, Sinyal SHORT -> Eksekusi LONG.
-- MARGIN SAFEGUARD: Jika Binance menolak leverage 20x, bot otomatis 
-  menyesuaikan kalkulasi kuantitas koin agar margin tetap aman ($2).
+- SMART MARGIN: Mengambil leverage asli dari Binance, memastikan margin tetap $2.
+- ANTI-GHOST: Penanganan API error yang ketat, mencegah posisi terbuka yang tak terlacak.
+- REDUCE-ONLY: Mendukung penutupan manual oleh user via HP tanpa membuat bot error.
+- STRICT KS: Pengecekan Kill Switch ganda sebelum eksekusi ke Binance.
 """
 
 import os, time, math, threading, queue
@@ -25,23 +23,21 @@ load_dotenv()
 # PASTIKAN API KEY MEMILIKI IZIN "ENABLE FUTURES"
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 
-# ⚠️ HAPUS ATAU COMMENT BARIS DI BAWAH INI JIKA INGIN PAKAI UANG ASLI (MAINNET) ⚠️
+# ⚠️ HAPUS/COMMENT BARIS DI BAWAH JIKA INGIN PAKAI UANG ASLI (MAINNET) ⚠️
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi" 
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v18.4 - LIVE HFT
+#  CONFIG v18.5 - LIVE HFT
 # ═══════════════════════════════════════════════════════
 INVERSE_MODE   = True   
 
 LEVERAGE       = 20
-ORDER_USDT     = 2.0    # Modal per posisi
+ORDER_USDT     = 2.0    # TARGET MARGIN (Modal yang tersedot per posisi)
 MAX_POSITIONS  = 3
-TAKER_FEE      = 0.0010 # 0.10% Round-trip fee (Buka 0.05% + Tutup 0.05%)
+TAKER_FEE      = 0.0010 # 0.10% Round-trip fee 
 
-# ── TARGET DISESUAIKAN UNTUK MENGALAHKAN FEE ───────────
-# Agar untung, profit harus > TAKER_FEE. (0.15% kotor = 0.05% bersih)
-EXTREME_PROFIT_PCT = 0.0015  
-HARD_SL_PCT        = 0.0025  
+EXTREME_PROFIT_PCT = 0.0015  # Target +0.15% kotor
+HARD_SL_PCT        = 0.0025  # Cutloss -0.25% kotor
 
 MIN_BASE_VOL   = 25_000_000
 MIN_VR         = 1.1    
@@ -54,6 +50,7 @@ SCAN_DELAY     = 0.015
 BATCH_SIZE     = 15
 MAX_WORKERS    = 8
 MAX_HOLD_SEC   = 60      
+IMPATIENT_SEC  = 10      # Dinaikkan ke 10s agar tidak terlalu sering mati konyol karena fee
 
 MIN_SCORE      = 40
 MIN_GAP        = 10
@@ -86,7 +83,7 @@ _executor        = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q        = queue.Queue()
 _hot_syms        = deque(maxlen=20)
 _precision_data  = {} 
-_actual_leverage = {} # Menyimpan leverage riil yang diizinkan Binance
+_actual_leverage = {} # PENTING: Menyimpan leverage asli dari Binance
 
 _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
@@ -100,36 +97,39 @@ _stats = {
 #  SETUP & UTILS
 # ═══════════════════════════════════════════════════════
 def setup_exchange():
-    """Mengambil presisi koin & Set Leverage otomatis tanpa menyembunyikan error"""
+    """Mengambil presisi koin & Set Leverage otomatis (Anti Margin Jebol)"""
     print("  ⏳ Menyiapkan presisi koin & Set Leverage...")
     try:
+        # 1. Ambil Presisi Lot Size
         info = client.futures_exchange_info()
         for s in info['symbols']:
             if s['symbol'] in SYMBOLS:
-                # 1. Ambil Presisi Lot Size
                 for f in s['filters']:
                     if f['filterType'] == 'LOT_SIZE':
                         step_size = float(f['stepSize'])
                         precision = int(round(-math.log(step_size, 10), 0))
                         _precision_data[s['symbol']] = max(0, precision)
                         break
+                        
+        # 2. Ambil Leverage Asli dari Akun Anda
+        pos_info = client.futures_position_information()
+        for p in pos_info:
+            sym = p['symbol']
+            if sym in SYMBOLS:
+                _actual_leverage[sym] = int(p['leverage'])
                 
-                # 2. Set Margin Type (Isolated)
-                try:
-                    client.futures_change_margin_type(symbol=s['symbol'], marginType='ISOLATED')
-                except BinanceAPIException as e:
-                    if e.code != -4046: # -4046 = sudah isolated
-                        print(f"  ⚠️ Gagal set ISOLATED untuk {s['symbol']}: {e.message}")
+        # 3. Coba Paksa Set ke Leverage Target & Isolated
+        for sym in SYMBOLS:
+            try:
+                client.futures_change_margin_type(symbol=sym, marginType='ISOLATED')
+            except BinanceAPIException: pass 
                 
-                # 3. Set Leverage (Tangkap error jika ditolak Binance)
-                actual_lev = LEVERAGE
-                try:
-                    client.futures_change_leverage(symbol=s['symbol'], leverage=LEVERAGE)
-                except BinanceAPIException as e:
-                    print(f"  ⚠️ Gagal set Leverage {LEVERAGE}x untuk {s['symbol']}: {e.message}")
-                    actual_lev = 10 # Turunkan ekspektasi agar margin kalkulasi tetap aman
-                    
-                _actual_leverage[s['symbol']] = actual_lev
+            try:
+                client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
+                _actual_leverage[sym] = LEVERAGE # Update jika sukses
+            except BinanceAPIException as e:
+                # Jika ditolak Binance, bot akan menggunakan angka dari step 2 untuk hitung margin
+                print(f"  ⚠️ Leverage {sym} ditolak: {e.message} (Gunakan: {_actual_leverage.get(sym, 10)}x)")
 
         print("  ✅ Presisi & Leverage selesai disiapkan!")
     except Exception as e:
@@ -137,10 +137,11 @@ def setup_exchange():
 
 def format_qty(symbol, raw_qty):
     precision = _precision_data.get(symbol, 0)
+    if precision == 0: return int(raw_qty)
     return round(raw_qty, precision)
 
 def qty(symbol, price): 
-    # Menghitung qty berdasarkan LEVERAGE ASLI yang disetujui
+    # MENGHITUNG QTY BERDASARKAN LEVERAGE ASLI = MARGIN PASTI $2
     lev = _actual_leverage.get(symbol, LEVERAGE)
     return (ORDER_USDT * lev) / price
 
@@ -281,9 +282,9 @@ def signal(df):
 def real_open(sym, direction, score, sigs, price, atr):
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS: return
-        live_positions[sym] = {"_r": True}
+        live_positions[sym] = {"_r": True} # Kunci slot sementara
 
-    raw_qty = qty(sym, price) # MENGGUNAKAN LEVERAGE REAL BINANCE
+    raw_qty = qty(sym, price) 
     final_qty = format_qty(sym, raw_qty)
 
     if final_qty <= 0:
@@ -293,13 +294,20 @@ def real_open(sym, direction, score, sigs, price, atr):
     side = 'BUY' if direction == 'LONG' else 'SELL'
     
     try:
+        # EKSEKUSI BINANCE
         order = client.futures_create_order(
             symbol=sym,
             side=side,
             type='MARKET',
             quantity=final_qty
         )
-        
+    except Exception as e:
+        print(f"\n  ❌ [API ERROR] Gagal open {sym}: {e}")
+        with _lock: live_positions.pop(sym, None) # Hapus karena order memang gagal
+        return
+
+    # JIKA ORDER SUKSES, PASTIKAN DISIMPAN MESKIPUN PRINT ERROR
+    try:
         pos = {
             "side": direction, "entry": price, "qty": final_qty,
             "open_time": time.time(), "score": score, "sigs": sigs, "atr": atr,
@@ -311,11 +319,8 @@ def real_open(sym, direction, score, sigs, price, atr):
         print(f"\n  {d} [LIVE ENTRY] {sym} {direction} @~{price:.6g} (Qty: {final_qty})")
         print(f"     Target Net Profit: ±{EXTREME_PROFIT_PCT*100}% | Hard SL: ±{HARD_SL_PCT*100}%")
         _stats["trades"] += 1
-
     except Exception as e:
-        print(f"\n  ❌ [API ERROR] Gagal open {sym}: {e}")
-        with _lock: live_positions.pop(sym, None)
-
+        print(f"  ⚠️ Error setelah open (posisi aman): {e}")
 
 def real_close(sym, reason, price=None):
     with _lock:
@@ -323,7 +328,6 @@ def real_close(sym, reason, price=None):
     if pos is None or pos.get("_r"): return
 
     if price is None: price = price_live(sym)
-
     side = 'SELL' if pos['side'] == 'LONG' else 'BUY'
     
     try:
@@ -331,50 +335,57 @@ def real_close(sym, reason, price=None):
             symbol=sym,
             side=side,
             type='MARKET',
-            quantity=pos['qty']
+            quantity=pos['qty'],
+            reduceOnly=True # Mencegah bot membuka posisi berlawanan
         )
-
-        entry = pos["entry"]
-        gross_pnl = (price - entry) * pos["qty"] if pos['side'] == "LONG" else (entry - price) * pos["qty"]
-        
-        # MENGHITUNG FEE ASLI BINANCE (0.10% total)
-        fee_amount = (entry * pos['qty'] * (TAKER_FEE / 2)) + (price * pos['qty'] * (TAKER_FEE / 2))
-        net_pnl = gross_pnl - fee_amount
-        
-        pct = (price - entry) / entry * 100 if pos['side'] == "LONG" else (entry - price) / entry * 100
-        hold = time.time() - pos["open_time"]
-        e = "🟢" if net_pnl >= 0 else "🔴"
-
-        print(f"  {e} [LIVE CLOSE] {sym} {pos['side']} — {reason}")
-        print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | Net PnL:{net_pnl:+.5f}U (Fee:-{fee_amount:.4f})")
-
-        _stats["pnl"] += net_pnl
-        _stats["hist"].append(net_pnl)
-        ks_upd(net_pnl)
-
-        if net_pnl >= 0:
-            _stats["wins"] += 1
-            if net_pnl > _stats["best"]: _stats["best"] = net_pnl
+    except BinanceAPIException as e:
+        if e.code == -2022: # Error -2022 (ReduceOnly rejected) artinya posisi sudah ditutup manual
+            print(f"\n  ⚠️ [SYNC] Posisi {sym} sepertinya sudah Anda tutup manual. Menghapus dari memori bot.")
+            return
         else:
-            _stats["losses"] += 1
-            if net_pnl < _stats["worst"]: _stats["worst"] = net_pnl
-
-        if "ExtremeProfit" in reason: _stats["extreme_tp"] += 1
-        elif "HardSL" in reason: _stats["hard_sl"] += 1
-        elif "Impatient" in reason: _stats["impatient_cut"] += 1
-        elif "Force" in reason: _stats["force"] += 1
-
-        trade_log.append({
-            "sym": sym, "side": pos['side'], "entry": round(entry, 7), "exit": round(price, 7),
-            "pnl": round(net_pnl, 5), "reason": reason, "hold": int(hold),
-        })
-        set_cd(sym); _hot_syms.appendleft(sym); _rescan_q.put(1)
-        print_inline()
-
+            print(f"\n  ❌ [API ERROR] Gagal close {sym}: {e}")
+            with _lock: live_positions[sym] = pos # Kembalikan ke memori agar dicoba tutup lagi
+            return
     except Exception as e:
-        print(f"\n  ❌ [API ERROR] Gagal close {sym}: {e}")
-        # Kembalikan posisi jika gagal supaya bisa di retry
-        with _lock: live_positions[sym] = pos
+        print(f"\n  ❌ [NET ERROR] Koneksi gagal close {sym}: {e}")
+        with _lock: live_positions[sym] = pos 
+        return
+
+    entry = pos["entry"]
+    gross_pnl = (price - entry) * pos["qty"] if pos['side'] == "LONG" else (entry - price) * pos["qty"]
+    
+    fee_amount = (entry * pos['qty'] * (TAKER_FEE / 2)) + (price * pos['qty'] * (TAKER_FEE / 2))
+    net_pnl = gross_pnl - fee_amount
+    
+    pct = (price - entry) / entry * 100 if pos['side'] == "LONG" else (entry - price) / entry * 100
+    hold = time.time() - pos["open_time"]
+    e = "🟢" if net_pnl >= 0 else "🔴"
+
+    print(f"  {e} [LIVE CLOSE] {sym} {pos['side']} — {reason}")
+    print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | Net PnL:{net_pnl:+.5f}U (Fee:-{fee_amount:.4f})")
+
+    _stats["pnl"] += net_pnl
+    _stats["hist"].append(net_pnl)
+    ks_upd(net_pnl)
+
+    if net_pnl >= 0:
+        _stats["wins"] += 1
+        if net_pnl > _stats["best"]: _stats["best"] = net_pnl
+    else:
+        _stats["losses"] += 1
+        if net_pnl < _stats["worst"]: _stats["worst"] = net_pnl
+
+    if "ExtremeProfit" in reason: _stats["extreme_tp"] += 1
+    elif "HardSL" in reason: _stats["hard_sl"] += 1
+    elif "Impatient" in reason: _stats["impatient_cut"] += 1
+    elif "Force" in reason: _stats["force"] += 1
+
+    trade_log.append({
+        "sym": sym, "side": pos['side'], "entry": round(entry, 7), "exit": round(price, 7),
+        "pnl": round(net_pnl, 5), "reason": reason, "hold": int(hold),
+    })
+    set_cd(sym); _hot_syms.appendleft(sym); _rescan_q.put(1)
+    print_inline()
 
 # ═══════════════════════════════════════════════════════
 #  MONITOR - INVERSE EXTREME PROFIT LOGIC
@@ -399,7 +410,7 @@ def monitor_positions():
             if prof_pct <= -HARD_SL_PCT:
                 real_close(sym, "HardSL", px); continue
                 
-            if hold >= 5:
+            if hold >= IMPATIENT_SEC:
                 if prof_pct > TAKER_FEE: real_close(sym, "ImpatientWin", px)
                 else: real_close(sym, "ImpatientLoss", px)
                 continue
@@ -411,7 +422,7 @@ def monitor_positions():
             if prof_pct <= -HARD_SL_PCT:
                 real_close(sym, "HardSL", px); continue
                 
-            if hold >= 5:
+            if hold >= IMPATIENT_SEC:
                 if prof_pct > TAKER_FEE: real_close(sym, "ImpatientWin", px)
                 else: real_close(sym, "ImpatientLoss", px)
                 continue
@@ -453,7 +464,7 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"     ┌ [v18.4 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}NET PnL:{pnl:+.4f}U")
+    print(f"     ┌ [v18.5 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}NET PnL:{pnl:+.4f}U")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -461,7 +472,7 @@ def print_full():
     pnl, sess = _stats["pnl"], (time.time() - _stats["start"]) / 3600
     tph, e = n / sess if sess > 0 else 0, "💚" if pnl >= 0 else "🔴"
     print(f"\n  {'─'*62}")
-    print(f"  🔥 LIVE TRADING v18.4 [INVERSE EXTREME] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"  🔥 LIVE TRADING v18.5 [SAFE MARGIN] — {sess*60:.0f}m | {tph:.1f}T/jam")
     print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"  {e} NET PnL:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     if trade_log:
@@ -491,6 +502,7 @@ def t_rescan(syms):
             if res:
                 for r in sorted(res, key=lambda x: x[2], reverse=True)[:slots]:
                     if len(live_positions) >= MAX_POSITIONS: break
+                    if ks_check()[0]: break  # DOUBLE CHECK KS SEBELUM ENTRY
                     sym, d, sc, sg, px, atr = r
                     real_open(sym, d, sc, sg, px, atr)
         except: pass
@@ -508,7 +520,7 @@ def t_macro():
 
 def run_bot():
     print("╔═══════════════════════════════════════════════════════╗")
-    print("║  🔥 LIVE TRADING v18.4 — INVERSE EXTREME PROFIT       ║")
+    print("║  🔥 LIVE TRADING v18.5 — INVERSE EXTREME & SAFE       ║")
     print("║  ⚠️  UANG ASLI — EKSEKUSI LANGSUNG KE BINANCE API     ║")
     print("╠═══════════════════════════════════════════════════════╣")
     print(f"║  Net Target Profit: > {TAKER_FEE*100}% (Termasuk Potongan Fee) ║")
@@ -520,7 +532,7 @@ def run_bot():
         syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
     except: syms = list(dict.fromkeys(SYMBOLS))
 
-    # PENTING: Ambil presisi koin dan set leverage API!
+    # PENTING: Ambil presisi koin dan amankan margin!
     setup_exchange()
 
     threading.Thread(target=t_monitor, daemon=True).start()
@@ -554,6 +566,7 @@ def run_bot():
                 res.sort(key=lambda x: x[2], reverse=True)
                 for r in res[:slots]:
                     if len(live_positions) >= MAX_POSITIONS: break
+                    if ks_check()[0]: break  # DOUBLE CHECK KS SEBELUM ENTRY
                     sym, d, sc, sg, px, atr = r
                     print(f"     ⭐ {sym} {d} Score:{sc} ATR:{atr:.5g} {' | '.join(sg)}")
                     real_open(sym, d, sc, sg, px, atr)
