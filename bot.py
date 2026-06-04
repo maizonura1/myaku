@@ -311,13 +311,19 @@ def paper_close(sym, reason, price=None):
         # Log tetap lanjut perhitungan stat untuk menghindari nyangkut & error spam
     # ----------------------------------
 
-    pnl = (price - entry) * q if side == "LONG" else (entry - price) * q
+    # --- PERBAIKAN LOG FEE DAN REAL PNL ---
+    gross_pnl = (price - entry) * q if side == "LONG" else (entry - price) * q
+    fee_open = entry * q * 0.0005   # Taker Fee 0.05% saat open
+    fee_close = price * q * 0.0005  # Taker Fee 0.05% saat close
+    total_fee = fee_open + fee_close
+    pnl = gross_pnl - total_fee      # PnL Bersih yang mengurangi/menambah saldo asli
+
     pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
     hold = time.time() - pos["open_time"]
     e = "🟢" if pnl >= 0 else "🔴"
 
     print(f"  {e} [REAL CLOSE] {sym} {side} CLOSE — {reason}")
-    print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
+    print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | Fee:-{total_fee:.5f}U | Net PnL:{pnl:+.5f}U")
 
     _stats["pnl"] += pnl
     _stats["hist"].append(pnl)
@@ -373,7 +379,7 @@ def monitor_positions():
                 continue
 
             pnl_now = (px - entry) * pos["qty"]
-            print(f"  📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [LIVE MODE]")
+            print(f"   📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [LIVE MODE]")
 
         else:  # SHORT
             prof_pct = (entry - px) / entry
@@ -390,7 +396,7 @@ def monitor_positions():
                 continue
 
             pnl_now = (entry - px) * pos["qty"]
-            print(f"  📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [LIVE MODE]")
+            print(f"   📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [LIVE MODE]")
 
 # ═══════════════════════════════════════════════════════
 #  SCANNER & MAIN
@@ -499,10 +505,10 @@ def t_macro():
 def run_bot():
     print("╔═══════════════════════════════════════════════════════╗")
     print("║  🚀 LIVE TRADE v18.3 — INVERSE EXTREME PROFIT         ║")
-    print("║  ⚠️  WARNING: EKSEKUSI ORDER REAL KE BINANCE          ║")
+    print("║  ⚠️  WARNING: EKSEKUSI ORDER REAL KE BINANCE           ║")
     print("╠═══════════════════════════════════════════════════════╣")
     print(f"║  Target Profit : +{EXTREME_PROFIT_PCT*100}% (Ambil nafas / Pantulan)   ║")
-    print(f"║  Hard Stop Loss: -{HARD_SL_PCT*100}% (Mencegah terseret tren)    ║")
+    print(f"║  Hard Stop Loss: -{HARD_SL_PCT*100}% (Mencegah terseret tren)     ║")
     print(f"║  Impatient Cut : Hold 5s -> Profit bungkus, Minus cut ║")
     print("╚═══════════════════════════════════════════════════════╝")
 
