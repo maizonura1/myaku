@@ -1,10 +1,10 @@
 """
-Bot Scalping v19.2 — INVERSE & BUG FIX EXECUTION (LIVE)
+Bot Scalping v19.2 — REVERSED LOGIC & QUICK PROFIT (LIVE)
 ====================================================
-- PATCHED: Bug harga 0 / loss -100% (Minus puluhan dollar palsu).
-- PATCHED: Bug posisi ghost/zombie (lupa close karena pop memori duluan).
-- PATCHED: Bug margin bengkak > $2 (kuantitas sekarang selalu floor/pembulatan bawah).
-- INVERSE MODE AKTIF: Menangkap koreksi/pullback.
+- PATCHED: Bug harga 0 / loss -100%.
+- PATCHED: Bug margin bengkak > $2 (pembulatan bawah).
+- LOGIC FLIPPED: Sinyal LONG dieksekusi SHORT, sinyal SHORT dieksekusi LONG.
+- RR SWAPPED: HardSL diubah jadi HardProfit, ImpatientLoss jadi ImpatientProfit.
 """
 
 import os, time, math, threading, queue
@@ -26,16 +26,15 @@ client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"  # ← Ganti ke li
 # ───────────────────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v19.2
+#  CONFIG v19.2 (REVERSED & PROFIT-FOCUSED)
 # ═══════════════════════════════════════════════════════
-INVERSE_MODE   = True
-
 LEVERAGE       = 20
-ORDER_USDT     = 2.0  # Modal (Margin) yang digunakan per trade
+ORDER_USDT     = 2.0  # Modal (Margin) per trade
 MAX_POSITIONS  = 3
 
-EXTREME_PROFIT_PCT = 0.0020  # +0.20%
-HARD_SL_PCT        = 0.0015  # -0.15%
+# === RR POSITIONS SWAPPED ===
+HARD_PROFIT_PCT  = 0.0015  # +0.15% (Profit paksa, dulunya HardSL)
+EXTREME_SL_PCT   = 0.0020  # -0.20% (Stop Loss darurat, dulunya ExtremeProfit)
 
 MIN_BASE_VOL   = 25_000_000
 MIN_VR         = 1.1
@@ -87,7 +86,7 @@ _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0, "impatient_loss": 0, "force": 0,
+    "extreme_loss": 0, "hard_profit": 0, "impatient_profit": 0, "force": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -119,7 +118,6 @@ def round_qty(symbol, raw_qty):
     if step == 0:
         return round(raw_qty, 3)
     precision = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
-    # FIX: Selalu floor (pembulatan bawah) agar margin tidak melebihi setting
     qty = math.floor(raw_qty / step) * step
     return round(qty, precision)
 
@@ -232,7 +230,7 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL ENGINE
+#  SIGNAL ENGINE (REVERSED)
 # ═══════════════════════════════════════════════════════
 def signal(df):
     if df is None or len(df) < 55: return None, 0, [], 0.0
@@ -248,45 +246,47 @@ def signal(df):
     lp = sp = 0
     sl, ss = [], []
 
+    # Indikator Bullish
     if p > e5 > e9 > e21 > e50:   lp += 30; sl.append("EMA_stack↑")
     elif p > e5 > e9 > e21:       lp += 22; sl.append("EMA↑↑")
-    if p < e5 < e9 < e21 < e50:   sp += 30; ss.append("EMA_stack↓")
-    elif p < e5 < e9 < e21:       sp += 22; ss.append("EMA↓↓")
-
     if m5 > 0.005:   lp += 25; sl.append(f"Mom+{m5*100:.1f}%")
     elif m5 > 0.003: lp += 18; sl.append(f"Mom+{m5*100:.1f}%")
-    if m5 < -0.005:  sp += 25; ss.append(f"Mom{m5*100:.1f}%")
-    elif m5 < -0.003: sp += 18; ss.append(f"Mom{m5*100:.1f}%")
-
     if mh_p <= 0 and mh > 0:            lp += 22; sl.append("MACD_X↑")
     elif mh > 0 and mh > mh_p > mh_p2:  lp += 18; sl.append("MACD↑↑")
+    if br > 0.65: lp += 18; sl.append(f"Buy{br:.0%}")
+    if rsi < 25: lp += 20; sl.append(f"RSI_OS{rsi:.0f}")
+
+    # Indikator Bearish
+    if p < e5 < e9 < e21 < e50:   sp += 30; ss.append("EMA_stack↓")
+    elif p < e5 < e9 < e21:       sp += 22; ss.append("EMA↓↓")
+    if m5 < -0.005:  sp += 25; ss.append(f"Mom{m5*100:.1f}%")
+    elif m5 < -0.003: sp += 18; ss.append(f"Mom{m5*100:.1f}%")
     if mh_p >= 0 and mh < 0:            sp += 22; ss.append("MACD_X↓")
     elif mh < 0 and mh < mh_p < mh_p2:  sp += 18; ss.append("MACD↓↓")
+    if br < 0.35: sp += 18; ss.append(f"Sell{1-br:.0%}")
+    if rsi > 75:  sp += 20; ss.append(f"RSI_OB{rsi:.0f}")
 
     if vr >= 3.0:   lp += 15; sp += 15; sl.append(f"Vol{vr:.1f}x"); ss.append(f"Vol{vr:.1f}x")
     elif vr >= 2.0: lp += 10; sp += 10; sl.append(f"Vol{vr:.1f}x"); ss.append(f"Vol{vr:.1f}x")
-
-    if br > 0.65: lp += 18; sl.append(f"Buy{br:.0%}")
-    if br < 0.35: sp += 18; ss.append(f"Sell{1-br:.0%}")
-
-    if rsi > 75:   lp = int(lp * 0.4); sp += 20; ss.append(f"RSI_OB{rsi:.0f}")
-    elif rsi < 25: sp = int(sp * 0.4); lp += 20; sl.append(f"RSI_OS{rsi:.0f}")
-
     if adx > 35: lp += 8; sp += 8; sl.append(f"ADX{adx:.0f}"); ss.append(f"ADX{adx:.0f}")
 
     btc_sw = btc in ("SIDEWAYS", "UNKNOWN")
     thresh = 40 if btc_sw else MIN_SCORE
     gap    = abs(lp - sp)
 
+    # --- EKSEKUSI REVERSED (DIBALIK) ---
+    
+    # Jika sinyal asli adalah SHORT (Bearish)
     if lp <= sp or lp < thresh or gap < MIN_GAP:
         if sp <= lp or sp < thresh or gap < MIN_GAP: return None, max(lp, sp), [], atr
         if br >= BR_SHORT_MAX: return None, sp, [], atr
-        if INVERSE_MODE: return "LONG", sp, ss[:3] + ["(INV)"], atr
-        return "SHORT", sp, ss[:3], atr
+        # KITA PAKSA EKSEKUSI JADI LONG
+        return "LONG", sp, ss[:3] + ["(FLIPPED)"], atr
 
+    # Jika sinyal asli adalah LONG (Bullish)
     if br <= BR_LONG_MIN: return None, lp, [], atr
-    if INVERSE_MODE: return "SHORT", lp, sl[:3] + ["(INV)"], atr
-    return "LONG", lp, sl[:3], atr
+    # KITA PAKSA EKSEKUSI JADI SHORT
+    return "SHORT", lp, sl[:3] + ["(FLIPPED)"], atr
 
 # ═══════════════════════════════════════════════════════
 #  LIVE ORDER HELPERS
@@ -315,7 +315,6 @@ def close_position_market(symbol, side, quantity):
     except BinanceAPIException as e:
         if e.code == -2022:
             print(f"  ⚠️  Posisi {symbol} sudah tidak ada di exchange (-2022).")
-            # Kembalikan harga saat ini agar tidak dihitung loss 100%
             px = price_live(symbol)
             return px if px > 0 else -1 
         print(f"  ❌ close_position {symbol}: [{e.code}] {e.message}")
@@ -331,7 +330,6 @@ def live_open(sym, direction, score, sigs, price, atr):
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
             return
-        # Set indikator bahwa posisi sedang dalam proses pembukaan
         live_positions[sym] = {"_r": True, "_closing": False}
 
     set_leverage(sym)
@@ -362,25 +360,21 @@ def live_open(sym, direction, score, sigs, price, atr):
 def live_close(sym, reason):
     with _lock:
         pos = live_positions.get(sym)
-        # Jika posisi tidak ada, atau sedang loading awal, atau SEDANG dalam proses close -> Abaikan
         if pos is None or pos.get("_r") or pos.get("_closing"):
             return
-        pos["_closing"] = True  # Kunci agar thread lain tidak ikut meng-close
+        pos["_closing"] = True
 
     side, entry, q = pos["side"], pos["entry"], pos["qty"]
     close_px = close_position_market(sym, side, q)
 
     if close_px == 0:
-        # Gagal close (API error). Buka kuncian agar bisa dicoba close lagi detik berikutnya.
         with _lock:
             if sym in live_positions: live_positions[sym]["_closing"] = False
         return
 
-    # Jika close sukses / atau memang posisi sudah hilang (-2022), baru hapus dari memori
     with _lock:
         live_positions.pop(sym, None)
 
-    # Antisipasi Bug Harga API = 0 / -1 agar tidak -100% PnL
     if close_px == -1 or close_px == 0:
         close_px = entry
 
@@ -401,9 +395,10 @@ def live_close(sym, reason):
     else:
         _stats["losses"] += 1; _stats["worst"] = min(_stats["worst"], pnl)
 
-    if "ExtremeProfit" in reason: _stats["extreme_tp"] += 1
-    elif "HardSL" in reason: _stats["hard_sl"] += 1
-    elif "ImpatientLoss" in reason: _stats["impatient_loss"] += 1
+    # Catat statistik RR baru
+    if "ExtremeLoss" in reason: _stats["extreme_loss"] += 1
+    elif "HardProfit" in reason: _stats["hard_profit"] += 1
+    elif "ImpatientProfit" in reason: _stats["impatient_profit"] += 1
     elif "Force" in reason: _stats["force"] += 1
 
     trade_log.append({"sym": sym, "side": side, "entry": round(entry, 7), "exit": round(close_px, 7), "pnl": round(pnl, 5), "reason": reason, "hold": int(hold)})
@@ -411,7 +406,7 @@ def live_close(sym, reason):
     print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR
+#  MONITOR (RR SWAPPED)
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -426,10 +421,19 @@ def monitor_positions():
         side, entry, hold = pos["side"], pos["entry"], time.time() - pos["open_time"]
         prof_pct = (px - entry) / entry if side == "LONG" else (entry - px) / entry
 
-        if prof_pct >= EXTREME_PROFIT_PCT: live_close(sym, "ExtremeProfit"); continue
-        if prof_pct <= -HARD_SL_PCT: live_close(sym, "HardSL"); continue
+        # --- LOGIKA RR BARU ---
+        # 1. Stop Loss Darurat (Menggantikan Extreme Profit lama)
+        if prof_pct <= -EXTREME_SL_PCT: live_close(sym, "ExtremeLoss"); continue
+        
+        # 2. Hard Profit (Menggantikan Hard SL lama)
+        if prof_pct >= HARD_PROFIT_PCT: live_close(sym, "HardProfit"); continue
+        
+        # 3. Timeout Force Close
         if hold >= MAX_HOLD_SEC: live_close(sym, "ForceTimeout"); continue
-        if hold >= 15 and prof_pct < -0.0005: live_close(sym, "ImpatientLoss"); continue
+        
+        # 4. Impatient Profit: Timeout tapi maksa Profit
+        # Jika ditahan > 15 detik dan sudah ijo dikit aja (>0.05%), langsung bungkus!
+        if hold >= 15 and prof_pct > 0.0005: live_close(sym, "ImpatientProfit"); continue
 
         pnl_now = (px - entry) * pos["qty"] if side == "LONG" else (entry - px) * pos["qty"]
         char = "L" if side == "LONG" else "S"
@@ -472,7 +476,8 @@ def print_inline():
     wr = _stats["wins"] / n * 100 if n else 0
     e = "💚" if _stats["pnl"] >= 0 else "🔴"
     print(f"     ┌ [v19.2 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{_stats['pnl']:+.4f}U")
-    print(f"     └ Ex-Profit:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']} Imp-Loss:{_stats['impatient_loss']} Force:{_stats['force']}")
+    # Tampilan log stats bawah diubah sesuai RR baru
+    print(f"     └ Hard-Profit:{_stats['hard_profit']} Ext-Loss:{_stats['extreme_loss']} Imp-Profit:{_stats['impatient_profit']} Force:{_stats['force']}")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -481,7 +486,7 @@ def print_full():
     tph = n / sess if sess > 0 else 0
     e = "💚" if _stats["pnl"] >= 0 else "🔴"
     print(f"\n  {'─'*62}")
-    print(f"  🚀 LIVE v19.2 [BUG PATCHED] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"  🚀 LIVE v19.2 [REVERSED & PROFIT-FOCUS] — {sess*60:.0f}m | {tph:.1f}T/jam")
     print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"  {e} PnL:{_stats['pnl']:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     if trade_log:
@@ -550,7 +555,7 @@ def get_tradable_symbols():
 
 def run_bot():
     print("╔═══════════════════════════════════════════════════════╗")
-    print(f"║  🚀 LIVE TRADE v19.2 — EXECUTION BUG PATCHED          ║")
+    print(f"║  🚀 LIVE TRADE v19.2 — REVERSED LOGIC PATCH           ║")
     print("╚═══════════════════════════════════════════════════════╝\n")
     syms = get_tradable_symbols()
     SYMBOLS[:] = syms 
