@@ -2,9 +2,11 @@
 Bot Scalping v18.4 — LIVE EXECUTION (INVERSE EXTREME)
 ====================================================
 - LIVE TRADING: Mengeksekusi order MARKET sungguhan ke Binance Futures.
-- AUTO PRECISION: Mengambil data desimal (LOT_SIZE) otomatis dari Binance.
+- AUTO PRECISION: Mengambil data desimal otomatis dari Binance.
 - FEE CALCULATION: PnL sudah dikurangi taker fee (0.10% round-trip).
 - INVERSE MODE: Sinyal LONG -> Eksekusi SHORT, Sinyal SHORT -> Eksekusi LONG.
+- MARGIN SAFEGUARD: Jika Binance menolak leverage 20x, bot otomatis 
+  menyesuaikan kalkulasi kuantitas koin agar margin tetap aman ($2).
 """
 
 import os, time, math, threading, queue
@@ -23,7 +25,7 @@ load_dotenv()
 # PASTIKAN API KEY MEMILIKI IZIN "ENABLE FUTURES"
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 
-# HAPUS ATAU COMMENT BARIS DI BAWAH JIKA INGIN PAKAI UANG ASLI (MAINNET)
+# ⚠️ HAPUS ATAU COMMENT BARIS DI BAWAH INI JIKA INGIN PAKAI UANG ASLI (MAINNET) ⚠️
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi" 
 
 # ═══════════════════════════════════════════════════════
@@ -73,17 +75,18 @@ SYMBOLS = [
 ]
 SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
-live_positions  = {}
-trade_log       = []
-_ohlcv_cache    = {}
-_sym_cooldown   = {}
-_ticker_cache   = {}
-_ticker_ts      = 0
-_lock           = threading.Lock()
-_executor       = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-_rescan_q       = queue.Queue()
-_hot_syms       = deque(maxlen=20)
-_precision_data = {} # Cache untuk menyimpan LOT_SIZE presisi koin
+live_positions   = {}
+trade_log        = []
+_ohlcv_cache     = {}
+_sym_cooldown    = {}
+_ticker_cache    = {}
+_ticker_ts       = 0
+_lock            = threading.Lock()
+_executor        = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+_rescan_q        = queue.Queue()
+_hot_syms        = deque(maxlen=20)
+_precision_data  = {} 
+_actual_leverage = {} # Menyimpan leverage riil yang diizinkan Binance
 
 _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
@@ -97,41 +100,49 @@ _stats = {
 #  SETUP & UTILS
 # ═══════════════════════════════════════════════════════
 def setup_exchange():
-    """Mengambil presisi desimal koin & Set Leverage otomatis"""
+    """Mengambil presisi koin & Set Leverage otomatis tanpa menyembunyikan error"""
     print("  ⏳ Menyiapkan presisi koin & Set Leverage...")
     try:
         info = client.futures_exchange_info()
         for s in info['symbols']:
             if s['symbol'] in SYMBOLS:
-                # Cari filter LOT_SIZE untuk tahu presisi quantity
+                # 1. Ambil Presisi Lot Size
                 for f in s['filters']:
                     if f['filterType'] == 'LOT_SIZE':
                         step_size = float(f['stepSize'])
-                        # Menghitung jumlah angka di belakang koma
                         precision = int(round(-math.log(step_size, 10), 0))
                         _precision_data[s['symbol']] = max(0, precision)
                         break
                 
-                # Set Margin Type dan Leverage (Abaikan error jika sudah terseting)
+                # 2. Set Margin Type (Isolated)
                 try:
                     client.futures_change_margin_type(symbol=s['symbol'], marginType='ISOLATED')
                 except BinanceAPIException as e:
-                    pass # Error biasanya "No need to change margin type"
+                    if e.code != -4046: # -4046 = sudah isolated
+                        print(f"  ⚠️ Gagal set ISOLATED untuk {s['symbol']}: {e.message}")
                 
+                # 3. Set Leverage (Tangkap error jika ditolak Binance)
+                actual_lev = LEVERAGE
                 try:
                     client.futures_change_leverage(symbol=s['symbol'], leverage=LEVERAGE)
-                except:
-                    pass
-        print("  ✅ Presisi & Leverage berhasil disiapkan!")
+                except BinanceAPIException as e:
+                    print(f"  ⚠️ Gagal set Leverage {LEVERAGE}x untuk {s['symbol']}: {e.message}")
+                    actual_lev = 10 # Turunkan ekspektasi agar margin kalkulasi tetap aman
+                    
+                _actual_leverage[s['symbol']] = actual_lev
+
+        print("  ✅ Presisi & Leverage selesai disiapkan!")
     except Exception as e:
-        print(f"  ❌ Gagal setup exchange: {e}")
+        print(f"  ❌ Gagal setup exchange secara total: {e}")
 
 def format_qty(symbol, raw_qty):
-    """Membulatkan jumlah koin sesuai aturan Binance"""
     precision = _precision_data.get(symbol, 0)
     return round(raw_qty, precision)
 
-def qty(price): return (ORDER_USDT * LEVERAGE) / price
+def qty(symbol, price): 
+    # Menghitung qty berdasarkan LEVERAGE ASLI yang disetujui
+    lev = _actual_leverage.get(symbol, LEVERAGE)
+    return (ORDER_USDT * lev) / price
 
 def price_live(symbol):
     try: return float(client.futures_symbol_ticker(symbol=symbol)["price"])
@@ -152,7 +163,7 @@ def ok_cooldown(sym): return (time.time() - _sym_cooldown.get(sym, 0)) >= COOLDO
 def set_cd(sym): _sym_cooldown[sym] = time.time()
 
 # ═══════════════════════════════════════════════════════
-#  OHLCV, TA, & SIGNALS (Sama seperti versi sebelumnya)
+#  OHLCV, TA, & SIGNALS
 # ═══════════════════════════════════════════════════════
 def ohlcv(symbol, interval, limit=100):
     key, now = (symbol, interval), time.time()
@@ -270,9 +281,9 @@ def signal(df):
 def real_open(sym, direction, score, sigs, price, atr):
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS: return
-        live_positions[sym] = {"_r": True} # Lock slot
+        live_positions[sym] = {"_r": True}
 
-    raw_qty = qty(price)
+    raw_qty = qty(sym, price) # MENGGUNAKAN LEVERAGE REAL BINANCE
     final_qty = format_qty(sym, raw_qty)
 
     if final_qty <= 0:
@@ -282,7 +293,6 @@ def real_open(sym, direction, score, sigs, price, atr):
     side = 'BUY' if direction == 'LONG' else 'SELL'
     
     try:
-        # EKSEKUSI MARKET ORDER KE BINANCE
         order = client.futures_create_order(
             symbol=sym,
             side=side,
@@ -290,7 +300,6 @@ def real_open(sym, direction, score, sigs, price, atr):
             quantity=final_qty
         )
         
-        # Simpan state lokal
         pos = {
             "side": direction, "entry": price, "qty": final_qty,
             "open_time": time.time(), "score": score, "sigs": sigs, "atr": atr,
@@ -318,7 +327,6 @@ def real_close(sym, reason, price=None):
     side = 'SELL' if pos['side'] == 'LONG' else 'BUY'
     
     try:
-        # EKSEKUSI MARKET ORDER TUTUP POSISI
         order = client.futures_create_order(
             symbol=sym,
             side=side,
@@ -365,7 +373,7 @@ def real_close(sym, reason, price=None):
 
     except Exception as e:
         print(f"\n  ❌ [API ERROR] Gagal close {sym}: {e}")
-        # Kembalikan posisi ke tracking jika gagal API supaya bisa dicoba tutup lagi
+        # Kembalikan posisi jika gagal supaya bisa di retry
         with _lock: live_positions[sym] = pos
 
 # ═══════════════════════════════════════════════════════
@@ -384,7 +392,6 @@ def monitor_positions():
         if hold >= MAX_HOLD_SEC:
             real_close(sym, "ForceTimeout", px); continue
 
-        # Kalkulasi PnL kotor hanya untuk memicu trigger logic (target 0.15% kotor)
         if side == "LONG":
             prof_pct = (px - entry) / entry
             if prof_pct >= EXTREME_PROFIT_PCT:
@@ -393,7 +400,6 @@ def monitor_positions():
                 real_close(sym, "HardSL", px); continue
                 
             if hold >= 5:
-                # Bungkus jika profit kotor lebih besar dari FEE 0.10% (supaya net tidak minus)
                 if prof_pct > TAKER_FEE: real_close(sym, "ImpatientWin", px)
                 else: real_close(sym, "ImpatientLoss", px)
                 continue
@@ -411,7 +417,7 @@ def monitor_positions():
                 continue
 
 # ═══════════════════════════════════════════════════════
-#  SCANNER & UTILS VIEW
+#  SCANNER & THREADS
 # ═══════════════════════════════════════════════════════
 def scan_one(sym):
     try:
