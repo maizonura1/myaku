@@ -75,15 +75,16 @@ TTL_15M        = 30
 # ═══════════════════════════════════════════════════════
 #  SYMBOLS & STATE
 # ═══════════════════════════════════════════════════════
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "TRXUSDT", "DOTUSDT",
-    "LINKUSDT", "MATICUSDT", "LTCUSDT", "ATOMUSDT", "UNIUSDT",
+# ✅ v18.4: SYMBOLS diisi dinamis saat startup via get_tradable_symbols()
+# Daftar ini hanya fallback jika exchange_info gagal diambil
+SYMBOLS_FALLBACK = [
+    "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT",
+    "TRXUSDT", "DOTUSDT", "LINKUSDT", "LTCUSDT", "ATOMUSDT",
     "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT", "INJUSDT",
     "SUIUSDT", "SEIUSDT", "FETUSDT", "WLDUSDT", "AAVEUSDT",
     "ORDIUSDT", "TONUSDT", "1000PEPEUSDT", "WIFUSDT", "JUPUSDT",
 ]
-SYMBOLS = list(dict.fromkeys(SYMBOLS))
+SYMBOLS = []  # Diisi oleh get_tradable_symbols() saat run_bot()
 
 live_positions  = {}   # sym -> {side, entry, qty, open_time, score, sigs, atr, order_id}
 trade_log       = []
@@ -692,6 +693,90 @@ def t_macro():
 # ═══════════════════════════════════════════════════════
 #  MAIN
 # ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
+#  SYMBOL FILTER — hanya simbol yang bisa diorder dengan modal kita
+# ═══════════════════════════════════════════════════════
+def get_tradable_symbols():
+    """
+    Ambil semua simbol USDT-margined futures dari Binance, lalu filter:
+    1. Status TRADING
+    2. Hanya pair xxxUSDT (bukan BUSD, USDC, dsb)
+    3. Notional cukup: (ORDER_USDT × LEVERAGE) / harga >= stepSize minimum
+       dan notional value >= MIN_NOTIONAL Binance (biasanya $100, testnet $50)
+    Mengembalikan list simbol yang siap diorder.
+    """
+    MIN_NOTIONAL_USD = ORDER_USDT * LEVERAGE  # modal efektif kita per trade
+
+    print(f"  🔍 Scanning simbol Binance Futures (notional min: ${MIN_NOTIONAL_USD:.0f})...")
+
+    try:
+        info    = client.futures_exchange_info()
+        tickers = {t["symbol"]: float(t["lastPrice"]) for t in client.futures_ticker()}
+    except Exception as e:
+        print(f"  ❌ Gagal fetch exchange info: {e}")
+        return list(SYMBOLS_FALLBACK)
+
+    tradable = []
+    skipped_price  = []
+    skipped_notional = []
+
+    for s in info["symbols"]:
+        sym = s["symbol"]
+
+        # Hanya USDT pairs, status TRADING
+        if not sym.endswith("USDT"):          continue
+        if s["status"] != "TRADING":          continue
+        if s.get("contractType") != "PERPETUAL": continue
+
+        # Ambil harga live
+        px = tickers.get(sym, 0)
+        if px == 0:
+            skipped_price.append(sym)
+            continue
+
+        # Ambil stepSize dari LOT_SIZE filter
+        step = 0.001
+        min_notional_filter = 0
+        for f in s["filters"]:
+            if f["filterType"] == "LOT_SIZE":
+                step = float(f["stepSize"])
+            if f["filterType"] == "MIN_NOTIONAL":
+                min_notional_filter = float(f.get("notional", 0))
+
+        # Hitung qty yang akan kita order
+        raw_qty = (ORDER_USDT * LEVERAGE) / px
+        precision = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
+        actual_qty = round(math.floor(raw_qty / step) * step, precision)
+
+        # Notional aktual setelah pembulatan
+        actual_notional = actual_qty * px
+
+        # Cek apakah notional cukup (Binance minimum $100, testnet $50)
+        # Pakai threshold lebih longgar: notional kita >= 50 USD
+        threshold = max(min_notional_filter, 50.0)
+
+        if actual_qty <= 0 or actual_notional < threshold:
+            skipped_notional.append(f"{sym}(${actual_notional:.1f})")
+            continue
+
+        tradable.append(sym)
+
+    # Sort: prioritaskan yang volume tinggi (sudah ada di ticker)
+    vol_map = {t["symbol"]: float(t["quoteVolume"]) for t in client.futures_ticker()
+               if t["symbol"] in set(tradable)}
+    tradable.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
+
+    print(f"  ✅ {len(tradable)} simbol lolos filter notional")
+    print(f"  ⏭  {len(skipped_notional)} dilewati (notional terlalu kecil untuk modal $2×{LEVERAGE}x):")
+    if skipped_notional:
+        # Tampilkan sebagian saja agar tidak banjir log
+        shown = skipped_notional[:10]
+        more  = len(skipped_notional) - len(shown)
+        print(f"     {', '.join(shown)}{f' ... +{more} lainnya' if more else ''}")
+
+    return tradable if tradable else list(SYMBOLS_FALLBACK)
+
+
 def run_bot():
     is_testnet = "testnet" in client.FUTURES_URL
     mode_str   = "TESTNET" if is_testnet else "⚠️  LIVE REAL MONEY ⚠️"
@@ -712,17 +797,10 @@ def run_bot():
         print("  Tekan Ctrl+C dalam 5 detik untuk batalkan...")
         time.sleep(5)
 
-    try:
-        valid = {
-            s["symbol"]
-            for s in client.futures_exchange_info()["symbols"]
-            if s["status"] == "TRADING"
-        }
-        syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
-    except:
-        syms = list(dict.fromkeys(SYMBOLS))
-
-    print(f"  ✅ {len(syms)} simbol aktif")
+    # ✅ v18.4: filter dinamis — hanya simbol yang notional-nya cukup untuk $2×20x
+    syms = get_tradable_symbols()
+    SYMBOLS[:] = syms  # update global agar t_rescan bisa pakai list terbaru
+    print(f"  ✅ {len(syms)} simbol siap ditrading")
 
     threading.Thread(target=t_monitor,          daemon=True).start()
     threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
