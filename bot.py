@@ -568,9 +568,12 @@ def scan_one(sym):
     try:
         time.sleep(SCAN_DELAY)
         if not ok_cooldown(sym): return None
-        tk = _ticker_cache
+        # Pakai ticker yang ada; kalau kosong, fetch dulu
+        tk = _ticker_cache if _ticker_cache else tickers_all()
         if sym in tk and tk[sym]["vol"] < MIN_BASE_VOL: return None
-        df  = run_ta(ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100).copy())
+        df = ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100)
+        if df is None or len(df) < 55: return None
+        df  = run_ta(df.copy())
         px  = df["close"].iloc[-2]
         atr = df["atr"].iloc[-2]
         if px == 0 or atr / px > 0.03: return None
@@ -579,7 +582,8 @@ def scan_one(sym):
         px_live = price_live(sym)
         if px_live == 0: return None
         return (sym, dir_, sc, sigs, px_live, atr_val)
-    except:
+    except Exception as e:
+        print(f"  ⚠️  scan_one {sym}: {e}")
         return None
 
 def scan_batch(syms):
@@ -829,6 +833,10 @@ def run_bot():
             continue
 
         if slots > 0:
+            # Pastikan ticker cache terisi
+            if not _ticker_cache:
+                tickers_all()
+
             mv = top_movers(syms, 20)
             mv = [s for s in mv if s not in live_positions]
 
@@ -837,10 +845,15 @@ def run_bot():
             scan_idx  = (scan_idx + 1) % n_bat
             scan_list = mv[:15] + reg[:10]
 
+            print(f"  🔎 Scan {len(scan_list)} syms (mv:{len(mv[:15])} reg:{len(reg[:10])}) | pool:{len(syms)}")
+
             try:
                 res = scan_batch(scan_list)
-            except:
+            except Exception as e:
+                print(f"  ❌ scan_batch error: {e}")
                 res = []
+
+            print(f"  📊 Sinyal ditemukan: {len(res)}")
 
             if res:
                 res.sort(key=lambda x: x[2], reverse=True)
@@ -850,10 +863,12 @@ def run_bot():
                     print(f"     ⭐ {sym} {d} Score:{sc} ATR:{atr:.5g} {' | '.join(sg)}")
                     live_open(sym, d, sc, sg, px, atr)
             elif len(live_positions) == 0:
+                print(f"  🔎 No signal, fallback scan semua {len(syms)} syms...")
                 try:
                     r2 = scan_batch([s for s in syms if s not in live_positions])
                 except:
                     r2 = []
+                print(f"  📊 Fallback sinyal: {len(r2)}")
                 if r2:
                     r2.sort(key=lambda x: x[2], reverse=True)
                     sym, d, sc, sg, px, atr = r2[0]
