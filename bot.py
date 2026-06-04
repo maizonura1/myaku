@@ -1,15 +1,21 @@
 """
-Bot Scalping v18.3 — INVERSE EXTREME PROFIT MODE (LIVE)
+Bot Scalping v18.4 — INVERSE EXTREME PROFIT MODE (LIVE)
 ====================================================
 - LIVE MODE: Order nyata ke Binance Futures Testnet/Live.
 - INVERSE MODE: Sinyal LONG dieksekusi SHORT, sinyal SHORT dieksekusi LONG.
 - EXTREME PROFIT: Profit +0.05% langsung bungkus.
-- IMPATIENT EXIT: Hold 5 detik, jika profit dikit bungkus, jika loss langsung cut.
-- HARD SL: 0.2% agar tidak kena noise sebelum koreksi mikro terjadi.
+- IMPATIENT PROFIT: Hold 5 detik → kalau PLUS langsung bungkus, kalau MINUS tahan (biarkan Hard SL).
+- HARD SL: 0.2% jaring pengaman terakhir.
 
 ⚠️  PERINGATAN: Bot ini melakukan order NYATA ke Binance.
     Pastikan API Key memiliki izin Trading Futures.
     Gunakan Testnet dulu sebelum ke akun live.
+
+CHANGELOG v18.4:
+  - ImpatientLoss  → DIHAPUS (posisi minus tidak langsung diclose)
+  - ImpatientWin   → DIGANTI menjadi ImpatientProfit
+  - Posisi minus setelah 5 detik: ditahan, diserahkan ke Hard SL (-0.2%) atau ExtremeProfit
+  - Stat key: impatient_cut → impatient_profit
 """
 
 import os, time, math, threading, queue
@@ -33,7 +39,7 @@ client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"  # ← Ganti ke li
 # ───────────────────────────────────────────────────────────
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v18.3 - INVERSE EXTREME PROFIT
+#  CONFIG v18.4 - INVERSE EXTREME PROFIT
 # ═══════════════════════════════════════════════════════
 INVERSE_MODE   = True
 
@@ -95,7 +101,8 @@ _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0, "impatient_cut": 0, "force": 0,
+    # ✅ v18.4: impatient_cut diganti impatient_profit
+    "extreme_tp": 0, "hard_sl": 0, "impatient_profit": 0, "force": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -103,7 +110,6 @@ _stats = {
 #  SYMBOL INFO & PRECISION
 # ═══════════════════════════════════════════════════════
 def get_sym_info(symbol):
-    """Ambil stepSize (qty precision) dan tickSize (price precision) dari exchange."""
     if symbol in _sym_info:
         return _sym_info[symbol]
     try:
@@ -123,7 +129,6 @@ def get_sym_info(symbol):
     return {"qty_step": 0.001, "price_tick": 0.0001}
 
 def round_qty(symbol, raw_qty):
-    """Bulatkan qty ke stepSize yang diizinkan Binance."""
     info = get_sym_info(symbol)
     step = info["qty_step"]
     if step == 0:
@@ -138,7 +143,7 @@ def set_leverage(symbol):
     try:
         client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
     except BinanceAPIException as e:
-        if e.code != -4046:  # -4046 = leverage sudah diset sama
+        if e.code != -4046:
             print(f"  ⚠️  set_leverage {symbol}: {e.message}")
 
 # ═══════════════════════════════════════════════════════
@@ -323,11 +328,6 @@ def signal(df):
 #  LIVE ORDER HELPERS
 # ═══════════════════════════════════════════════════════
 def place_market_order(symbol, side, quantity):
-    """
-    Kirim MARKET order ke Binance Futures.
-    side: "BUY" atau "SELL"
-    Mengembalikan (order_id, filled_price) atau (None, 0) jika gagal.
-    """
     try:
         order = client.futures_create_order(
             symbol=symbol,
@@ -336,11 +336,9 @@ def place_market_order(symbol, side, quantity):
             quantity=quantity,
             reduceOnly=False,
         )
-        order_id = order["orderId"]
-        # Ambil harga fill rata-rata
+        order_id  = order["orderId"]
         avg_price = float(order.get("avgPrice", 0) or 0)
         if avg_price == 0:
-            # Fallback: coba ambil dari fills jika ada
             fills = order.get("fills", [])
             if fills:
                 total_qty = sum(float(f["qty"]) for f in fills)
@@ -356,10 +354,6 @@ def place_market_order(symbol, side, quantity):
         return None, 0
 
 def close_position_market(symbol, side, quantity):
-    """
-    Tutup posisi dengan MARKET order (reduceOnly=True).
-    side posisi LONG → kirim SELL; posisi SHORT → kirim BUY.
-    """
     close_side = "SELL" if side == "LONG" else "BUY"
     try:
         order = client.futures_create_order(
@@ -375,7 +369,6 @@ def close_position_market(symbol, side, quantity):
         return avg_price
     except BinanceAPIException as e:
         print(f"  ❌ close_position_market {symbol} {side}: [{e.code}] {e.message}")
-        # Jika reduceOnly gagal, coba tanpa reduceOnly sebagai fallback darurat
         try:
             order = client.futures_create_order(
                 symbol=symbol,
@@ -400,14 +393,10 @@ def live_open(sym, direction, score, sigs, price, atr):
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
             return
-
-        # Tandai "sedang diproses" agar thread lain tidak masuk ganda
         live_positions[sym] = {"_r": True}
 
-    # Set leverage dulu
     set_leverage(sym)
 
-    # Hitung qty yang benar
     raw_q = qty_calc(price)
     q = round_qty(sym, raw_q)
     if q <= 0:
@@ -416,7 +405,6 @@ def live_open(sym, direction, score, sigs, price, atr):
             live_positions.pop(sym, None)
         return
 
-    # Tentukan sisi order
     order_side = "BUY" if direction == "LONG" else "SELL"
 
     print(f"\n  {'🟢' if direction=='LONG' else '🔴'} [LIVE] {sym} {direction} — Placing {order_side} {q} unit...")
@@ -454,19 +442,18 @@ def live_close(sym, reason, close_px=None):
     if pos is None or pos.get("_r"):
         return
 
-    side = pos["side"]
+    side  = pos["side"]
     entry = pos["entry"]
-    q = pos["qty"]
+    q     = pos["qty"]
 
-    # Tutup posisi di Binance
     filled_close = close_position_market(sym, side, q)
     if close_px is None:
         close_px = filled_close
 
-    pnl = (close_px - entry) * q if side == "LONG" else (entry - close_px) * q
-    pct = (close_px - entry) / entry * 100 if side == "LONG" else (entry - close_px) / entry * 100
+    pnl  = (close_px - entry) * q if side == "LONG" else (entry - close_px) * q
+    pct  = (close_px - entry) / entry * 100 if side == "LONG" else (entry - close_px) / entry * 100
     hold = time.time() - pos["open_time"]
-    e = "🟢" if pnl >= 0 else "🔴"
+    e    = "🟢" if pnl >= 0 else "🔴"
 
     print(f"  {e} [LIVE] {sym} {side} CLOSE — {reason}")
     print(f"     {entry:.6g}→{close_px:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U")
@@ -482,19 +469,20 @@ def live_close(sym, reason, close_px=None):
         _stats["losses"] += 1
         if pnl < _stats["worst"]: _stats["worst"] = pnl
 
-    if "ExtremeProfit"  in reason: _stats["extreme_tp"]    += 1
-    elif "HardSL"       in reason: _stats["hard_sl"]       += 1
-    elif "Impatient"    in reason: _stats["impatient_cut"] += 1
-    elif "Force"        in reason: _stats["force"]         += 1
+    # ✅ v18.4: tracking reason yang diperbarui
+    if   "ExtremeProfit"    in reason: _stats["extreme_tp"]      += 1
+    elif "HardSL"           in reason: _stats["hard_sl"]         += 1
+    elif "ImpatientProfit"  in reason: _stats["impatient_profit"] += 1
+    elif "Force"            in reason: _stats["force"]           += 1
 
     trade_log.append({
-        "sym":   sym,
-        "side":  side,
-        "entry": round(entry, 7),
-        "exit":  round(close_px, 7),
-        "pnl":   round(pnl, 5),
+        "sym":    sym,
+        "side":   side,
+        "entry":  round(entry, 7),
+        "exit":   round(close_px, 7),
+        "pnl":    round(pnl, 5),
         "reason": reason,
-        "hold":  int(hold),
+        "hold":   int(hold),
     })
 
     set_cd(sym)
@@ -503,7 +491,7 @@ def live_close(sym, reason, close_px=None):
     print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR — cek exit condition secara berkala
+#  MONITOR — IMPATIENT PROFIT LOGIC (v18.4)
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -515,10 +503,11 @@ def monitor_positions():
         if px == 0:
             continue
 
-        side   = pos["side"]
-        entry  = pos["entry"]
-        hold   = time.time() - pos["open_time"]
+        side  = pos["side"]
+        entry = pos["entry"]
+        hold  = time.time() - pos["open_time"]
 
+        # Force close jika terlalu lama
         if hold >= MAX_HOLD_SEC:
             live_close(sym, "ForceTimeout")
             continue
@@ -526,16 +515,23 @@ def monitor_positions():
         if side == "LONG":
             prof_pct = (px - entry) / entry
 
+            # 1. Extreme Profit → bungkus langsung
             if prof_pct >= EXTREME_PROFIT_PCT:
                 live_close(sym, "ExtremeProfit"); continue
 
+            # 2. Hard SL → jaring pengaman terakhir
             if prof_pct <= -HARD_SL_PCT:
                 live_close(sym, "HardSL"); continue
 
+            # 3. ✅ IMPATIENT PROFIT (v18.4)
+            #    Setelah 5 detik:
+            #    - Kalau PLUS sekecil apapun → bungkus (ImpatientProfit)
+            #    - Kalau MINUS → TAHAN, biarkan Hard SL atau ExtremeProfit yang handle
             if hold >= 5:
-                if prof_pct > 0: live_close(sym, "ImpatientWin")
-                else:            live_close(sym, "ImpatientLoss")
-                continue
+                if prof_pct > 0:
+                    live_close(sym, "ImpatientProfit")
+                    continue
+                # minus = tidak diclose, lanjut monitor
 
             pnl_now = (px - entry) * pos["qty"]
             print(f"  📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s")
@@ -543,16 +539,23 @@ def monitor_positions():
         else:  # SHORT
             prof_pct = (entry - px) / entry
 
+            # 1. Extreme Profit → bungkus langsung
             if prof_pct >= EXTREME_PROFIT_PCT:
                 live_close(sym, "ExtremeProfit"); continue
 
+            # 2. Hard SL → jaring pengaman terakhir
             if prof_pct <= -HARD_SL_PCT:
                 live_close(sym, "HardSL"); continue
 
+            # 3. ✅ IMPATIENT PROFIT (v18.4)
+            #    Setelah 5 detik:
+            #    - Kalau PLUS sekecil apapun → bungkus (ImpatientProfit)
+            #    - Kalau MINUS → TAHAN, biarkan Hard SL atau ExtremeProfit yang handle
             if hold >= 5:
-                if prof_pct > 0: live_close(sym, "ImpatientWin")
-                else:            live_close(sym, "ImpatientLoss")
-                continue
+                if prof_pct > 0:
+                    live_close(sym, "ImpatientProfit")
+                    continue
+                # minus = tidak diclose, lanjut monitor
 
             pnl_now = (entry - px) * pos["qty"]
             print(f"  📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s")
@@ -599,13 +602,14 @@ def top_movers(syms, n=20):
 #  PRINT
 # ═══════════════════════════════════════════════════════
 def print_inline():
-    n  = _stats["wins"] + _stats["losses"]
-    wr = _stats["wins"] / n * 100 if n else 0
+    n   = _stats["wins"] + _stats["losses"]
+    wr  = _stats["wins"] / n * 100 if n else 0
     pnl = _stats["pnl"]
     e   = "💚" if pnl >= 0 else "🔴"
-    print(f"     ┌ [v18.3 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
+    # ✅ v18.4: label Imp-Cut → Imp-Profit
+    print(f"     ┌ [v18.4 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL:{pnl:+.4f}U")
     print(f"     └ Ex-Profit:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']} "
-          f"Imp-Cut:{_stats['impatient_cut']} Force:{_stats['force']}")
+          f"Imp-Profit:{_stats['impatient_profit']} Force:{_stats['force']}")
 
 def print_full():
     n    = _stats["wins"] + _stats["losses"]
@@ -625,7 +629,7 @@ def print_full():
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
     print(f"\n  {'─'*62}")
-    print(f"  🚀 LIVE v18.3 [INVERSE EXTREME PROFIT] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"  🚀 LIVE v18.4 [INVERSE EXTREME PROFIT] — {sess*60:.0f}m | {tph:.1f}T/jam")
     print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"  {e} PnL:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"  📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
@@ -693,13 +697,14 @@ def run_bot():
     mode_str   = "TESTNET" if is_testnet else "⚠️  LIVE REAL MONEY ⚠️"
 
     print("╔═══════════════════════════════════════════════════════╗")
-    print(f"║  🚀 LIVE TRADE v18.3 — INVERSE EXTREME PROFIT         ║")
+    print(f"║  🚀 LIVE TRADE v18.4 — INVERSE EXTREME PROFIT         ║")
     print(f"║  MODE: {mode_str:<47}║")
     print("╠═══════════════════════════════════════════════════════╣")
-    print(f"║  Order    : ${ORDER_USDT} notional × {LEVERAGE}x leverage               ║")
-    print(f"║  Target   : +{EXTREME_PROFIT_PCT*100:.2f}% per trade                        ║")
-    print(f"║  Hard SL  : -{HARD_SL_PCT*100:.2f}%                                  ║")
-    print(f"║  Impatient: 5s → bungkus jika profit, cut jika minus  ║")
+    print(f"║  Order      : ${ORDER_USDT} notional × {LEVERAGE}x leverage             ║")
+    print(f"║  Target     : +{EXTREME_PROFIT_PCT*100:.2f}% per trade                      ║")
+    print(f"║  Hard SL    : -{HARD_SL_PCT*100:.2f}%                                ║")
+    print(f"║  Impatient  : 5s → PLUS bungkus, MINUS tahan terus   ║")
+    print(f"║  Jaring akhir: Hard SL -0.2% atau ForceTimeout 60s   ║")
     print("╚═══════════════════════════════════════════════════════╝\n")
 
     if not is_testnet:
@@ -719,9 +724,9 @@ def run_bot():
 
     print(f"  ✅ {len(syms)} simbol aktif")
 
-    threading.Thread(target=t_monitor,         daemon=True).start()
+    threading.Thread(target=t_monitor,          daemon=True).start()
     threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
-    threading.Thread(target=t_macro,           daemon=True).start()
+    threading.Thread(target=t_macro,            daemon=True).start()
 
     time.sleep(4)
     tickers_all()
