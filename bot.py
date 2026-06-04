@@ -32,7 +32,7 @@ ORDER_USDT     = 2.0    # ⚠️ PERHATIAN: Binance mewajibkan min order $5 USDT
 MAX_POSITIONS  = 3
 
 # ── TARGET SUPER KETAT (EXTREME PROFIT) ────────────
-EXTREME_PROFIT_PCT = 0.0005  # +0.05% langsung Take Profit!
+EXTREME_PROFIT_PCT = 0.0015  # +0.05% langsung Take Profit!
 HARD_SL_PCT        = 0.0020  # -0.20% Hard Cut Loss (agar tak terseret tren)
 
 MIN_BASE_VOL   = 25_000_000
