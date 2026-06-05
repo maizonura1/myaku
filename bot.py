@@ -372,7 +372,7 @@ def paper_close(sym, reason, price=None):
     fee_open = entry * q * 0.0005  
     fee_close = price * q * 0.0005  
     total_fee = fee_open + fee_close
-    pnl = gross_pnl - total_fee      
+    pnl = gross_pnl - total_fee     
 
     pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
     hold = time.time() - pos["open_time"]
@@ -440,9 +440,9 @@ def monitor_positions():
                 paper_close(sym, "HardSL", px); continue
                 
             if hold >= MIN_HOLD_SEC_BEFORE_IMPATIENT:
-                if prof_pct >= MIN_PROFIT_TO_EXIT: 
+                if prof_pct >= 0.0015:  
                     paper_close(sym, "ImpatientWin", px); continue
-                elif prof_pct < -0.0015:  # ⬅️ Ambang loss disesuaikan jadi win lama
+                elif prof_pct < -MIN_PROFIT_TO_EXIT:  
                     paper_close(sym, "ImpatientLoss", px); continue
 
             print(f"   📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) NetEst:{pnl_now:+.4f}U {hold:.0f}s")
@@ -462,9 +462,9 @@ def monitor_positions():
                 paper_close(sym, "HardSL", px); continue
                 
             if hold >= MIN_HOLD_SEC_BEFORE_IMPATIENT:
-                if prof_pct >= MIN_PROFIT_TO_EXIT: 
+                if prof_pct >= 0.0015:  
                     paper_close(sym, "ImpatientWin", px); continue
-                elif prof_pct < -0.0015:  # ⬅️ Ambang loss disesuaikan jadi win lama
+                elif prof_pct < -MIN_PROFIT_TO_EXIT:  
                     paper_close(sym, "ImpatientLoss", px); continue
 
             print(f"   📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) NetEst:{pnl_now:+.4f}U {hold:.0f}s")
