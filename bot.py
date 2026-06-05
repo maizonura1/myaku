@@ -26,7 +26,7 @@ client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 # ═══════════════════════════════════════════════════════
 #  CONFIG v18.7 - FULL REVERSAL MIRROR
 # ═══════════════════════════════════════════════════════
-INVERSE_MODE   = False  # ⬅️ AKTIF! DIBALIK 180 DERAJAT
+INVERSE_MODE   = True  # ⬅️ AKTIF! DIBALIK 180 DERAJAT
 
 LEVERAGE       = 20
 ORDER_USDT     = 2.0    
