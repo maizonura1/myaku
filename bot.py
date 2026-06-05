@@ -1,10 +1,9 @@
 """
-Bot Scalping v18.6 — INVERSE EXTREME PROFIT MODE (LIVE REAL TRADE)
+Bot Scalping v18.7 — MIRROR REVERSAL MODE (LIVE REAL TRADE)
 ==================================================================
-Perbaikan Mutlak & Anti Double Entry:
-- Race Condition Fix: Proteksi _lock menyeluruh untuk mencegah order ganda pada koin yang sama.
-- Breather Space: Impatient exit diperlonggar dari 5 detik ke 30 detik agar posisi tidak prematur cutloss.
-- Strict Margin Lockdown: Pembulatan Lot Size lantai terbawah demi menjaga margin konsisten di $2.
+- Logic Reversal: INVERSE_MODE dimatikan. Bot berbalik 180 derajat dari sesi loss sebelumnya.
+- Dynamic Timeout: ForceTimeout dipecah menjadi ForceTimeoutProfit & ForceTimeoutLoss.
+- Strict RLock: Memastikan tidak ada tabrakan thread (Deadlock) saat sinkronisasi bursa.
 """
 
 import os, time, math, threading, queue
@@ -20,24 +19,21 @@ import numpy as np
 load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 
-# MATIKAN TESTNET AGAR ENTRY KE BINANCE ASLI
-client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
-
 # ═══════════════════════════════════════════════════════
-#  CONFIG v18.6 - INVERSE EXTREME PROFIT
+#  CONFIG v18.7 - MIRROR REVERSAL
 # ═══════════════════════════════════════════════════════
-INVERSE_MODE   = True   # MASTER SWITCH UNTUK STRATEGI KEBALIKAN
+INVERSE_MODE   = False  # ⬅️ DIBALIK 180 DERAJAT DARI SESI SEBELUMNYA (Balik ke Trend Following)
 
 LEVERAGE       = 20
 ORDER_USDT     = 2.0    # Target Margin Ketat $2 USDT
 MAX_POSITIONS  = 3
 
-# ── TARGET PROFIT & SL (Disesuaikan agar aman dari fee) ────────────
-EXTREME_PROFIT_PCT = 0.0030  # +0.30% Ambil profit aman dari fee taker
-HARD_SL_PCT        = 0.0045  # -0.45% Hard Cut Loss (diperlebar sedikit dari noise)
-MIN_PROFIT_TO_EXIT = 0.0015  # +0.15% Minimum profit untuk ImpatientWin
+# ── TARGET PROFIT & SL ────────────
+EXTREME_PROFIT_PCT = 0.0030  
+HARD_SL_PCT        = 0.0045  
+MIN_PROFIT_TO_EXIT = 0.0015  
 
-MIN_HOLD_SEC_BEFORE_IMPATIENT = 30  # Mengubah batas panik bot dari 5 detik ke 30 detik
+MIN_HOLD_SEC_BEFORE_IMPATIENT = 30  
 MAX_HOLD_SEC   = 90      
 
 MIN_BASE_VOL   = 25_000_000
@@ -81,7 +77,7 @@ _sym_cooldown   = {}
 _ticker_cache   = {}
 _ticker_ts      = 0
 _precisions     = {} 
-_lock           = threading.RLock()
+_lock           = threading.RLock() # PENGAMAN DEADLOCK
 _executor       = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q       = queue.Queue()
 _hot_syms       = deque(maxlen=20)
@@ -90,7 +86,7 @@ _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0, "impatient_cut": 0, "force": 0, 
+    "extreme_tp": 0, "hard_sl": 0, "impatient_cut": 0, "force_profit": 0, "force_loss": 0, 
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -208,7 +204,7 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL ENGINE DENGAN INVERSE LOGIC
+#  SIGNAL ENGINE
 # ═══════════════════════════════════════════════════════
 def signal(df):
     if df is None or len(df) < 55: return None, 0, [], 0.0
@@ -269,10 +265,9 @@ def signal(df):
     return "LONG", lp, sl[:3], atr
 
 # ═══════════════════════════════════════════════════════
-#  REAL OPEN / CLOSE & SINKRONISASI BURSA (ANTI RE-ENTRY)
+#  REAL OPEN / CLOSE
 # ═══════════════════════════════════════════════════════
 def sync_binance_positions():
-    """Sinkronisasi paksa data lokal RAM dengan posisi riil di server Binance"""
     global paper_positions
     try:
         pos_info = client.futures_position_information()
@@ -290,12 +285,10 @@ def sync_binance_positions():
                 }
                 
         with _lock:
-            # Bersihkan RAM lokal jika posisi di Binance asli sudah close
             for local_sym in list(paper_positions.keys()):
                 if local_sym not in active_on_binance:
                     paper_positions.pop(local_sym, None)
                     
-            # Pulihkan data jika ada posisi asli di Binance yang tertinggal/tidak tercatat di lokal
             for bin_sym, data in active_on_binance.items():
                 if bin_sym not in paper_positions or paper_positions[bin_sym].get("_r"):
                     paper_positions[bin_sym] = {
@@ -306,7 +299,6 @@ def sync_binance_positions():
         pass
 
 def paper_open(sym, direction, score, sigs, price, atr):
-    # Lock penuh gerbang entry sejak fungsi dimulai untuk memblokir thread lain masuk
     with _lock:
         sync_binance_positions()
         if sym in paper_positions or len(paper_positions) >= MAX_POSITIONS: 
@@ -404,7 +396,8 @@ def paper_close(sym, reason, price=None):
     if "ExtremeProfit" in reason: _stats["extreme_tp"] += 1
     elif "HardSL" in reason: _stats["hard_sl"] += 1
     elif "Impatient" in reason: _stats["impatient_cut"] += 1
-    elif "Force" in reason: _stats["force"] += 1
+    elif "ForceTimeoutProfit" in reason: _stats["force_profit"] += 1
+    elif "ForceTimeoutLoss" in reason: _stats["force_loss"] += 1
 
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
@@ -414,7 +407,7 @@ def paper_close(sym, reason, price=None):
     print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR TRACKING LOGIC
+#  MONITOR TRACKING LOGIC (DENGAN PEMISAHAN LOG)
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     sync_binance_positions()
@@ -430,30 +423,14 @@ def monitor_positions():
 
         side, entry, hold = pos["side"], pos["entry"], time.time() - pos["open_time"]
 
-        if hold >= MAX_HOLD_SEC:
-            paper_close(sym, "ForceTimeout", px); continue
-
         if side == "LONG":
             prof_pct = (px - entry) / entry
-            
-            if prof_pct >= EXTREME_PROFIT_PCT:
-                paper_close(sym, "ExtremeProfit", px); continue
-                
-            if prof_pct <= -HARD_SL_PCT:
-                paper_close(sym, "HardSL", px); continue
-                
-            # Logika Impatient Cut Loss dilonggarkan agar tidak panik menutup koin terlalu cepat
-            if hold >= MIN_HOLD_SEC_BEFORE_IMPATIENT:
-                if prof_pct >= MIN_PROFIT_TO_EXIT: 
-                    paper_close(sym, "ImpatientWin", px); continue
-                elif prof_pct < -0.0025: # Hanya cut jika loss melebih batas toleransi mikro 0.25%
-                    paper_close(sym, "ImpatientLoss", px); continue
-
             pnl_now = ((px - entry) * pos["qty"]) - (entry * pos["qty"] * 0.001)
-            print(f"   📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) NetEst:{pnl_now:+.4f}U {hold:.0f}s")
 
-        else:  # SHORT
-            prof_pct = (entry - px) / entry
+            # Modifikasi Pemisahan Timeout Sesuai Permintaan
+            if hold >= MAX_HOLD_SEC:
+                reason = "ForceTimeoutProfit" if pnl_now >= 0 else "ForceTimeoutLoss"
+                paper_close(sym, reason, px); continue
             
             if prof_pct >= EXTREME_PROFIT_PCT:
                 paper_close(sym, "ExtremeProfit", px); continue
@@ -467,7 +444,29 @@ def monitor_positions():
                 elif prof_pct < -0.0025: 
                     paper_close(sym, "ImpatientLoss", px); continue
 
+            print(f"   📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) NetEst:{pnl_now:+.4f}U {hold:.0f}s")
+
+        else:  # SHORT
+            prof_pct = (entry - px) / entry
             pnl_now = ((entry - px) * pos["qty"]) - (entry * pos["qty"] * 0.001)
+
+            # Modifikasi Pemisahan Timeout Sesuai Permintaan
+            if hold >= MAX_HOLD_SEC:
+                reason = "ForceTimeoutProfit" if pnl_now >= 0 else "ForceTimeoutLoss"
+                paper_close(sym, reason, px); continue
+            
+            if prof_pct >= EXTREME_PROFIT_PCT:
+                paper_close(sym, "ExtremeProfit", px); continue
+                
+            if prof_pct <= -HARD_SL_PCT:
+                paper_close(sym, "HardSL", px); continue
+                
+            if hold >= MIN_HOLD_SEC_BEFORE_IMPATIENT:
+                if prof_pct >= MIN_PROFIT_TO_EXIT: 
+                    paper_close(sym, "ImpatientWin", px); continue
+                elif prof_pct < -0.0025: 
+                    paper_close(sym, "ImpatientLoss", px); continue
+
             print(f"   📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) NetEst:{pnl_now:+.4f}U {hold:.0f}s")
 
 # ═══════════════════════════════════════════════════════
@@ -499,7 +498,9 @@ def scan_batch(syms):
     return res
 
 def top_movers(syms, n=20):
-    tk, ss = tickers_all(), set(syms)
+    tk, tickers_all()
+    tk = _ticker_cache
+    ss = set(syms)
     mv = [(s, abs(d["pct"])) for s, d in tk.items() if s in ss and d["vol"] >= MIN_BASE_VOL]
     return [s for s, _ in sorted(mv, key=lambda x: x[1], reverse=True)[:n]]
 
@@ -507,9 +508,9 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"     ┌ [v18.6 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}NetPnL:{pnl:+.4f}U")
+    print(f"     ┌ [v18.7 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}NetPnL:{pnl:+.4f}U")
     print(f"     └ Ex-Profit:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']} "
-          f"Imp-Cut:{_stats['impatient_cut']} Force:{_stats['force']}")
+          f"Imp-Cut:{_stats['impatient_cut']} TO-Profit:{_stats['force_profit']} TO-Loss:{_stats['force_loss']}")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
@@ -527,7 +528,7 @@ def print_full():
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
     print(f"\n  {'─'*62}")
-    print(f"  💸 LIVE REAL v18.6 [ANTI-RACE CONDITION] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"  💸 LIVE REAL v18.7 [MIRROR REVERSAL MODE] — {sess*60:.0f}m | {tph:.1f}T/jam")
     print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"  {e} Net PnL:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"  📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
@@ -578,12 +579,11 @@ def t_macro():
 
 def run_bot():
     print("╔═══════════════════════════════════════════════════════╗")
-    print("║  🚀 LIVE TRADE v18.6 — LOCKDOWN MARGIN REAL MODE      ║")
+    print("║  🚀 LIVE TRADE v18.7 — MIRROR REVERSAL LOGIC          ║")
     print("║  ⚠️  WARNING: EKSEKUSI ORDER REAL KE BINANCE           ║")
     print("╠═══════════════════════════════════════════════════════╣")
-    print(f"║  Target Profit : +{EXTREME_PROFIT_PCT*100}% (Proteksi Komisi Fee) ║")
-    print(f"║  Hard Stop Loss: -{HARD_SL_PCT*100}% (Mencegah Noise Mikro)     ║")
-    print(f"║  Margin Target : Strict ~$2.00 USDT | Anti Double Open║")
+    print("║  Logic         : Inverse Mode DIMATIKAN (Dibalik Total)║")
+    print("║  Tracking Exit : ForceTimeout Dipecah Jadi Profit/Loss ║")
     print("╚═══════════════════════════════════════════════════════╝")
 
     try:
