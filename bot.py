@@ -3,6 +3,8 @@ Bot Scalping v18.7 — MIRROR REVERSAL MODE (LIVE REAL TRADE)
 ==================================================================
 - Logic Reversal: INVERSE_MODE DIAKTIFKAN. Bot berbalik 180 derajat.
 - Target Swapped: Angka persentase PnL Loss dan Profit ditukar.
+- Timer Loss Dihapus: Hold time limit hanya berlaku untuk take profit.
+- Impatient Cut diubah menjadi Impatient Profit.
 """
 
 import os, time, math, threading, queue
@@ -31,12 +33,12 @@ ORDER_USDT     = 2.0
 MAX_POSITIONS  = 3
 
 # ── TARGET PROFIT & SL (DITUKAR UNTUK MENANGKAP LOSS LAMA) ────────────
-EXTREME_PROFIT_PCT = 0.0045  # Awalnya 0.0030 (Sekarang pakai target Hard SL lama)
-HARD_SL_PCT        = 0.0030  # Awalnya 0.0045 (Sekarang pakai target Extreme Profit lama)
-MIN_PROFIT_TO_EXIT = 0.0025  # Awalnya 0.0015 (Sekarang pakai target Impatient Loss lama)
+EXTREME_PROFIT_PCT   = 0.0045  # Awalnya 0.0030 (Sekarang pakai target Hard SL lama)
+HARD_SL_PCT          = 0.0030  # Awalnya 0.0045 (Sekarang pakai target Extreme Profit lama)
+IMPATIENT_PROFIT_PCT = 0.0025  # Awalnya target Impatient Loss, sekarang jadi Impatient Profit
 
 MIN_HOLD_SEC_BEFORE_IMPATIENT = 30  
-MAX_HOLD_SEC   = 90     
+MAX_HOLD_SEC   = 90      
 
 MIN_BASE_VOL   = 25_000_000
 MIN_VR         = 1.1    
@@ -86,9 +88,11 @@ _hot_syms       = deque(maxlen=20)
 
 _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
+
+# Update stats dict untuk impatient_profit
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0, "impatient_cut": 0, "force_profit": 0, "force_loss": 0, 
+    "extreme_tp": 0, "hard_sl": 0, "impatient_profit": 0, "force_profit": 0, "force_loss": 0, 
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -258,11 +262,13 @@ def signal(df):
             return None, max(lp, sp), [], atr
         if br >= BR_SHORT_MAX: return None, sp, [], atr  
         
+        # INVERSE MODE: Short signal jadi Long
         if INVERSE_MODE: return "LONG", sp, ss[:3] + ["(INV)"], atr
         return "SHORT", sp, ss[:3], atr
 
     if br <= BR_LONG_MIN: return None, lp, [], atr  
     
+    # INVERSE MODE: Long signal jadi Short
     if INVERSE_MODE: return "SHORT", lp, sl[:3] + ["(INV)"], atr
     return "LONG", lp, sl[:3], atr
 
@@ -397,7 +403,7 @@ def paper_close(sym, reason, price=None):
 
     if "ExtremeProfit" in reason: _stats["extreme_tp"] += 1
     elif "HardSL" in reason: _stats["hard_sl"] += 1
-    elif "Impatient" in reason: _stats["impatient_cut"] += 1
+    elif "Impatient" in reason: _stats["impatient_profit"] += 1
     elif "ForceTimeoutProfit" in reason: _stats["force_profit"] += 1
     elif "ForceTimeoutLoss" in reason: _stats["force_loss"] += 1
 
@@ -429,9 +435,11 @@ def monitor_positions():
             prof_pct = (px - entry) / entry
             pnl_now = ((px - entry) * pos["qty"]) - (entry * pos["qty"] * 0.001)
 
+            # Hilangkan timer loss, biarkan hanya timer profit yang mengeksekusi
             if hold >= MAX_HOLD_SEC:
-                reason = "ForceTimeoutProfit" if pnl_now >= 0 else "ForceTimeoutLoss"
-                paper_close(sym, reason, px); continue
+                if pnl_now >= 0:
+                    paper_close(sym, "ForceTimeoutProfit", px)
+                continue
             
             if prof_pct >= EXTREME_PROFIT_PCT:
                 paper_close(sym, "ExtremeProfit", px); continue
@@ -439,11 +447,10 @@ def monitor_positions():
             if prof_pct <= -HARD_SL_PCT:
                 paper_close(sym, "HardSL", px); continue
                 
+            # Mengganti Impatient Cut/Loss menjadi Impatient Profit
             if hold >= MIN_HOLD_SEC_BEFORE_IMPATIENT:
-                if prof_pct >= 0.0015:  
-                    paper_close(sym, "ImpatientWin", px); continue
-                elif prof_pct < -MIN_PROFIT_TO_EXIT:  
-                    paper_close(sym, "ImpatientLoss", px); continue
+                if prof_pct >= IMPATIENT_PROFIT_PCT:  
+                    paper_close(sym, "ImpatientProfit", px); continue
 
             print(f"   📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) NetEst:{pnl_now:+.4f}U {hold:.0f}s")
 
@@ -451,9 +458,11 @@ def monitor_positions():
             prof_pct = (entry - px) / entry
             pnl_now = ((entry - px) * pos["qty"]) - (entry * pos["qty"] * 0.001)
 
+            # Hilangkan timer loss, biarkan hanya timer profit yang mengeksekusi
             if hold >= MAX_HOLD_SEC:
-                reason = "ForceTimeoutProfit" if pnl_now >= 0 else "ForceTimeoutLoss"
-                paper_close(sym, reason, px); continue
+                if pnl_now >= 0:
+                    paper_close(sym, "ForceTimeoutProfit", px)
+                continue
             
             if prof_pct >= EXTREME_PROFIT_PCT:
                 paper_close(sym, "ExtremeProfit", px); continue
@@ -461,11 +470,10 @@ def monitor_positions():
             if prof_pct <= -HARD_SL_PCT:
                 paper_close(sym, "HardSL", px); continue
                 
+            # Mengganti Impatient Cut/Loss menjadi Impatient Profit
             if hold >= MIN_HOLD_SEC_BEFORE_IMPATIENT:
-                if prof_pct >= 0.0015:  
-                    paper_close(sym, "ImpatientWin", px); continue
-                elif prof_pct < -MIN_PROFIT_TO_EXIT:  
-                    paper_close(sym, "ImpatientLoss", px); continue
+                if prof_pct >= IMPATIENT_PROFIT_PCT:  
+                    paper_close(sym, "ImpatientProfit", px); continue
 
             print(f"   📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) NetEst:{pnl_now:+.4f}U {hold:.0f}s")
 
@@ -508,8 +516,9 @@ def print_inline():
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
     print(f"     ┌ [v18.7 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}NetPnL:{pnl:+.4f}U")
+    # Nama Impatient cut diganti jadi Imp-Profit
     print(f"     └ Ex-Profit:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']} "
-          f"Imp-Cut:{_stats['impatient_cut']} TO-Profit:{_stats['force_profit']} TO-Loss:{_stats['force_loss']}")
+          f"Imp-Profit:{_stats['impatient_profit']} TO-Profit:{_stats['force_profit']} TO-Loss:{_stats['force_loss']}")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
