@@ -19,6 +19,7 @@ import numpy as np
 
 load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
+
 # MATIKAN TESTNET AGAR ENTRY KE BINANCE ASLI
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
