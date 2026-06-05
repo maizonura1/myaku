@@ -81,7 +81,7 @@ _sym_cooldown   = {}
 _ticker_cache   = {}
 _ticker_ts      = 0
 _precisions     = {} 
-_lock           = threading.Lock()
+_lock           = threading.RLock()
 _executor       = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q       = queue.Queue()
 _hot_syms       = deque(maxlen=20)
