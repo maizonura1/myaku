@@ -4,6 +4,7 @@ Bot Scalping v18.7 — MIRROR REVERSAL MODE (LIVE REAL TRADE)
 - Logic Reversal: INVERSE_MODE dimatikan. Bot berbalik 180 derajat dari sesi loss sebelumnya.
 - Dynamic Timeout: ForceTimeout dipecah menjadi ForceTimeoutProfit & ForceTimeoutLoss.
 - Strict RLock: Memastikan tidak ada tabrakan thread (Deadlock) saat sinkronisasi bursa.
+- Fix: Memperbaiki typo UnboundLocalError pada fungsi top_movers.
 """
 
 import os, time, math, threading, queue
@@ -20,7 +21,6 @@ load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 # MATIKAN TESTNET AGAR ENTRY KE BINANCE ASLI
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
-
 
 # ═══════════════════════════════════════════════════════
 #  CONFIG v18.7 - MIRROR REVERSAL
@@ -430,7 +430,6 @@ def monitor_positions():
             prof_pct = (px - entry) / entry
             pnl_now = ((px - entry) * pos["qty"]) - (entry * pos["qty"] * 0.001)
 
-            # Modifikasi Pemisahan Timeout Sesuai Permintaan
             if hold >= MAX_HOLD_SEC:
                 reason = "ForceTimeoutProfit" if pnl_now >= 0 else "ForceTimeoutLoss"
                 paper_close(sym, reason, px); continue
@@ -453,7 +452,6 @@ def monitor_positions():
             prof_pct = (entry - px) / entry
             pnl_now = ((entry - px) * pos["qty"]) - (entry * pos["qty"] * 0.001)
 
-            # Modifikasi Pemisahan Timeout Sesuai Permintaan
             if hold >= MAX_HOLD_SEC:
                 reason = "ForceTimeoutProfit" if pnl_now >= 0 else "ForceTimeoutLoss"
                 paper_close(sym, reason, px); continue
@@ -501,8 +499,7 @@ def scan_batch(syms):
     return res
 
 def top_movers(syms, n=20):
-    tk, tickers_all()
-    tk = _ticker_cache
+    tk = tickers_all()
     ss = set(syms)
     mv = [(s, abs(d["pct"])) for s, d in tk.items() if s in ss and d["vol"] >= MIN_BASE_VOL]
     return [s for s, _ in sorted(mv, key=lambda x: x[1], reverse=True)[:n]]
