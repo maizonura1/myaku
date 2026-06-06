@@ -1,10 +1,11 @@
-"""
-Bot Scalping v18.7 — MIRROR REVERSAL MODE (LIVE REAL TRADE)
+p or lp < thresh or gap < MIN_GAP:
+     """
+Bot Scalping v18.8 — MIRROR REVERSAL MODE (FIXED EXECUTION)
 ==================================================================
-- Logic Reversal: INVERSE_MODE DIAKTIFKAN. Bot berbalik 180 derajat.
-- Target Swapped: Angka persentase PnL Loss dan Profit ditukar.
-- Timer Loss Dihapus: Hold time limit hanya berlaku untuk take profit.
-- Impatient Cut diubah menjadi Impatient Profit.
+- Testnet Initialization: Diperbaiki menggunakan parameter resmi bawaan SDK.
+- Native TP/SL: Close posisi diserahkan ke server Binance (mengurangi slippage).
+- Real PnL Tracking: Menghitung profit berdasarkan data eksekusi asli Binance.
+- Error Handling: Diperketat agar bot tidak "berhalusinasi" mencatat profit palsu.
 """
 
 import os, time, math, threading, queue
@@ -18,13 +19,12 @@ import pandas as pd
 import numpy as np
 
 load_dotenv()
-client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 
-# URL TESTNET DIMATIKAN AGAR TIDAK KENA ERROR -1109 KETIKA LIVE TRADE
-client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+# Inisialisasi awal Client langsung diarahkan ke Testnet secara resmi
+client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"), testnet=True)
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v18.7 - FULL REVERSAL MIRROR
+#  CONFIG v18.8 - FULL REVERSAL MIRROR (FIXED)
 # ═══════════════════════════════════════════════════════
 INVERSE_MODE   = True  # ⬅️ AKTIF! DIBALIK 180 DERAJAT
 
@@ -32,13 +32,9 @@ LEVERAGE       = 20
 ORDER_USDT     = 2.0    
 MAX_POSITIONS  = 3
 
-# ── TARGET PROFIT & SL (DITUKAR UNTUK MENANGKAP LOSS LAMA) ────────────
-EXTREME_PROFIT_PCT   = 0.0045  # Awalnya 0.0030 (Sekarang pakai target Hard SL lama)
-HARD_SL_PCT          = 0.0045  # Disamakan dengan Extreme Profit
-IMPATIENT_PROFIT_PCT = 0.0025  # Awalnya target Impatient Loss, sekarang jadi Impatient Profit
-
-MIN_HOLD_SEC_BEFORE_IMPATIENT = 30  
-MAX_HOLD_SEC   = 90     
+# TARGET PROFIT & SL PERSENTASE (Dari harga entry)
+EXTREME_PROFIT_PCT   = 0.0045  # 0.45%
+HARD_SL_PCT          = 0.0045  # 0.45%
 
 MIN_BASE_VOL   = 25_000_000
 MIN_VR         = 1.1    
@@ -46,7 +42,6 @@ BR_LONG_MIN    = 0.48
 BR_SHORT_MAX   = 0.52
 
 SCAN_INTERVAL  = 1
-MONITOR_INT    = 0.5
 SCAN_DELAY     = 0.015
 BATCH_SIZE     = 15
 MAX_WORKERS    = 8
@@ -89,10 +84,8 @@ _hot_syms       = deque(maxlen=20)
 _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 
-# Update stats dict untuk impatient_profit
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0, "impatient_profit": 0, "force_profit": 0, "force_loss": 0, 
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -104,6 +97,7 @@ def get_precision_rules(sym):
         for item in info['symbols']:
             if item['symbol'] == sym:
                 prec = item['quantityPrecision']
+                p_prec = item['pricePrecision'] # Ambil presisi harga juga untuk TP/SL
                 step_size = 0.0
                 min_notional = 5.0 
                 for f in item['filters']:
@@ -111,14 +105,14 @@ def get_precision_rules(sym):
                         step_size = float(f['stepSize'])
                     if f['filterType'] == 'MIN_NOTIONAL':
                         min_notional = float(f.get('notional', 5.0))
-                _precisions[sym] = (prec, step_size, min_notional)
-                return prec, step_size, min_notional
+                _precisions[sym] = (prec, step_size, min_notional, p_prec)
+                return prec, step_size, min_notional, p_prec
     except Exception as e:
-        pass
-    return 3, 0.001, 5.0
+        print(f"⚠️ Gagal load precision info {sym}: {e}")
+    return 3, 0.001, 5.0, 4
 
 def qty(price, sym): 
-    prec, step_size, min_notional = get_precision_rules(sym)
+    prec, step_size, min_notional, _ = get_precision_rules(sym)
     target_notional = ORDER_USDT * LEVERAGE 
     
     if target_notional < min_notional:
@@ -259,6 +253,267 @@ def signal(df):
 
     if lp <= sp or lp < thresh or gap < MIN_GAP:
         if sp <= lp or sp < thresh or gap < MIN_GAP:
+            return None, max(lp, sp), [], atr
+        if br >= BR_SHORT_MAX: return None, sp, [], atr  
+        
+        # INVERSE MODE: Short signal jadi Long
+        if INVERSE_MODE: return "LONG", sp, ss[:3] + ["(INV)"], atr
+        return "SHORT", sp, ss[:3], atr
+
+    if br <= BR_LONG_MIN: return None, lp, [], atr  
+    
+    # INVERSE MODE: Long signal jadi Short
+    if INVERSE_MODE: return "SHORT", lp, sl[:3] + ["(INV)"], atr
+    return "LONG", lp, sl[:3], atr
+
+# ═══════════════════════════════════════════════════════
+#  REAL EXECUTION SYSTEM (NATIVE TP & SL)
+# ═══════════════════════════════════════════════════════
+def sync_binance_positions():
+    global paper_positions, trade_log
+    try:
+        pos_info = client.futures_position_information()
+        active_on_binance = {}
+        
+        for p in pos_info:
+            amt = float(p["positionAmt"])
+            sym = p["symbol"]
+            if amt != 0:
+                side = "LONG" if amt > 0 else "SHORT"
+                active_on_binance[sym] = {
+                    "side": side,
+                    "qty": abs(amt),
+                    "entry": float(p["entryPrice"])
+                }
+                
+        with _lock:
+            # Jika ada posisi lokal yang sudah hilang di Binance (artinya kena TP/SL asli)
+            for local_sym in list(paper_positions.keys()):
+                if local_sym not in active_on_binance and not paper_positions[local_sym].get("_r"):
+                    # Ambil data PnL riwayat asli dari Binance
+                    process_closed_position(local_sym)
+                    paper_positions.pop(local_sym, None)
+                    
+            for bin_sym, data in active_on_binance.items():
+                if bin_sym not in paper_positions:
+                    paper_positions[bin_sym] = {
+                        "side": data["side"], "entry": data["entry"], "qty": data["qty"],
+                        "open_time": time.time(), "score": 99, "sigs": ["RESTORED_SYNC"], "atr": 0.0
+                    }
+    except Exception as e:
+        print(f"⚠️ Error saat sinkronisasi posisi: {e}")
+
+def paper_open(sym, direction, score, sigs, price, atr):
+    with _lock:
+        if sym in paper_positions or len(paper_positions) >= MAX_POSITIONS: 
+            return
+        paper_positions[sym] = {"_r": True} # Lock slot temporary
+
+    try:
+        client.futures_change_leverage(symbol=sym, leverage=LEVERAGE)
+        q = qty(price, sym)
+
+        if q <= 0:
+            with _lock: paper_positions.pop(sym, None)
+            return
+
+        # 1. Kirim Order MARKET Entry Utama
+        side_str = "BUY" if direction == "LONG" else "SELL"
+        order = client.futures_create_order(
+            symbol=sym,
+            side=side_str,
+            type="MARKET",
+            quantity=q
+        )
+        
+        exec_price = float(order.get('avgPrice', price))
+        if exec_price == 0: exec_price = price
+        
+        # Ambil aturan presisi harga koin untuk hitung TP/SL
+        _, _, _, p_prec = get_precision_rules(sym)
+        
+        # 2. Hitung Harga Target TP dan SL Asli
+        if direction == "LONG":
+            tp_price = round(exec_price * (1 + EXTREME_PROFIT_PCT), p_prec)
+            sl_price = round(exec_price * (1 - HARD_SL_PCT), p_prec)
+            tp_side = "SELL"
+            sl_side = "SELL"
+        else:
+            tp_price = round(exec_price * (1 - EXTREME_PROFIT_PCT), p_prec)
+            sl_price = round(exec_price * (1 + HARD_SL_PCT), p_prec)
+            tp_side = "BUY"
+            sl_side = "BUY"
+
+        # 3. Kirim Order TAKE_PROFIT_MARKET ke Binance
+        client.futures_create_order(
+            symbol=sym,
+            side=tp_side,
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=tp_price,
+            closePosition=True
+        )
+
+        # 4. Kirim Order STOP_MARKET ke Binance
+        client.futures_create_order(
+            symbol=sym,
+            side=sl_side,
+            type="STOP_MARKET",
+            stopPrice=sl_price,
+            closePosition=True
+        )
+        
+    except Exception as e:
+        print(f"❌ GAGAL ENTRY REAL {sym}: {e}")
+        # Jika gagal di tengah jalan, bersihkan sisa orderan/posisi jika sempat terbuat
+        try: client.futures_cancel_all_open_orders(symbol=sym)
+        except: pass
+        with _lock: paper_positions.pop(sym, None)
+        return
+
+    pos = {
+        "side": direction, "entry": exec_price, "qty": q,
+        "open_time": time.time(), "score": score, "sigs": sigs, "atr": atr,
+    }
+    with _lock: paper_positions[sym] = pos
+
+    d = "🟢" if direction == "LONG" else "🔴"
+    real_margin = (q * exec_price) / LEVERAGE
+    print(f"\n  {d} [REAL ENTRY] {sym} {direction} @{exec_price:.6g} (Margin: ${real_margin:.2f})")
+    print(f"     [NATIVE SENT] Target TP: @{tp_price} | Hard SL: @{sl_price}")
+    _stats["trades"] += 1
+
+def process_closed_position(sym):
+    """Mengambil riwayat transaksi asli dari server Binance agar pencatatan PnL 100% Akurat"""
+    try:
+        # Ambil 5 riwayat trade terakhir untuk koin tersebut
+        trades = client.futures_account_trades(symbol=sym, limit=5)
+        if not trades: return
+        
+        # Ambil trade penutup terakhir yang memiliki realizedPnl
+        closed_trade = None
+        for t in reversed(trades):
+            if float(t.get("realizedPnl", 0)) != 0:
+                closed_trade = t
+                break
+                
+        if closed_trade:
+            pnl = float(closed_trade["realizedPnl"])
+            qty_executed = float(closed_trade["qty"])
+            price_exit = float(closed_trade["price"])
+            
+            e = "🟢" if pnl >= 0 else "🔴"
+            print(f"  {e} [REAL CLOSE NOTIFICATION] {sym} closed via Binance Engine. Net Realized PnL: {pnl:+.5f}U")
+            
+            # Update data Statistik Bot menggunakan data dari Binance
+            _stats["pnl"] += pnl
+            _stats["hist"].append(pnl)
+            ks_upd(pnl)
+
+            if pnl >= 0:
+                _stats["wins"] += 1
+                if pnl > _stats["best"]: _stats["best"] = pnl
+            else:
+                _stats["losses"] += 1
+                if pnl < _stats["worst"]: _stats["worst"] = pnl
+
+            trade_log.append({
+                "sym": sym, "side": "CLOSED", "entry": 0.0, "exit": price_exit,
+                "pnl": round(pnl, 5), "reason": "Native Binance TP/SL Executed", "hold": 0,
+            })
+            set_cd(sym); _hot_syms.appendleft(sym); _rescan_q.put(1)
+            print_inline()
+            
+            # Bersihkan sisa order TP atau SL satunya yang mungkin masih menggantung
+            try: client.futures_cancel_all_open_orders(symbol=sym)
+            except: pass
+    except Exception as e:
+        print(f"⚠️ Gagal memproses data close dari Binance: {e}")
+
+# ═══════════════════════════════════════════════════════
+#  SCANNER & MAIN ENGINE
+# ═══════════════════════════════════════════════════════
+def scan_one(sym):
+    try:
+        time.sleep(SCAN_DELAY)
+        if not ok_cooldown(sym): return None
+        tk = _ticker_cache
+        if sym in tk and tk[sym]["vol"] < MIN_BASE_VOL: return None
+        df = run_ta(ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100).copy())
+        px, atr = df["close"].iloc[-2], df["atr"].iloc[-2]
+        if px == 0 or atr / px > 0.03: return None
+        dir_, sc, sigs, atr_val = signal(df)
+        if dir_ is None or len(sigs) < 1: return None
+        px_live = price_live(sym)
+        if px_live == 0: return None
+        return (sym, dir_, sc, sigs, px_live, atr_val)
+    except: return None
+
+def scan_batch(syms):
+    res = []
+    fut = {_executor.submit(scan_one, s): s for s in syms[:BATCH_SIZE]}
+    try:
+        for f in as_completed(fut, timeout=10):
+            if r := f.result(timeout=2): res.append(r)
+    except: pass
+    return res
+
+def top_movers(syms, n=20):
+    tk = tickers_all()
+    ss = set(syms)
+    mv = [(s, abs(d["pct"])) for s, d in tk.items() if s in ss and d["vol"] >= MIN_BASE_VOL]
+    return [s for s, _ in sorted(mv, key=lambda x: x[1], reverse=True)[:n]]
+
+def print_inline():
+    n = _stats["wins"] + _stats["losses"]
+    wr = _stats["wins"] / n * 100 if n else 0
+    pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
+    print(f"     ┌ [v18.8 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}NetPnL:{pnl:+.4f}U")
+
+def print_full():
+    n = _stats["wins"] + _stats["losses"]
+    wr = _stats["wins"] / n * 100 if n else 0
+    pnl, sess = _stats["pnl"], (time.time() - _stats["start"]) / 3600
+    tph, e = n / sess if sess > 0 else 0, "💚" if pnl >= 0 else "🔴"
+    
+    sh = md = 0.0
+    if len(_stats["hist"]) >= 5:
+        a = np.array(list(_stats["hist"]))
+        sd = float(np.std(a))
+        sh = float(np.mean(a)) / sd if sd > 0 else 0.0
+    if len(_stats["hist"]) >= 2:
+        eq = np.cumsum(list(_stats["hist"]))
+        md = float(np.min(eq - np.maximum.accumulate(eq)))
+
+    print(f"\n  {'─'*62}")
+    print(f"  💸 LIVE REAL v18.8 [NATIVE TRACKING] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
+    print(f"  {e} Net PnL:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
+    print(f"  📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
+    print(f"  KS: consec={_ks['consec']} daily={_ks['daily']:+.4f} | BTC:{_macro['btc']}")
+    if trade_log:
+        print(f"  📋 Last 5 Transactions:")
+        for t in trade_log[-5:]:
+            em = "🟢" if t["pnl"] > 0 else "🔴"
+            print(f"     {em} {t['sym']:<14} PnL: {t['pnl']:+.5f}U — {t['reason']}")
+    print(f"  {'─'*62}")
+
+def t_monitor():
+    """Melakukan tracking sinkronisasi posisi aktif secara berkala"""
+    while True:
+        try:
+            sync_binance_positions()
+        except: pass
+        time.sleep(2.0) # Diturunkan ke 2 detik agar tidak spamming API Limit
+
+def t_rescan(syms):
+    while True:
+        try:
+            _rescan_q.get(timeout=30)
+            time.sleep(0.3)
+            with _lock:
+                sync_binance_positions()
+                slots = MAX_POSITIONS - len(paper_positions)
+            if slots <= 0 or ks_check()[0]: co   if sp <= lp or sp < thresh or gap < MIN_GAP:
             return None, max(lp, sp), [], atr
         if br >= BR_SHORT_MAX: return None, sp, [], atr  
         
