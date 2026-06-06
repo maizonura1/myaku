@@ -34,7 +34,7 @@ MAX_POSITIONS  = 3
 
 # ── TARGET PROFIT & SL (DITUKAR UNTUK MENANGKAP LOSS LAMA) ────────────
 EXTREME_PROFIT_PCT   = 0.0045  # Awalnya 0.0030 (Sekarang pakai target Hard SL lama)
-HARD_SL_PCT          = 0.0030  # Awalnya 0.0045 (Sekarang pakai target Extreme Profit lama)
+HARD_SL_PCT          = 0.0045  # Disamakan dengan Extreme Profit
 IMPATIENT_PROFIT_PCT = 0.0025  # Awalnya target Impatient Loss, sekarang jadi Impatient Profit
 
 MIN_HOLD_SEC_BEFORE_IMPATIENT = 30  
@@ -444,8 +444,7 @@ def monitor_positions():
             if prof_pct >= EXTREME_PROFIT_PCT:
                 paper_close(sym, "ExtremeProfit", px); continue
                 
-            # ⬅️ PERBAIKAN DI SINI: Jika minus berapapun (di bawah 0), langsung tutup!
-            if prof_pct < 0:
+            if prof_pct <= -HARD_SL_PCT:
                 paper_close(sym, "HardSL", px); continue
                 
             # Mengganti Impatient Cut/Loss menjadi Impatient Profit
@@ -468,8 +467,7 @@ def monitor_positions():
             if prof_pct >= EXTREME_PROFIT_PCT:
                 paper_close(sym, "ExtremeProfit", px); continue
                 
-            # ⬅️ PERBAIKAN DI SINI: Jika minus berapapun (di bawah 0), langsung tutup!
-            if prof_pct < 0:
+            if prof_pct <= -HARD_SL_PCT:
                 paper_close(sym, "HardSL", px); continue
                 
             # Mengganti Impatient Cut/Loss menjadi Impatient Profit
