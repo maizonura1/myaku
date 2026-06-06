@@ -1,12 +1,4 @@
-p or lp < thresh or gap < MIN_GAP:
-     """
-Bot Scalping v18.8 — MIRROR REVERSAL MODE (FIXED EXECUTION)
-==================================================================
-- Testnet Initialization: Diperbaiki menggunakan parameter resmi bawaan SDK.
-- Native TP/SL: Close posisi diserahkan ke server Binance (mengurangi slippage).
-- Real PnL Tracking: Menghitung profit berdasarkan data eksekusi asli Binance.
-- Error Handling: Diperketat agar bot tidak "berhalusinasi" mencatat profit palsu.
-"""
+
 
 import os, time, math, threading, queue
 import requests
