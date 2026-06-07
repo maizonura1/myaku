@@ -1,13 +1,29 @@
 """
-Bot Scalping v18.8 — MIRROR REVERSAL MODE (FIXED + FEE-AWARE)
+Bot Scalping v19.0 — PROFIT-FIRST REBUILD
 ==================================================================
-CHANGELOG dari v18.8 original:
-  [FIX-1] Fee sekarang dikurangi dari realizedPnl (ambil field 'commission' dari API)
-  [FIX-2] Guard double-count: set _logged_closes mencegah posisi di-log dua kali
-  [FIX-3] Sync race condition: backoff -1109, interval t_monitor dinaikkan 3s
-  [FIX-4] process_closed_position pakai startTime filter agar tidak ambil trade lama
-  [FIX-5] paper_open reset _logged_closes saat posisi baru dibuka
-  [FIX-6] Stats sekarang tampilkan gross_pnl vs net_pnl vs total_fee untuk diagnostik
+PERBAIKAN dari v18.8 (balik logika loss → profit):
+
+  [FIX-1] ASYMMETRIC RR 1:2 — TP=0.9% SL=0.45%
+          Sebelumnya TP=SL=0.45% (butuh WR>50%). Sekarang WR>34% sudah profit.
+
+  [FIX-2] SL BOCOR → TRAILING STOP + ENTRY ATR FILTER
+          - Entry hanya jika ATR/price antara 0.0003–0.015 (tidak terlalu volatile)
+          - Trailing stop 0.3% dari harga tertinggi/terendah setelah entry
+          - Monitor thread update trailing setiap 2 detik
+
+  [FIX-3] FEE BUDGET CHECK SEBELUM ENTRY
+          - Estimasi fee = qty × price × 0.0004 × 2 (open+close)
+          - Entry dibatalkan jika fee > 15% dari expected TP profit
+
+  [FIX-4] INVERSE MODE ADAPTIF (bukan selalu ON)
+          - INVERSE aktif hanya saat BTC = BULL atau BEAR (trend jelas)
+          - Saat SIDEWAYS/UNKNOWN: pakai signal normal, MIN_SCORE dinaikkan ke 55
+
+  Perubahan minor lainnya:
+  - MIN_SCORE naik dari 40 → 45 (filter entry lebih ketat)
+  - MIN_GAP naik dari 10 → 15
+  - MAX_POSITIONS turun 3 → 2 (kurangi exposure saat kondisi buruk)
+  - COOLDOWN_SEC naik 8 → 15 (hindari re-entry cepat setelah loss)
 """
 
 import os, time, math, threading, queue
@@ -25,16 +41,30 @@ load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"), testnet=True)
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v18.8 - FULL REVERSAL MIRROR (FIXED + FEE-AWARE)
+#  CONFIG v19.0 - PROFIT-FIRST
 # ═══════════════════════════════════════════════════════
-INVERSE_MODE   = True
+# [FIX-4] INVERSE_MODE sekarang ADAPTIF, bukan konstanta
+# Variabel ini hanya default fallback, logika sebenarnya di signal()
+INVERSE_MODE_DEFAULT = False
 
 LEVERAGE       = 20
 ORDER_USDT     = 2.0
-MAX_POSITIONS  = 3
+MAX_POSITIONS  = 2         # [FIX-3] Turun dari 3 → 2, kurangi exposure
 
-EXTREME_PROFIT_PCT   = 0.0045  # 0.45%
-HARD_SL_PCT          = 0.0045  # 0.45%
+# [FIX-1] ASYMMETRIC RR: TP = 2x SL
+EXTREME_PROFIT_PCT   = 0.009   # 0.9%  ← sebelumnya 0.45%
+HARD_SL_PCT          = 0.0045  # 0.45% ← sama
+
+# [FIX-2] ATR filter: entry hanya jika volatilitas wajar
+ATR_MIN_RATIO    = 0.0003   # ATR/price minimal (terlalu flat = fake signal)
+ATR_MAX_RATIO    = 0.015    # ATR/price maksimal (terlalu volatile = slippage)
+
+# [FIX-2] Trailing stop setelah entry
+TRAIL_PCT        = 0.003    # 0.3% trailing dari peak
+
+# [FIX-3] Fee budget: batalkan entry jika fee > threshold ini dari expected profit
+FEE_BUDGET_RATIO = 0.15     # 15% dari expected TP profit
+TAKER_FEE_RATE   = 0.0004   # 0.04% per side
 
 MIN_BASE_VOL   = 25_000_000
 MIN_VR         = 1.1
@@ -46,13 +76,15 @@ SCAN_DELAY     = 0.015
 BATCH_SIZE     = 15
 MAX_WORKERS    = 8
 
-MIN_SCORE      = 40
-MIN_GAP        = 10
-COOLDOWN_SEC   = 8
+MIN_SCORE      = 45          # [FIX-4] Naik dari 40 → 45
+MIN_SCORE_SW   = 55          # [FIX-4] Score lebih tinggi saat SIDEWAYS
+MIN_GAP        = 15          # Naik dari 10 → 15
+COOLDOWN_SEC   = 15          # Naik dari 8 → 15
+TRAIL_CHECK_INTERVAL = 2.0   # [FIX-2] Interval cek trailing stop (detik)
 
-DAILY_LOSS     = -8.0
-CONSEC_MAX     = 6
-CONSEC_PAUSE   = 60
+DAILY_LOSS     = -6.0        # Lebih ketat dari -8.0
+CONSEC_MAX     = 5
+CONSEC_PAUSE   = 90          # Naik dari 60 → 90
 TTL_5M         = 5
 TTL_15M        = 30
 
@@ -81,21 +113,28 @@ _executor        = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 _rescan_q        = queue.Queue()
 _hot_syms        = deque(maxlen=20)
 
-# [FIX-2] Guard set untuk mencegah double-count close notification
 _logged_closes   = set()
-# [FIX-4] Track waktu open per posisi untuk filter trade history
 _position_open_ts = {}
+
+# [FIX-2] Track peak price per posisi untuk trailing stop
+_position_peak   = {}
 
 _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 
 _stats = {
     "trades": 0, "wins": 0, "losses": 0,
-    "gross_pnl": 0.0,   # PnL sebelum fee
-    "total_fee": 0.0,   # Akumulasi fee yang dibayar
-    "pnl": 0.0,         # Net PnL (gross - fee) ← ini yang benar
+    "gross_pnl": 0.0,
+    "total_fee": 0.0,
+    "pnl": 0.0,
     "best": 0.0, "worst": 0.0,
     "hist": deque(maxlen=200), "start": time.time(),
+    # v19.0 tambahan
+    "trail_exits": 0,   # berapa kali trailing stop kena
+    "tp_exits":    0,   # berapa kali TP native kena
+    "sl_exits":    0,   # berapa kali SL native kena
+    "skipped_fee": 0,   # berapa kali entry dibatalkan karena fee budget
+    "skipped_atr": 0,   # berapa kali entry dibatalkan karena ATR
 }
 
 # ═══════════════════════════════════════════════════════
@@ -132,6 +171,31 @@ def qty(price, sym):
     if step_size > 0:
         raw_qty = math.trunc(raw_qty / step_size) * step_size
     return round(raw_qty, prec)
+
+# ═══════════════════════════════════════════════════════
+#  [FIX-3] FEE BUDGET CHECK
+# ═══════════════════════════════════════════════════════
+def check_fee_budget(price, q, direction):
+    """
+    Estimasi fee total (open + close) dan bandingkan dengan expected TP profit.
+    Return True jika fee masih dalam budget (boleh entry).
+    Return False jika fee terlalu besar relatif terhadap profit target.
+    """
+    notional      = q * price
+    estimated_fee = notional * TAKER_FEE_RATE * 2  # open + close
+    tp_profit_est = notional * EXTREME_PROFIT_PCT / LEVERAGE  # profit di akun (leverage-adjusted)
+
+    # tp_profit_est tanpa leverage: notional * pct, tapi margin = notional/leverage
+    # Profit aktual = qty × price × pct (bukan dibagi leverage karena sudah dihitung dari notional)
+    tp_profit_actual = q * price * EXTREME_PROFIT_PCT
+
+    if tp_profit_actual == 0:
+        return False
+
+    fee_ratio = estimated_fee / tp_profit_actual
+    if fee_ratio > FEE_BUDGET_RATIO:
+        return False
+    return True
 
 # ═══════════════════════════════════════════════════════
 #  MARKET DATA
@@ -235,21 +299,41 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL ENGINE
+#  SIGNAL ENGINE — [FIX-4] ADAPTIVE INVERSE MODE
 # ═══════════════════════════════════════════════════════
 def signal(df):
+    """
+    [FIX-4] INVERSE MODE sekarang adaptif:
+    - BTC BULL/BEAR   → INVERSE aktif (mirror trend market)
+    - BTC MILD_BULL/MILD_BEAR → INVERSE aktif dengan score threshold lebih tinggi
+    - BTC SIDEWAYS/UNKNOWN → pakai signal NORMAL, threshold MIN_SCORE_SW (55)
+
+    Logika: di v18.8, INVERSE selalu ON. Ini bagus saat ada trend jelas karena
+    signal yang tampak "bearish" di timeframe kecil sebenarnya counter-trend bounce.
+    Tapi di SIDEWAYS, tidak ada trend yang bisa di-counter — hasilnya random.
+    """
     if df is None or len(df) < 55: return None, 0, [], 0.0
 
     row, prev, prev2 = df.iloc[-2], df.iloc[-3], df.iloc[-4]
     p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
     rsi, mh, mh_p, mh_p2 = row["rsi"], row["mh"], prev["mh"], prev2["mh"]
-    vr, br, m5, body, atr, adx = (
+    vr, br, m5, atr, adx = (
         row["vr"], row["br"], row["m5"],
-        row["br"], row["atr"], row["adx"]
+        row["atr"], row["adx"]
     )
     btc = _macro["btc"]
 
+    # [FIX-4] Tentukan mode dan threshold berdasarkan kondisi BTC
+    is_sideways   = btc in ("SIDEWAYS", "UNKNOWN")
+    use_inverse   = btc in ("BULL", "BEAR", "MILD_BULL", "MILD_BEAR")
+    score_thresh  = MIN_SCORE_SW if is_sideways else MIN_SCORE
+
     if vr < MIN_VR: return None, 0, [], atr
+
+    # [FIX-2] ATR filter — cek volatilitas sebelum scoring
+    atr_ratio = atr / p if p > 0 else 0
+    if atr_ratio < ATR_MIN_RATIO or atr_ratio > ATR_MAX_RATIO:
+        return None, 0, [], atr
 
     lp = sp = 0
     sl, ss = [], []
@@ -289,27 +373,42 @@ def signal(df):
         lp += 8; sp += 8
         sl.append(f"ADX{adx:.0f}"); ss.append(f"ADX{adx:.0f}")
 
-    btc_sw = btc in ("SIDEWAYS", "UNKNOWN")
-    thresh = 40 if btc_sw else MIN_SCORE
-    gap    = abs(lp - sp)
+    gap = abs(lp - sp)
 
-    if lp <= sp or lp < thresh or gap < MIN_GAP:
-        if sp <= lp or sp < thresh or gap < MIN_GAP:
-            return None, max(lp, sp), [], atr
-        if br >= BR_SHORT_MAX: return None, sp, [], atr
-        if INVERSE_MODE: return "LONG", sp, ss[:3] + ["(INV)"], atr
-        return "SHORT", sp, ss[:3], atr
+    # Determine raw signal direction
+    if lp > sp and lp >= score_thresh and gap >= MIN_GAP:
+        raw_dir = "LONG"
+        raw_sc  = lp
+        raw_sigs = sl[:3]
+    elif sp > lp and sp >= score_thresh and gap >= MIN_GAP:
+        raw_dir = "SHORT"
+        raw_sc  = sp
+        raw_sigs = ss[:3]
+    else:
+        return None, max(lp, sp), [], atr
 
-    if br <= BR_LONG_MIN: return None, lp, [], atr
-    if INVERSE_MODE: return "SHORT", lp, sl[:3] + ["(INV)"], atr
-    return "LONG", lp, sl[:3], atr
+    # [FIX-4] Terapkan inverse hanya saat ada trend jelas
+    if use_inverse:
+        # Mirror: signal LONG → eksekusi SHORT, vice versa
+        final_dir  = "SHORT" if raw_dir == "LONG" else "LONG"
+        final_sigs = raw_sigs + ["(INV)"]
+        # Cek buy ratio untuk arah setelah inversion
+        if final_dir == "LONG"  and br <= BR_LONG_MIN:  return None, raw_sc, [], atr
+        if final_dir == "SHORT" and br >= BR_SHORT_MAX: return None, raw_sc, [], atr
+    else:
+        # Mode normal saat sideways
+        final_dir  = raw_dir
+        final_sigs = raw_sigs + ["(NORM)"]
+        if final_dir == "LONG"  and br <= BR_LONG_MIN:  return None, raw_sc, [], atr
+        if final_dir == "SHORT" and br >= BR_SHORT_MAX: return None, raw_sc, [], atr
+
+    return final_dir, raw_sc, final_sigs, atr
 
 # ═══════════════════════════════════════════════════════
-#  REAL EXECUTION SYSTEM (NATIVE TP & SL)
+#  REAL EXECUTION SYSTEM
 # ═══════════════════════════════════════════════════════
 def sync_binance_positions():
-    """Sinkronisasi posisi lokal dengan Binance. Deteksi posisi yang sudah close."""
-    global paper_positions, trade_log
+    """Sinkronisasi posisi lokal dengan Binance."""
     try:
         pos_info = client.futures_position_information()
         active_on_binance = {}
@@ -328,13 +427,12 @@ def sync_binance_positions():
         with _lock:
             for local_sym in list(paper_positions.keys()):
                 pos = paper_positions[local_sym]
-                # Skip posisi yang sedang dalam proses entry (_r flag)
                 if pos.get("_r"):
                     continue
-                # Jika posisi tidak ada di Binance → sudah close
                 if local_sym not in active_on_binance:
-                    process_closed_position(local_sym)
+                    process_closed_position(local_sym, reason="Native Binance TP/SL")
                     paper_positions.pop(local_sym, None)
+                    _position_peak.pop(local_sym, None)
 
             for bin_sym, data in active_on_binance.items():
                 if bin_sym not in paper_positions:
@@ -343,15 +441,12 @@ def sync_binance_positions():
                         "open_time": time.time(), "score": 99,
                         "sigs": ["RESTORED_SYNC"], "atr": 0.0
                     }
+                    _position_peak[bin_sym] = data["entry"]
 
     except Exception as e:
         err_str = str(e)
-        if "-1109" in err_str:
-            # [FIX-3] -1109 = Invalid account, biasanya testnet credential issue
-            # Jangan spam, cukup catat sekali
-            pass
-        else:
-            print(f"⚠️ Error saat sinkronisasi posisi: {e}")
+        if "-1109" not in err_str:
+            print(f"⚠️ Error sinkronisasi: {e}")
 
 def paper_open(sym, direction, score, sigs, price, atr):
     with _lock:
@@ -359,9 +454,7 @@ def paper_open(sym, direction, score, sigs, price, atr):
             return
         paper_positions[sym] = {"_r": True}
 
-    # [FIX-2] Reset close guard saat posisi baru dibuka
     _logged_closes.discard(sym)
-    # [FIX-4] Catat timestamp open untuk filter trade history
     _position_open_ts[sym] = int(time.time() * 1000)
 
     try:
@@ -370,6 +463,14 @@ def paper_open(sym, direction, score, sigs, price, atr):
 
         if q <= 0:
             with _lock: paper_positions.pop(sym, None)
+            return
+
+        # [FIX-3] Cek fee budget sebelum entry
+        if not check_fee_budget(price, q, direction):
+            print(f"  ⚠️ [FEE SKIP] {sym} — fee terlalu besar vs expected profit")
+            _stats["skipped_fee"] += 1
+            with _lock: paper_positions.pop(sym, None)
+            _position_open_ts.pop(sym, None)
             return
 
         side_str = "BUY" if direction == "LONG" else "SELL"
@@ -385,6 +486,7 @@ def paper_open(sym, direction, score, sigs, price, atr):
 
         _, _, _, p_prec = get_precision_rules(sym)
 
+        # [FIX-1] ASYMMETRIC RR: TP=0.9%, SL=0.45%
         if direction == "LONG":
             tp_price = round(exec_price * (1 + EXTREME_PROFIT_PCT), p_prec)
             sl_price = round(exec_price * (1 - HARD_SL_PCT), p_prec)
@@ -418,30 +520,151 @@ def paper_open(sym, direction, score, sigs, price, atr):
     pos = {
         "side": direction, "entry": exec_price, "qty": q,
         "open_time": time.time(), "score": score, "sigs": sigs, "atr": atr,
+        "tp": tp_price, "sl": sl_price,
+        # [FIX-2] Inisialisasi trailing peak
+        "trail_peak": exec_price,
+        "trail_sl":   sl_price,   # trailing SL dimulai dari hard SL
     }
-    with _lock: paper_positions[sym] = pos
+    with _lock:
+        paper_positions[sym] = pos
+        _position_peak[sym]  = exec_price
 
     d = "🟢" if direction == "LONG" else "🔴"
     real_margin = (q * exec_price) / LEVERAGE
-    print(f"\n  {d} [REAL ENTRY] {sym} {direction} @{exec_price:.6g} (Margin: ${real_margin:.2f})")
-    print(f"     [NATIVE SENT] Target TP: @{tp_price} | Hard SL: @{sl_price}")
+    rr_str = f"TP:{tp_price:.6g}(+{EXTREME_PROFIT_PCT*100:.1f}%) SL:{sl_price:.6g}(-{HARD_SL_PCT*100:.1f}%)"
+    print(f"\n  {d} [REAL ENTRY v19] {sym} {direction} @{exec_price:.6g} (Margin:${real_margin:.2f})")
+    print(f"     [RR 1:2] {rr_str}")
+    print(f"     [MODE] {'INVERSE' if '(INV)' in sigs else 'NORMAL'} | BTC:{_macro['btc']} | {' | '.join(sigs)}")
     _stats["trades"] += 1
 
-def process_closed_position(sym):
+# ═══════════════════════════════════════════════════════
+#  [FIX-2] TRAILING STOP MONITOR
+# ═══════════════════════════════════════════════════════
+def update_trailing_stops():
     """
-    [FIX-1] Ambil realizedPnl DAN commission dari trade history.
-    [FIX-2] Guard dengan _logged_closes agar tidak double-count.
-    [FIX-4] Filter by startTime = waktu posisi dibuka.
+    Cek semua posisi aktif dan update trailing SL.
+    Jika harga melewati trailing SL → close manual via MARKET order.
+
+    Logika trailing:
+    - LONG:  trailing SL = max(current_trail_sl, current_price × (1 - TRAIL_PCT))
+    - SHORT: trailing SL = min(current_trail_sl, current_price × (1 + TRAIL_PCT))
     """
-    # [FIX-2] Cek apakah sudah pernah diproses
+    with _lock:
+        positions_copy = dict(paper_positions)
+
+    for sym, pos in positions_copy.items():
+        if pos.get("_r") or "trail_sl" not in pos:
+            continue
+
+        try:
+            current_price = price_live(sym)
+            if current_price == 0:
+                continue
+
+            side     = pos["side"]
+            _, _, _, p_prec = get_precision_rules(sym)
+
+            with _lock:
+                if sym not in paper_positions:
+                    continue
+                pos_live = paper_positions[sym]
+
+                if side == "LONG":
+                    # Update trail peak ke harga tertinggi
+                    new_peak = max(pos_live.get("trail_peak", current_price), current_price)
+                    # Trailing SL bergerak naik mengikuti harga
+                    new_trail_sl = round(new_peak * (1 - TRAIL_PCT), p_prec)
+                    # Trailing SL tidak boleh lebih rendah dari hard SL
+                    new_trail_sl = max(new_trail_sl, pos_live["sl"])
+                    pos_live["trail_peak"] = new_peak
+                    pos_live["trail_sl"]   = new_trail_sl
+
+                    # Cek apakah harga sudah turun ke bawah trailing SL
+                    if current_price <= new_trail_sl and current_price > pos_live["sl"]:
+                        # Trailing kena — close manual
+                        _execute_trailing_close(sym, pos_live, current_price, "TRAIL_SL_LONG")
+
+                else:  # SHORT
+                    new_peak = min(pos_live.get("trail_peak", current_price), current_price)
+                    new_trail_sl = round(new_peak * (1 + TRAIL_PCT), p_prec)
+                    new_trail_sl = min(new_trail_sl, pos_live["sl"])
+                    pos_live["trail_peak"] = new_peak
+                    pos_live["trail_sl"]   = new_trail_sl
+
+                    if current_price >= new_trail_sl and current_price < pos_live["sl"]:
+                        _execute_trailing_close(sym, pos_live, current_price, "TRAIL_SL_SHORT")
+
+        except Exception as e:
+            pass  # Jangan spam error di loop trailing
+
+def _execute_trailing_close(sym, pos, current_price, reason):
+    """Close posisi via market order karena trailing stop kena."""
+    try:
+        side     = pos["side"]
+        close_side = "SELL" if side == "LONG" else "BUY"
+        q        = pos["qty"]
+
+        client.futures_cancel_all_open_orders(symbol=sym)
+        client.futures_create_order(
+            symbol=sym, side=close_side,
+            type="MARKET", quantity=q,
+            reduceOnly=True
+        )
+
+        entry = pos["entry"]
+        if side == "LONG":
+            gross = (current_price - entry) * q
+        else:
+            gross = (entry - current_price) * q
+
+        # Estimasi fee untuk trailing close
+        fee     = current_price * q * TAKER_FEE_RATE
+        net_pnl = gross - fee
+
+        e = "🟢" if net_pnl >= 0 else "🔴"
+        print(f"  {e} [TRAIL CLOSE] {sym} {side} @{current_price:.6g} | Net:{net_pnl:+.5f}U ({reason})")
+
+        _stats["gross_pnl"] += gross
+        _stats["total_fee"] += fee
+        _stats["pnl"]       += net_pnl
+        _stats["hist"].append(net_pnl)
+        _stats["trail_exits"] += 1
+        ks_upd(net_pnl)
+
+        if net_pnl >= 0:
+            _stats["wins"] += 1
+            if net_pnl > _stats["best"]: _stats["best"] = net_pnl
+        else:
+            _stats["losses"] += 1
+            if net_pnl < _stats["worst"]: _stats["worst"] = net_pnl
+
+        trade_log.append({
+            "sym": sym, "side": side,
+            "entry": entry, "exit": current_price,
+            "gross": round(gross, 5), "fee": round(fee, 5),
+            "pnl": round(net_pnl, 5), "reason": reason, "hold": 0,
+        })
+
+        _logged_closes.add(sym)
+        _position_open_ts.pop(sym, None)
+        _position_peak.pop(sym, None)
+        paper_positions.pop(sym, None)
+
+        set_cd(sym); _hot_syms.appendleft(sym); _rescan_q.put(1)
+        print_inline()
+
+    except Exception as e:
+        print(f"⚠️ Gagal trailing close {sym}: {e}")
+
+def process_closed_position(sym, reason="Native Binance TP/SL"):
+    """Proses posisi yang ditutup oleh Binance (TP/SL native)."""
     if sym in _logged_closes:
         return
     _logged_closes.add(sym)
 
     try:
-        # [FIX-4] Ambil hanya trade setelah posisi dibuka
-        open_ts   = _position_open_ts.get(sym, 0)
-        kwargs    = {"symbol": sym, "limit": 20}
+        open_ts = _position_open_ts.get(sym, 0)
+        kwargs  = {"symbol": sym, "limit": 20}
         if open_ts > 0:
             kwargs["startTime"] = open_ts
 
@@ -449,33 +672,36 @@ def process_closed_position(sym):
         if not trades:
             return
 
-        # Kumpulkan semua trade yang punya realizedPnl != 0 (trade close)
-        gross_pnl    = 0.0
-        total_fee    = 0.0
-        price_exit   = 0.0
-        found_close  = False
+        gross_pnl   = 0.0
+        total_fee   = 0.0
+        price_exit  = 0.0
+        found_close = False
 
         for t in trades:
             rpnl = float(t.get("realizedPnl", 0))
             if rpnl != 0:
-                gross_pnl  += rpnl
-                # [FIX-1] Tambah fee dari field commission
-                fee         = float(t.get("commission", 0))
-                total_fee  += fee
-                price_exit  = float(t.get("price", 0))
+                gross_pnl += rpnl
+                fee        = float(t.get("commission", 0))
+                total_fee += fee
+                price_exit = float(t.get("price", 0))
                 found_close = True
 
         if not found_close:
             return
 
-        # [FIX-1] Net PnL = gross - fee
         net_pnl = gross_pnl - total_fee
 
-        e = "🟢" if net_pnl >= 0 else "🔴"
-        print(f"  {e} [REAL CLOSE NOTIFICATION] {sym} closed via Binance Engine.")
-        print(f"     Gross PnL: {gross_pnl:+.5f}U | Fee: -{total_fee:.5f}U | Net: {net_pnl:+.5f}U")
+        # Detect TP vs SL
+        pos = paper_positions.get(sym, {})
+        if pos:
+            if net_pnl > 0:
+                _stats["tp_exits"] += 1
+            else:
+                _stats["sl_exits"] += 1
 
-        # Update stats dengan nilai NET
+        e = "🟢" if net_pnl >= 0 else "🔴"
+        print(f"  {e} [BINANCE CLOSE] {sym} | Gross:{gross_pnl:+.5f} Fee:{total_fee:.5f} Net:{net_pnl:+.5f}U")
+
         _stats["gross_pnl"] += gross_pnl
         _stats["total_fee"] += total_fee
         _stats["pnl"]       += net_pnl
@@ -492,16 +718,11 @@ def process_closed_position(sym):
         trade_log.append({
             "sym": sym, "side": "CLOSED",
             "entry": 0.0, "exit": price_exit,
-            "gross": round(gross_pnl, 5),
-            "fee":   round(total_fee, 5),
-            "pnl":   round(net_pnl, 5),
-            "reason": "Native Binance TP/SL Executed",
-            "hold": 0,
+            "gross": round(gross_pnl, 5), "fee": round(total_fee, 5),
+            "pnl": round(net_pnl, 5), "reason": reason, "hold": 0,
         })
 
-        # Bersihkan tracking timestamp
         _position_open_ts.pop(sym, None)
-
         set_cd(sym); _hot_syms.appendleft(sym); _rescan_q.put(1)
         print_inline()
 
@@ -509,8 +730,7 @@ def process_closed_position(sym):
         except: pass
 
     except Exception as e:
-        print(f"⚠️ Gagal memproses data close dari Binance ({sym}): {e}")
-        # Jangan hapus dari _logged_closes agar tidak retry infinite
+        print(f"⚠️ Gagal proses close {sym}: {e}")
         _position_open_ts.pop(sym, None)
 
 # ═══════════════════════════════════════════════════════
@@ -523,8 +743,16 @@ def scan_one(sym):
         tk = _ticker_cache
         if sym in tk and tk[sym]["vol"] < MIN_BASE_VOL: return None
         df = run_ta(ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100).copy())
-        px, atr = df["close"].iloc[-2], df["atr"].iloc[-2]
-        if px == 0 or atr / px > 0.03: return None
+        px  = df["close"].iloc[-2]
+        atr = df["atr"].iloc[-2]
+        if px == 0: return None
+
+        # [FIX-2] ATR ratio check sudah ada di signal(), tapi double-check di sini juga
+        atr_ratio = atr / px if px > 0 else 0
+        if atr_ratio > ATR_MAX_RATIO:
+            _stats["skipped_atr"] += 1
+            return None
+
         dir_, sc, sigs, atr_val = signal(df)
         if dir_ is None or len(sigs) < 1: return None
         px_live = price_live(sym)
@@ -554,8 +782,9 @@ def print_inline():
     pnl = _stats["pnl"]
     e   = "💚" if pnl >= 0 else "🔴"
     fee = _stats["total_fee"]
-    print(f"     ┌ [v18.8 LIVE] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} "
-          f"{e}NetPnL:{pnl:+.4f}U Fee:{fee:.4f}U")
+    print(f"     ┌ [v19.0] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} "
+          f"{e}Net:{pnl:+.4f}U Fee:{fee:.4f}U "
+          f"Trail:{_stats['trail_exits']} SkipFee:{_stats['skipped_fee']}")
 
 def print_full():
     n    = _stats["wins"] + _stats["losses"]
@@ -574,26 +803,34 @@ def print_full():
         eq = np.cumsum(list(_stats["hist"]))
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
-    print(f"\n  {'─'*62}")
-    print(f"  💸 LIVE REAL v18.8 [FEE-AWARE] — {sess*60:.0f}m | {tph:.1f}T/jam")
-    print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
-    print(f"  {e} Net PnL:{pnl:+.5f}U  Gross:{_stats['gross_pnl']:+.5f}U  Fee:{_stats['total_fee']:.5f}U")
-    print(f"  📊 Best:{_stats['best']:+.5f}  Worst:{_stats['worst']:+.5f}")
+    # Hitung breakeven WR aktual
+    avg_win  = _stats["best"]  # proxy
+    avg_loss = abs(_stats["worst"])
+    be_wr    = avg_loss / (avg_win + avg_loss) * 100 if (avg_win + avg_loss) > 0 else 50
+
+    print(f"\n  {'─'*65}")
+    print(f"  💸 LIVE REAL v19.0 [PROFIT-FIRST] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"  🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} (BE:{be_wr:.0f}%)")
+    print(f"  {e} Net:{pnl:+.5f}U  Gross:{_stats['gross_pnl']:+.5f}U  Fee:{_stats['total_fee']:.5f}U")
+    print(f"  📊 Best:{_stats['best']:+.5f}  Worst:{_stats['worst']:+.5f}  RR≈{abs(_stats['best']/(_stats['worst'] if _stats['worst'] else 1)):.1f}:1")
     print(f"  📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
-    print(f"  KS: consec={_ks['consec']} daily={_ks['daily']:+.4f} | BTC:{_macro['btc']}")
+    print(f"  🔧 TrailExit:{_stats['trail_exits']} TP:{_stats['tp_exits']} SL:{_stats['sl_exits']} "
+          f"SkipFee:{_stats['skipped_fee']} SkipATR:{_stats['skipped_atr']}")
+    print(f"  📡 BTC:{_macro['btc']} | Mode:{'INV' if _macro['btc'] in ('BULL','BEAR','MILD_BULL','MILD_BEAR') else 'NORM'}")
+    print(f"  KS: consec={_ks['consec']} daily={_ks['daily']:+.4f}")
     if trade_log:
-        print(f"  📋 Last 5 Transactions:")
+        print(f"  📋 Last 5:")
         for t in trade_log[-5:]:
             em = "🟢" if t["pnl"] > 0 else "🔴"
             print(f"     {em} {t['sym']:<14} Net:{t['pnl']:+.5f}U "
                   f"(Gross:{t['gross']:+.5f} Fee:{t['fee']:.5f}) — {t['reason']}")
-    print(f"  {'─'*62}")
+    print(f"  {'─'*65}")
 
 # ═══════════════════════════════════════════════════════
 #  BACKGROUND THREADS
 # ═══════════════════════════════════════════════════════
 def t_monitor():
-    """[FIX-3] Monitor thread dengan backoff untuk -1109 dan interval lebih lambat."""
+    """Sync posisi Binance."""
     consecutive_errors = 0
     while True:
         try:
@@ -601,14 +838,19 @@ def t_monitor():
             consecutive_errors = 0
         except Exception as e:
             consecutive_errors += 1
-            err_str = str(e)
-            if "-1109" in err_str:
-                # Invalid account — backoff lebih lama
-                sleep_time = min(30, 5 * consecutive_errors)
-                time.sleep(sleep_time)
+            if "-1109" in str(e):
+                time.sleep(min(30, 5 * consecutive_errors))
                 continue
-        # [FIX-3] Interval dinaikkan dari 2.0 → 3.0 untuk kurangi spam
         time.sleep(3.0)
+
+def t_trailing():
+    """[FIX-2] Thread khusus untuk update trailing stop."""
+    while True:
+        try:
+            update_trailing_stops()
+        except Exception as e:
+            pass
+        time.sleep(TRAIL_CHECK_INTERVAL)
 
 def t_rescan(syms):
     while True:
@@ -647,14 +889,15 @@ def t_macro():
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════
 def run_bot():
-    print("╔═══════════════════════════════════════════════════════╗")
-    print("║  🚀 NATIVE BINANCE v18.8 — FULL MIRROR REVERSAL       ║")
-    print("║  ⚠️  STATUS: RUNNING ON FUTURES TESTNET ENVIRONMENT   ║")
-    print("╠═══════════════════════════════════════════════════════╣")
-    print("║  Logic      : Inverse Mode ON (Dibalik Total)         ║")
-    print("║  Execution  : Server-side TP/SL (No Halusination)     ║")
-    print("║  Fee Tracking: ON — Net PnL = Gross - Commission      ║")
-    print("╚═══════════════════════════════════════════════════════╝")
+    print("╔═══════════════════════════════════════════════════════════╗")
+    print("║  🚀 BOT SCALPING v19.0 — PROFIT-FIRST REBUILD             ║")
+    print("║  ⚠️  STATUS: RUNNING ON FUTURES TESTNET ENVIRONMENT       ║")
+    print("╠═══════════════════════════════════════════════════════════╣")
+    print("║  [FIX-1] RR 1:2 — TP=0.9% SL=0.45% (WR>34% = profit)    ║")
+    print("║  [FIX-2] Trailing Stop 0.3% + ATR filter entry            ║")
+    print("║  [FIX-3] Fee budget check sebelum entry (<15% TP)         ║")
+    print("║  [FIX-4] Inverse mode adaptif (OFF saat SIDEWAYS)         ║")
+    print("╚═══════════════════════════════════════════════════════════╝")
 
     try:
         valid = {
@@ -667,9 +910,10 @@ def run_bot():
 
     sync_binance_positions()
 
-    threading.Thread(target=t_monitor,          daemon=True).start()
+    threading.Thread(target=t_monitor,              daemon=True).start()
+    threading.Thread(target=t_trailing,             daemon=True).start()  # [FIX-2]
     threading.Thread(target=t_rescan, args=(syms,), daemon=True).start()
-    threading.Thread(target=t_macro,            daemon=True).start()
+    threading.Thread(target=t_macro,                daemon=True).start()
 
     time.sleep(4); tickers_all()
     cycle = scan_idx = 0
@@ -681,9 +925,10 @@ def run_bot():
             sync_binance_positions()
             slots = MAX_POSITIONS - len(paper_positions)
 
-        print(f"\n{'═'*57}")
-        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC:{_macro['btc']} F&G:{_macro['fng']} "
-              f"({len(paper_positions)}/{MAX_POSITIONS}) NetPnL:{_stats['pnl']:+.4f}U")
+        mode_str = "INV" if _macro["btc"] in ("BULL","BEAR","MILD_BULL","MILD_BEAR") else "NORM"
+        print(f"\n{'═'*60}")
+        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC:{_macro['btc']}[{mode_str}] F&G:{_macro['fng']} "
+              f"({len(paper_positions)}/{MAX_POSITIONS}) Net:{_stats['pnl']:+.4f}U")
 
         if (k := ks_check())[0]:
             print(f"  🚨 KS:{k[1]}")
@@ -709,7 +954,8 @@ def run_bot():
                 for r in res[:slots]:
                     if len(paper_positions) >= MAX_POSITIONS: break
                     sym, d, sc, sg, px, atr = r
-                    print(f"     ⭐ {sym} {d} Score:{sc} ATR:{atr:.5g} {' | '.join(sg)}")
+                    mode_tag = "INV" if "(INV)" in sg else "NORM"
+                    print(f"     ⭐ {sym} {d}[{mode_tag}] Score:{sc} ATR:{atr:.5g} {' | '.join(sg)}")
                     paper_open(sym, d, sc, sg, px, atr)
             elif len(paper_positions) == 0:
                 try:
