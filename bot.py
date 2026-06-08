@@ -24,6 +24,11 @@ MASALAH v19.0 yang diperbaiki:
     - VWAP sebagai filter arah
     - Order book imbalance proxy (taker buy ratio lebih sensitif)
 
+  [FIX v20.0 — TESTNET AUTH]
+    - Tambah testnet=True di Client init agar headers & URL benar
+    - Tambah futures account check saat startup sebelum bot jalan
+    - Jika -1109 saat startup, bot berhenti + tampilkan panduan fix
+
   PARAMETER UTAMA:
     - LEVERAGE = 20, ORDER_USDT = 2.0 (margin per posisi)
     - TP = 0.4%, SL = 0.2% (RR 2:1 — butuh WR > 34% untuk profit)
@@ -42,13 +47,18 @@ from binance.client import Client
 import ta
 import pandas as pd
 import numpy as np
-# SESUDAH
+
+load_dotenv()
+
+# ═══════════════════════════════════════════════════════
+#  CLIENT INIT — testnet=True wajib untuk futures testnet
+# ═══════════════════════════════════════════════════════
 client = Client(
     os.getenv("API_KEY"),
     os.getenv("API_SECRET"),
-    testnet=True  # ← ini set base URL + headers yang benar untuk testnet
+    testnet=True   # ← FIX -1109: set base URL + auth headers testnet
 )
-# Override futures URL tetap perlu
+# Override ke futures testnet URL
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
@@ -68,45 +78,44 @@ EXTREME_PROFIT_PCT = 0.004  # 0.4% TP
 HARD_SL_PCT        = 0.002  # 0.2% SL
 
 # ─── ATR FILTER ────────────────────────────────────────
-# TP=0.4%, jadi ATR minimal harus ada ruang gerak
 ATR_MIN_RATIO  = 0.0002     # ATR/price > 0.02% (ada volatilitas)
 ATR_MAX_RATIO  = 0.008      # ATR/price < 0.8% (tidak terlalu liar)
 
 # ─── TRAILING STOP ─────────────────────────────────────
-TRAIL_PCT      = 0.0015     # 0.15% — lebih ketat dari 0.3%, protect profit lebih awal
+TRAIL_PCT      = 0.0015     # 0.15%
 
 # ─── FEE BUDGET ────────────────────────────────────────
 FEE_BUDGET_RATIO = 0.25     # max 25% dari expected TP profit
 TAKER_FEE_RATE   = 0.0004   # 0.04% per side
 
 # ─── VOLUME & SIGNAL FILTER ────────────────────────────
-MIN_BASE_VOL   = 15_000_000  # Turun dari 25M → 15M (lebih banyak coin tersedia)
-MIN_VR         = 1.0         # Turun dari 1.1 → 1.0 (lebih sensitif)
-BR_LONG_MIN    = 0.45        # Sedikit lebih longgar
+MIN_BASE_VOL   = 15_000_000
+MIN_VR         = 1.0
+BR_LONG_MIN    = 0.45
 BR_SHORT_MAX   = 0.55
 
 # ─── SCAN SPEED ────────────────────────────────────────
 SCAN_INTERVAL  = 1
-SCAN_DELAY     = 0.008       # Turun dari 0.015 → 0.008 (scan lebih cepat)
-BATCH_SIZE     = 20          # Naik dari 15 → 20
-MAX_WORKERS    = 12          # Naik dari 8 → 12
+SCAN_DELAY     = 0.008
+BATCH_SIZE     = 20
+MAX_WORKERS    = 12
 
 # ─── SCORE THRESHOLD ───────────────────────────────────
-MIN_SCORE      = 38          # Turun dari 45 → 38 (lebih sering entry)
-MIN_SCORE_SW   = 45          # Sideways: turun dari 55 → 45
-MIN_GAP        = 10          # Turun dari 15 → 10
+MIN_SCORE      = 38
+MIN_SCORE_SW   = 45
+MIN_GAP        = 10
 
 # ─── COOLDOWN & KILL SWITCH ────────────────────────────
-COOLDOWN_SEC   = 8           # Turun dari 15 → 8
-TRAIL_CHECK_INTERVAL = 1.5   # Lebih sering check trailing
-DAILY_LOSS     = -8.0        # Sedikit lebih longgar dari -6
+COOLDOWN_SEC   = 8
+TRAIL_CHECK_INTERVAL = 1.5
+DAILY_LOSS     = -8.0
 CONSEC_MAX     = 6
 CONSEC_PAUSE   = 60
 TTL_5M         = 5
 TTL_1M         = 2
 
 # ═══════════════════════════════════════════════════════
-#  SYMBOLS — fokus coin dengan volume & volatilitas tinggi
+#  SYMBOLS
 # ═══════════════════════════════════════════════════════
 SYMBOLS = [
     # Tier-1: liquid + volatile
@@ -163,8 +172,8 @@ def get_precision_rules(sym):
         info = client.futures_exchange_info()
         for item in info['symbols']:
             if item['symbol'] == sym:
-                prec     = item['quantityPrecision']
-                p_prec   = item['pricePrecision']
+                prec         = item['quantityPrecision']
+                p_prec       = item['pricePrecision']
                 step_size    = 0.0
                 min_notional = 5.0
                 for f in item['filters']:
@@ -193,7 +202,7 @@ def qty(price, sym):
 # ═══════════════════════════════════════════════════════
 def check_fee_budget(price, q):
     notional         = q * price
-    estimated_fee    = notional * TAKER_FEE_RATE * 2  # open + close
+    estimated_fee    = notional * TAKER_FEE_RATE * 2
     tp_profit_actual = notional * EXTREME_PROFIT_PCT
     if tp_profit_actual == 0:
         return False
@@ -252,7 +261,6 @@ def ohlcv(symbol, interval, limit=100):
         return _ohlcv_cache.get(key, (None, None))[1]
 
 def run_ta(df):
-    """TA indicators untuk 5m candle."""
     c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
     df["rsi"]  = ta.momentum.RSIIndicator(c, 14).rsi()
     df["mh"]   = ta.trend.MACD(c, 12, 26, 9).macd_diff()
@@ -267,20 +275,18 @@ def run_ta(df):
     df["br"]   = df["tbbase"] / df["volume"].replace(0, 1)
     df["body"] = abs(c - df["open"])
     df["rng"]  = h - l
-    df["m3"]   = (c - c.shift(3)) / c.shift(3).replace(0, 1)   # momentum 3 candle
+    df["m3"]   = (c - c.shift(3)) / c.shift(3).replace(0, 1)
     df["m5"]   = (c - c.shift(5)) / c.shift(5).replace(0, 1)
-    # VWAP sederhana (rolling 20 bar)
     tp = (h + l + c) / 3
     df["vwap"] = (tp * v).rolling(20).sum() / v.rolling(20).sum()
     return df
 
 def run_ta_1m(df):
-    """TA cepat untuk konfirmasi 1m."""
     c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
-    df["rsi1"] = ta.momentum.RSIIndicator(c, 7).rsi()   # RSI lebih cepat
+    df["rsi1"] = ta.momentum.RSIIndicator(c, 7).rsi()
     df["e3"]   = ta.trend.EMAIndicator(c, 3).ema_indicator()
     df["e8"]   = ta.trend.EMAIndicator(c, 8).ema_indicator()
-    df["mh1"]  = ta.trend.MACD(c, 6, 13, 4).macd_diff()  # MACD lebih cepat
+    df["mh1"]  = ta.trend.MACD(c, 6, 13, 4).macd_diff()
     df["vm1"]  = v.rolling(10).mean()
     df["vr1"]  = v / df["vm1"].replace(0, 1)
     df["m2"]   = (c - c.shift(2)) / c.shift(2).replace(0, 1)
@@ -291,8 +297,8 @@ def btc_trend():
         df  = run_ta(ohlcv("BTCUSDT", Client.KLINE_INTERVAL_5MINUTE, 80).copy())
         row = df.iloc[-2]
         p, e5, e9, e21, m5 = row["close"], row["e5"], row["e9"], row["e21"], row["m5"]
-        if p > e5 > e9 > e21 and m5 > 0.001:   return "BULL"
-        if p < e5 < e9 < e21 and m5 < -0.001:  return "BEAR"
+        if p > e5 > e9 > e21 and m5 > 0.001:  return "BULL"
+        if p < e5 < e9 < e21 and m5 < -0.001: return "BEAR"
         if p > e9 > e21:  return "MILD_BULL"
         if p < e9 < e21:  return "MILD_BEAR"
         return "SIDEWAYS"
@@ -328,14 +334,9 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  COIN SCORING — pilih coin terbaik sebelum entry
+#  COIN SCORING
 # ═══════════════════════════════════════════════════════
 def coin_quality_score(sym):
-    """
-    Skor kualitas coin untuk prioritas entry.
-    Faktor: volume, % change, volatilitas historis.
-    Return score 0-100.
-    """
     tk = _ticker_cache
     if sym not in tk:
         return 0
@@ -344,19 +345,16 @@ def coin_quality_score(sym):
     pct  = abs(t["pct"])
     score = 0
 
-    # Volume score (0-40)
     if vol >= 100_000_000:  score += 40
     elif vol >= 50_000_000: score += 30
     elif vol >= 25_000_000: score += 20
     elif vol >= 15_000_000: score += 10
 
-    # % change score — volatile tapi tidak terlalu jauh (0-35)
-    if 0.5 <= pct <= 2.0:   score += 35   # sweet spot
+    if 0.5 <= pct <= 2.0:   score += 35
     elif 0.3 <= pct < 0.5:  score += 20
-    elif 2.0 < pct <= 4.0:  score += 25   # masih bagus
-    elif pct > 4.0:         score += 10   # sudah over-extended
+    elif 2.0 < pct <= 4.0:  score += 25
+    elif pct > 4.0:         score += 10
 
-    # Bonus tier-1 coins
     if sym in ("BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT"):
         score += 25
 
@@ -366,15 +364,6 @@ def coin_quality_score(sym):
 #  SIGNAL ENGINE v20 — DUAL TIMEFRAME + VWAP + 1M CONFIRM
 # ═══════════════════════════════════════════════════════
 def signal(df5, df1=None):
-    """
-    Signal engine dengan dual timeframe (5m primary + 1m confirm).
-
-    Perubahan dari v19:
-    1. VWAP filter — harga harus di atas/bawah VWAP untuk konfirmasi arah
-    2. 1m momentum check — konfirmasi arah sebelum entry
-    3. Score lebih agresif tapi filter lebih cerdas
-    4. ATR check lebih relaxed karena TP/SL sudah lebih kecil
-    """
     if df5 is None or len(df5) < 55:
         return None, 0, [], 0.0
 
@@ -390,7 +379,6 @@ def signal(df5, df1=None):
     vwap    = row["vwap"]
     btc     = _macro["btc"]
 
-    # ── ATR filter ──────────────────────────────────────
     atr_ratio = atr / p if p > 0 else 0
     if atr_ratio < ATR_MIN_RATIO or atr_ratio > ATR_MAX_RATIO:
         _stats["skipped_atr"] += 1
@@ -399,7 +387,6 @@ def signal(df5, df1=None):
     if vr < MIN_VR:
         return None, 0, [], atr
 
-    # ── BTC context ─────────────────────────────────────
     is_sideways  = btc in ("SIDEWAYS", "UNKNOWN")
     use_inverse  = btc in ("BULL", "BEAR", "MILD_BULL", "MILD_BEAR")
     score_thresh = MIN_SCORE_SW if is_sideways else MIN_SCORE
@@ -407,7 +394,7 @@ def signal(df5, df1=None):
     lp = sp = 0
     sl, ss  = [], []
 
-    # ── EMA stack (30-22 poin) ──────────────────────────
+    # EMA stack
     if p > e5 > e9 > e21 > e50:   lp += 30; sl.append("EMA4↑")
     elif p > e5 > e9 > e21:       lp += 22; sl.append("EMA3↑")
     elif p > e9 > e21:            lp += 12; sl.append("EMA2↑")
@@ -416,7 +403,7 @@ def signal(df5, df1=None):
     elif p < e5 < e9 < e21:       sp += 22; ss.append("EMA3↓")
     elif p < e9 < e21:            sp += 12; ss.append("EMA2↓")
 
-    # ── VWAP filter (15-8 poin) ─────────────────────────
+    # VWAP
     if not pd.isna(vwap):
         vwap_pct = (p - vwap) / vwap if vwap > 0 else 0
         if vwap_pct > 0.001:   lp += 15; sl.append(f"VWAP+{vwap_pct*100:.1f}%")
@@ -424,22 +411,22 @@ def signal(df5, df1=None):
         if vwap_pct < -0.001:  sp += 15; ss.append(f"VWAP-{abs(vwap_pct)*100:.1f}%")
         elif vwap_pct < 0:     sp += 8;  ss.append("VWAP-")
 
-    # ── Momentum 3-bar & 5-bar (20-10 poin) ────────────
+    # Momentum
     if m3 > 0.004:    lp += 20; sl.append(f"M3+{m3*100:.1f}%")
     elif m3 > 0.002:  lp += 12; sl.append(f"M3+{m3*100:.1f}%")
     if m3 < -0.004:   sp += 20; ss.append(f"M3{m3*100:.1f}%")
     elif m3 < -0.002: sp += 12; ss.append(f"M3{m3*100:.1f}%")
 
-    if m5 > 0.006:    lp += 15; sl.append(f"M5+")
-    if m5 < -0.006:   sp += 15; ss.append(f"M5-")
+    if m5 > 0.006:    lp += 15; sl.append("M5+")
+    if m5 < -0.006:   sp += 15; ss.append("M5-")
 
-    # ── MACD crossover (20-15 poin) ─────────────────────
-    if mh_p <= 0 and mh > 0:           lp += 20; sl.append("MACD_X↑")
-    elif mh > 0 and mh > mh_p > mh_p2: lp += 15; sl.append("MACD↑↑")
-    if mh_p >= 0 and mh < 0:           sp += 20; ss.append("MACD_X↓")
-    elif mh < 0 and mh < mh_p < mh_p2: sp += 15; ss.append("MACD↓↓")
+    # MACD
+    if mh_p <= 0 and mh > 0:            lp += 20; sl.append("MACD_X↑")
+    elif mh > 0 and mh > mh_p > mh_p2:  lp += 15; sl.append("MACD↑↑")
+    if mh_p >= 0 and mh < 0:            sp += 20; ss.append("MACD_X↓")
+    elif mh < 0 and mh < mh_p < mh_p2:  sp += 15; ss.append("MACD↓↓")
 
-    # ── Volume (15-8 poin) ──────────────────────────────
+    # Volume
     if vr >= 3.0:
         lp += 15; sp += 15
         sl.append(f"Vol{vr:.1f}x"); ss.append(f"Vol{vr:.1f}x")
@@ -449,13 +436,13 @@ def signal(df5, df1=None):
     elif vr >= 1.5:
         lp += 5; sp += 5
 
-    # ── Buy/Sell ratio (18-10 poin) ─────────────────────
+    # Buy/Sell ratio
     if br > 0.62:   lp += 18; sl.append(f"Buy{br:.0%}")
     elif br > 0.55: lp += 10; sl.append(f"Buy{br:.0%}")
     if br < 0.38:   sp += 18; ss.append(f"Sell{1-br:.0%}")
     elif br < 0.45: sp += 10; ss.append(f"Sell{1-br:.0%}")
 
-    # ── RSI filter ──────────────────────────────────────
+    # RSI
     if rsi > 78:
         lp = int(lp * 0.35); sp += 15; ss.append(f"OB{rsi:.0f}")
     elif rsi > 70:
@@ -465,34 +452,29 @@ def signal(df5, df1=None):
     elif rsi < 30:
         sp = int(sp * 0.6)
 
-    # ── ADX (trend strength) ────────────────────────────
+    # ADX
     if adx > 30:
         lp += 10; sp += 10
         sl.append(f"ADX{adx:.0f}"); ss.append(f"ADX{adx:.0f}")
     elif adx < 15:
-        # Trend lemah — kurangi score kedua arah
         lp = int(lp * 0.8)
         sp = int(sp * 0.8)
 
-    # ── 1m konfirmasi (bonus 15 poin) ───────────────────
+    # 1m konfirmasi
     if df1 is not None and len(df1) >= 20:
         try:
-            r1  = df1.iloc[-2]
-            m2  = r1["m2"]
-            e3  = r1["e3"]
-            e8  = r1["e8"]
+            r1   = df1.iloc[-2]
+            m2   = r1["m2"]
+            e3   = r1["e3"]
+            e8   = r1["e8"]
             rsi1 = r1["rsi1"]
             mh1  = r1["mh1"]
-            vr1  = r1["vr1"]
-            p1   = r1["close"]
 
-            # 1m LONG konfirmasi
             if m2 > 0.001 and e3 > e8 and rsi1 < 75:
                 lp += 15; sl.append("1m↑")
             elif m2 > 0.0005 and mh1 > 0:
                 lp += 8
 
-            # 1m SHORT konfirmasi
             if m2 < -0.001 and e3 < e8 and rsi1 > 25:
                 sp += 15; ss.append("1m↓")
             elif m2 < -0.0005 and mh1 < 0:
@@ -502,7 +484,6 @@ def signal(df5, df1=None):
 
     gap = abs(lp - sp)
 
-    # ── Determine raw direction ──────────────────────────
     if lp > sp and lp >= score_thresh and gap >= MIN_GAP:
         raw_dir, raw_sc, raw_sigs = "LONG", lp, sl[:4]
     elif sp > lp and sp >= score_thresh and gap >= MIN_GAP:
@@ -510,7 +491,6 @@ def signal(df5, df1=None):
     else:
         return None, max(lp, sp), [], atr
 
-    # ── Inverse mode (saat BTC trend jelas) ─────────────
     if use_inverse:
         final_dir  = "SHORT" if raw_dir == "LONG" else "LONG"
         final_sigs = raw_sigs + ["(INV)"]
@@ -518,7 +498,6 @@ def signal(df5, df1=None):
         final_dir  = raw_dir
         final_sigs = raw_sigs + ["(NRM)"]
 
-    # ── Buy ratio check ──────────────────────────────────
     if final_dir == "LONG"  and br <= BR_LONG_MIN:  return None, raw_sc, [], atr
     if final_dir == "SHORT" and br >= BR_SHORT_MAX: return None, raw_sc, [], atr
 
@@ -567,7 +546,7 @@ def paper_open(sym, direction, score, sigs, price, atr):
     with _lock:
         if sym in paper_positions or len(paper_positions) >= MAX_POSITIONS:
             return
-        paper_positions[sym] = {"_r": True}  # placeholder
+        paper_positions[sym] = {"_r": True}
 
     _logged_closes.discard(sym)
     _position_open_ts[sym] = int(time.time() * 1000)
@@ -579,7 +558,6 @@ def paper_open(sym, direction, score, sigs, price, atr):
             with _lock: paper_positions.pop(sym, None)
             return
 
-        # Fee budget check
         if not check_fee_budget(price, q):
             print(f"  ⚠️ [FEE SKIP] {sym} — fee ratio terlalu tinggi")
             _stats["skipped_fee"] += 1
@@ -639,7 +617,7 @@ def paper_open(sym, direction, score, sigs, price, atr):
         paper_positions[sym] = pos
         _position_peak[sym]  = exec_price
 
-    d = "🟢" if direction == "LONG" else "🔴"
+    d            = "🟢" if direction == "LONG" else "🔴"
     notional     = q * exec_price
     real_margin  = notional / LEVERAGE
     expected_tp  = notional * EXTREME_PROFIT_PCT
@@ -682,7 +660,7 @@ def update_trailing_stops():
                     if current_price <= new_trail_sl and current_price > pos_live["sl"]:
                         _execute_trailing_close(sym, pos_live, current_price, "TRAIL↓")
 
-                else:  # SHORT
+                else:
                     new_peak     = min(pos_live.get("trail_peak", current_price), current_price)
                     new_trail_sl = round(new_peak * (1 + TRAIL_PCT), p_prec)
                     new_trail_sl = min(new_trail_sl, pos_live["sl"])
@@ -822,7 +800,6 @@ def scan_one(sym):
         if sym in tk and tk[sym]["vol"] < MIN_BASE_VOL:
             return None
 
-        # Ambil 5m dan 1m data
         df5 = ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100)
         df1 = ohlcv(sym, Client.KLINE_INTERVAL_1MINUTE, 50)
         if df5 is None or len(df5) < 55:
@@ -832,7 +809,6 @@ def scan_one(sym):
         df1 = run_ta_1m(df1.copy()) if df1 is not None and len(df1) >= 20 else None
 
         px  = df5["close"].iloc[-2]
-        atr = df5["atr"].iloc[-2]
         if px == 0:
             return None
 
@@ -844,9 +820,8 @@ def scan_one(sym):
         if px_live == 0:
             return None
 
-        # Tambah coin quality ke score
-        cq = coin_quality_score(sym)
-        final_score = sc + int(cq * 0.2)  # bonus max 20 poin dari coin quality
+        cq          = coin_quality_score(sym)
+        final_score = sc + int(cq * 0.2)
 
         return (sym, dir_, final_score, sigs, px_live, atr_val)
     except:
@@ -864,19 +839,16 @@ def scan_batch(syms):
     return res
 
 def top_movers(syms, n=25):
-    """Pilih coin dengan volume + volatilitas terbaik."""
     tk = tickers_all()
     ss = set(syms)
-    # Gabungkan % change dan volume untuk ranking
     mv = []
     for s, d in tk.items():
         if s not in ss or d["vol"] < MIN_BASE_VOL:
             continue
-        pct = abs(d["pct"])
-        vol = d["vol"]
-        # Score: volatilitas 1-4% adalah sweet spot
-        vol_score = min(vol / 10_000_000, 10)   # max 10
-        pct_score = 10 - abs(pct - 2.0)         # peak di 2%, berkurang jika terlalu tinggi/rendah
+        pct       = abs(d["pct"])
+        vol       = d["vol"]
+        vol_score = min(vol / 10_000_000, 10)
+        pct_score = 10 - abs(pct - 2.0)
         combined  = vol_score + max(pct_score, 0)
         mv.append((s, combined))
     return [s for s, _ in sorted(mv, key=lambda x: x[1], reverse=True)[:n]]
@@ -911,9 +883,8 @@ def print_full():
         eq = np.cumsum(list(_stats["hist"]))
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
-    # Break-even WR berdasarkan RR aktual
-    rr_ratio = EXTREME_PROFIT_PCT / HARD_SL_PCT  # = 2.0
-    be_wr    = 100 / (1 + rr_ratio)               # = 33.3%
+    rr_ratio = EXTREME_PROFIT_PCT / HARD_SL_PCT
+    be_wr    = 100 / (1 + rr_ratio)
 
     print(f"\n  {'─'*68}")
     print(f"  🚀 BOT SCALPING v20.0 — {sess*60:.0f}m | {tph:.1f}T/jam")
@@ -1003,6 +974,28 @@ def t_macro():
 #  MAIN LOOP
 # ═══════════════════════════════════════════════════════
 def run_bot():
+    # ── FIX -1109: Verifikasi futures account SEBELUM jalan ─────────
+    print("  🔑 Memeriksa koneksi Futures Testnet...")
+    try:
+        acc = client.futures_account()
+        bal = next(
+            (b for b in acc.get("assets", []) if b["asset"] == "USDT"),
+            {}
+        )
+        wallet = float(bal.get("walletBalance", 0))
+        print(f"  ✅ Futures Testnet OK | Balance: {wallet:.2f} USDT")
+    except Exception as e:
+        print(f"\n  ❌ GAGAL KONEK KE FUTURES TESTNET: {e}")
+        print(f"  ─────────────────────────────────────────────────────")
+        print(f"  Panduan fix:")
+        print(f"  1. Buka https://testnet.binancefuture.com")
+        print(f"  2. Login → klik nama akun → API Key → generate key baru")
+        print(f"  3. Salin API_KEY dan API_SECRET ke file .env kamu")
+        print(f"  4. JANGAN pakai key dari testnet.binance.vision (itu spot)")
+        print(f"  5. Pastikan .env tidak ada spasi/newline di value")
+        print(f"  ─────────────────────────────────────────────────────")
+        return
+
     print("╔══════════════════════════════════════════════════════════════╗")
     print("║  🚀 BOT SCALPING v20.0 — SPEED-FIRST REBUILD                ║")
     print("╠══════════════════════════════════════════════════════════════╣")
@@ -1056,18 +1049,16 @@ def run_bot():
             continue
 
         if slots > 0:
-            # Ambil top movers (volatilitas + volume terbaik)
             mv = top_movers(syms, 25)
             mv = [s for s in mv if s not in paper_positions]
 
-            # Scan batch reguler
             bs  = scan_idx * BATCH_SIZE
             reg = [
                 s for s in syms[bs:bs+BATCH_SIZE]
                 if s not in paper_positions and s not in mv
             ]
             scan_idx  = (scan_idx + 1) % n_bat
-            scan_list = mv[:18] + reg[:10]  # prioritas movers
+            scan_list = mv[:18] + reg[:10]
 
             try:
                 res = scan_batch(scan_list)
@@ -1075,19 +1066,17 @@ def run_bot():
                 res = []
 
             if res:
-                # Sort by score (coin quality sudah masuk ke score)
                 res.sort(key=lambda x: x[2], reverse=True)
                 for r in res[:slots]:
                     if len(paper_positions) >= MAX_POSITIONS:
                         break
                     sym, d, sc, sg, px, atr = r
-                    cq  = coin_quality_score(sym)
+                    cq       = coin_quality_score(sym)
                     mode_tag = "INV" if "(INV)" in sg else "NRM"
                     print(f"     ⭐ {sym} {d}[{mode_tag}] Score:{sc}(CQ:{cq}) ATR:{atr:.4g} → {' | '.join(sg[:3])}")
                     paper_open(sym, d, sc, sg, px, atr)
 
             elif len(paper_positions) == 0:
-                # Full scan jika tidak ada posisi sama sekali
                 try:
                     r2 = scan_batch([s for s in syms if s not in paper_positions])
                 except:
