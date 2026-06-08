@@ -44,8 +44,8 @@ import pandas as pd
 import numpy as np
 
 load_dotenv()
-
-client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"), testnet=True)
+client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
+client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
 #  CONFIG v20.0 — SPEED-FIRST
