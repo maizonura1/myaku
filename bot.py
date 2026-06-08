@@ -1,8 +1,9 @@
 """
-Bot Scalping v18.3 — DRY RUN LOG MODE (REVERSED LOGIC)
-====================================================
+Bot Scalping v18.3 — DRY RUN LOG MODE (REVERSED LOGIC — NO TIMEOUT)
+==================================================================
 - INVERSE MODE: Sinyal LONG dieksekusi SHORT, sinyal SHORT dieksekusi LONG.
-- REVERSED LOGIC: Profit jadi Loss, Loss jadi Profit. Impatient Cut jadi Impatient Profit.
+- REVERSED LOGIC: Profit jadi Loss, Loss jadi Profit.
+- IMPATIENT TIMEOUT REMOVED: Tidak ada lagi cut otomatis 5 detik.
 - EXECUTION: LOG ONLY (Tidak melakukan order ke Binance Testnet).
 """
 
@@ -21,7 +22,7 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v18.3 - REVERSED LOGIC EXTREME
+#  CONFIG v18.3 - REVERSED LOGIC EXTREME (NO TIMEOUT)
 # ═══════════════════════════════════════════════════════
 INVERSE_MODE   = True   
 
@@ -29,9 +30,9 @@ LEVERAGE       = 20
 ORDER_USDT     = 2.0
 MAX_POSITIONS  = 3
 
-# ── TARGET FIXED (REVERSED REGIME) ────────────
-EXTREME_PROFIT_PCT = 0.0040  # Sekarang dipicu saat minus -0.4%
-HARD_SL_PCT        = 0.0020  # Sekarang dipicu saat plus +0.2%
+# ── TARGET FIXED (Biarkan running sampai target tercapai) ────────────
+EXTREME_PROFIT_PCT = 0.0040  # Dipicu saat minus -0.4% (Secara real)
+HARD_SL_PCT        = 0.0020  # Dipicu saat plus +0.2% (Secara real)
 FUTURES_FEE_PCT    = 0.0005  
 
 MIN_BASE_VOL   = 25_000_000
@@ -83,7 +84,7 @@ _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
 _ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0, "impatient_profit": 0, "force": 0,
+    "extreme_tp": 0, "hard_sl": 0, "force": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
@@ -186,7 +187,6 @@ def ks_check():
 
 def ks_upd(pnl):
     _ks["daily"] += pnl
-    # DIBALIK: Kalau pnl minus (yang sekarang dianggap win), consec loss di-reset ke 0
     _ks["consec"] = 0 if pnl <= 0 else _ks["consec"] + 1
 
 def signal(df):
@@ -242,7 +242,7 @@ def signal(df):
     return "LONG", lp, sl[:3], atr
 
 # ═══════════════════════════════════════════════════════
-#  DRY RUN OPEN / CLOSE (LOGIC REVERSED)
+#  DRY RUN OPEN / CLOSE
 # ═══════════════════════════════════════════════════════
 def live_open(sym, direction, score, sigs, price, atr):
     with _lock:
@@ -271,7 +271,6 @@ def live_close(sym, reason, price=None):
     if price is None: price = price_live(sym)
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
 
-    # Perhitungan asli PnL pasar
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
     open_fee = (entry * q_val) * FUTURES_FEE_PCT
     close_fee = (price * q_val) * FUTURES_FEE_PCT
@@ -281,7 +280,6 @@ def live_close(sym, reason, price=None):
     pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
     hold = time.time() - pos["open_time"]
     
-    # DIBALIK TOTAL: Jika pnl <= 0 (rugi di real), bot mencatatnya sebagai WIN (Untung secara logika baru)
     is_reversed_win = (pnl <= 0)
     e = "🟢" if is_reversed_win else "🔴"
 
@@ -294,14 +292,13 @@ def live_close(sym, reason, price=None):
 
     if is_reversed_win:
         _stats["wins"] += 1
-        if pnl < _stats["best"]: _stats["best"] = pnl  # Nilai minus terbesar adalah profit terbaik
+        if pnl < _stats["best"]: _stats["best"] = pnl  
     else:
         _stats["losses"] += 1
         if pnl > _stats["worst"]: _stats["worst"] = pnl
 
     if "ExtremeProfit" in reason: _stats["extreme_tp"] += 1
     elif "HardSL" in reason: _stats["hard_sl"] += 1
-    elif "ImpatientProfit" in reason: _stats["impatient_profit"] += 1
 
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
@@ -311,7 +308,7 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR LOGIC (TARGETS & TIMEOUT REVERSED)
+#  MONITOR LOGIC (TIMEOUT REMOVED)
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -325,17 +322,10 @@ def monitor_positions():
 
         if side == "LONG":
             prof_pct = (px - entry) / entry
-            # DIBALIK: Jika harga turun melewati batas minus (Extreme Profit versi balik)
             if prof_pct <= -EXTREME_PROFIT_PCT:
                 live_close(sym, "ExtremeProfit", px); continue
-            # DIBALIK: Jika harga naik melewati batas plus (Hard SL versi balik)
             if prof_pct >= HARD_SL_PCT:
                 live_close(sym, "HardSL", px); continue
-            # DIBALIK: Impatient Profit jika setelah 5s posisi berstatus minus (dianggap profit)
-            if hold >= 5:
-                if prof_pct < 0: live_close(sym, "ImpatientProfit", px)
-                else: live_close(sym, "ImpatientLoss", px)
-                continue
             pnl_now = ((px - entry) * pos["qty"]) - (((entry * pos["qty"]) * FUTURES_FEE_PCT) + ((px * pos["qty"]) * FUTURES_FEE_PCT))
             print(f"   📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [REVERSED]")
 
@@ -345,10 +335,6 @@ def monitor_positions():
                 live_close(sym, "ExtremeProfit", px); continue
             if prof_pct >= HARD_SL_PCT:
                 live_close(sym, "HardSL", px); continue
-            if hold >= 5:
-                if prof_pct < 0: live_close(sym, "ImpatientProfit", px)
-                else: live_close(sym, "ImpatientLoss", px)
-                continue
             pnl_now = ((entry - px) * pos["qty"]) - (((entry * pos["qty"]) * FUTURES_FEE_PCT) + ((px * pos["qty"]) * FUTURES_FEE_PCT))
             print(f"   📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [REVERSED]")
 
@@ -388,10 +374,9 @@ def top_movers(syms, n=20):
 def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
-    # Indikator warna PnL Net utama disesuaikan jika bernilai minus justru hijau (Win)
     e = "💚" if _stats["pnl"] <= 0 else "🔴"
     print(f"      ┌ [v18.3 REV] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net Real:{_stats['pnl']:+.4f}U")
-    print(f"      └ Ex-Profit:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']} Imp-Profit:{_stats['impatient_profit']}")
+    print(f"      └ Ex-Profit:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
 
 def print_full():
     n = _stats["wins"] + _stats["losses"]
