@@ -42,9 +42,13 @@ from binance.client import Client
 import ta
 import pandas as pd
 import numpy as np
-
-load_dotenv()
-client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
+# SESUDAH
+client = Client(
+    os.getenv("API_KEY"),
+    os.getenv("API_SECRET"),
+    testnet=True  # ← ini set base URL + headers yang benar untuk testnet
+)
+# Override futures URL tetap perlu
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
