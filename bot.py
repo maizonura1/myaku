@@ -1,12 +1,12 @@
 """
-Bot Scalping v18.3.2 — DRY RUN LOG MODE (PAPER TRADING)
+Bot Scalping v18.3.3 — DRY RUN LOG MODE (PAPER TRADING)
 ====================================================
-- NORMAL MODE: Sinyal LONG dieksekusi LONG, sinyal SHORT dieksekusi SHORT.
+- INVERSE MODE: Sinyal LONG dieksekusi SHORT, sinyal SHORT dieksekusi LONG.
 - EXECUTION: LOG ONLY (Tidak melakukan order ke Binance Testnet).
 - FEE CALCULATION: PnL yang ditampilkan tetap dipotong fee Taker Binance (0.05% per transaksi).
-- MODIFICATION: Menghapus total fitur Impatient Cut (Hold > 5s). TP & SL disamakan (0.2%).
-- v18.3.2 FIX: EXTREME_PROFIT_PCT dinaikkan ke 0.7% (3.5x lipat SL 0.2%)
-               agar effective R:R positif setelah fee.
+- v18.3.3 FIX: INVERSE_MODE diaktifkan (True) karena WR 26% pada v18.3.2
+               menunjukkan sinyal konsisten terbalik dari arah market.
+               Membalik eksekusi: LONG→SHORT, SHORT→LONG.
                Net TP after fee: +0.60% | Net SL after fee: -0.30% | R:R = 2:1
 """
 
@@ -25,21 +25,16 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v18.3.2 - NORMAL EXTREME PROFIT (R:R FIXED)
+#  CONFIG v18.3.3 - INVERSE MODE ACTIVATED
 # ═══════════════════════════════════════════════════════
-INVERSE_MODE   = False   
+INVERSE_MODE   = True   # ← DIUBAH dari False ke True (v18.3.3)
 
 LEVERAGE       = 20
 ORDER_USDT     = 2.0
 MAX_POSITIONS  = 3
 
-# ── TARGET FIXED ────────────────────────────────────────
-# v18.3.2: TP dinaikkan 0.2% → 0.7% agar R:R positif setelah fee
-#   Gross TP  : +0.70%  →  Net TP after fee  : +0.60%
-#   Gross SL  : -0.20%  →  Net SL after fee  : -0.30%
-#   Effective R:R = 2:1  |  Break-even WR = 33%  (vs 55% aktual)
-EXTREME_PROFIT_PCT = 0.0070  # +0.7% Take Profit  ← DIUBAH dari 0.0020
-HARD_SL_PCT        = 0.0020  # -0.2% Hard Cut Loss (tidak diubah)
+EXTREME_PROFIT_PCT = 0.0070  # +0.7% Take Profit
+HARD_SL_PCT        = 0.0020  # -0.2% Hard Cut Loss
 FUTURES_FEE_PCT    = 0.0005  # Fee Taker Binance 0.05%
 
 MIN_BASE_VOL   = 25_000_000
@@ -53,7 +48,7 @@ SCAN_DELAY     = 0.015
 BATCH_SIZE     = 15
 MAX_WORKERS    = 8
 
-MIN_SCORE      = 52  # ← DIUBAH dari 40 (v18.3.2): filter sinyal lemah
+MIN_SCORE      = 52
 MIN_GAP        = 10
 COOLDOWN_SEC   = 3
 
@@ -238,14 +233,25 @@ def signal(df):
     thresh = 40 if btc_sw else MIN_SCORE
     gap    = abs(lp - sp)
 
+    # ── INVERSE MODE: balik arah eksekusi ──────────────────────
+    if INVERSE_MODE:
+        # Sinyal asli LONG → eksekusi SHORT
+        if lp > sp and lp >= thresh and gap >= MIN_GAP:
+            if br <= BR_LONG_MIN: return None, lp, [], atr  # filter tetap berlaku
+            return "SHORT", lp, sl[:3] + ["(INV)"], atr
+        # Sinyal asli SHORT → eksekusi LONG
+        if sp > lp and sp >= thresh and gap >= MIN_GAP:
+            if br >= BR_SHORT_MAX: return None, sp, [], atr  # filter tetap berlaku
+            return "LONG", sp, ss[:3] + ["(INV)"], atr
+        return None, max(lp, sp), [], atr
+
+    # ── NORMAL MODE ─────────────────────────────────────────────
     if lp <= sp or lp < thresh or gap < MIN_GAP:
         if sp <= lp or sp < thresh or gap < MIN_GAP: return None, max(lp, sp), [], atr
-        if br >= BR_SHORT_MAX: return None, sp, [], atr  
-        if INVERSE_MODE: return "LONG", sp, ss[:3] + ["(INV)"], atr
+        if br >= BR_SHORT_MAX: return None, sp, [], atr
         return "SHORT", sp, ss[:3], atr
 
-    if br <= BR_LONG_MIN: return None, lp, [], atr  
-    if INVERSE_MODE: return "SHORT", lp, sl[:3] + ["(INV)"], atr
+    if br <= BR_LONG_MIN: return None, lp, [], atr
     return "LONG", lp, sl[:3], atr
 
 # ═══════════════════════════════════════════════════════
@@ -271,7 +277,8 @@ def live_open(sym, direction, score, sigs, price, atr):
     with _lock: live_positions[sym] = pos
 
     d = "🟢" if direction == "LONG" else "🔴"
-    print(f"\n  {d} [DRY RUN LOG] {sym} {direction} @{entry_price:.6g}")
+    inv_label = " [INVERSE]" if INVERSE_MODE else ""
+    print(f"\n  {d} [DRY RUN LOG{inv_label}] {sym} {direction} @{entry_price:.6g}")
     print(f"      Target Profit: +{EXTREME_PROFIT_PCT*100:.1f}% | Hard SL: -{HARD_SL_PCT*100:.1f}% | R:R ~2:1")
     _stats["trades"] += 1
 
@@ -293,7 +300,8 @@ def live_close(sym, reason, price=None):
     hold = time.time() - pos["open_time"]
     e = "🟢" if pnl >= 0 else "🔴"
 
-    print(f"  {e} [DRY RUN LOG] {sym} {side} CLOSE — {reason}")
+    inv_label = " [INVERSE]" if INVERSE_MODE else ""
+    print(f"  {e} [DRY RUN LOG{inv_label}] {sym} {side} CLOSE — {reason}")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL Bersih:{pnl:+.5f}U (Fee:{total_fee:.5f}U)")
 
     _stats["pnl"] += pnl
@@ -337,16 +345,18 @@ def monitor_positions():
             if prof_pct <= -HARD_SL_PCT:
                 live_close(sym, "HardSL", px); continue
             pnl_now = ((px - entry) * pos["qty"]) - (((entry * pos["qty"]) * FUTURES_FEE_PCT) + ((px * pos["qty"]) * FUTURES_FEE_PCT))
-            print(f"   📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY RUN]")
+            print(f"   📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [INV]" if INVERSE_MODE else
+                  f"   📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY RUN]")
 
-        else: # SHORT
+        else:  # SHORT
             prof_pct = (entry - px) / entry
             if prof_pct >= EXTREME_PROFIT_PCT:
                 live_close(sym, "ExtremeProfit", px); continue
             if prof_pct <= -HARD_SL_PCT:
                 live_close(sym, "HardSL", px); continue
             pnl_now = ((entry - px) * pos["qty"]) - (((entry * pos["qty"]) * FUTURES_FEE_PCT) + ((px * pos["qty"]) * FUTURES_FEE_PCT))
-            print(f"   📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY RUN]")
+            print(f"   📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [INV]" if INVERSE_MODE else
+                  f"   📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY RUN]")
 
 # ═══════════════════════════════════════════════════════
 #  SCANNER & THREAD ENGINE
@@ -385,7 +395,8 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"      ┌ [v18.3.2 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
+    mode = "INV" if INVERSE_MODE else "NRM"
+    print(f"      ┌ [v18.3.3-{mode}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
     print(f"      └ Ex-Profit:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
 
 def print_full():
@@ -393,6 +404,7 @@ def print_full():
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, sess = _stats["pnl"], (time.time() - _stats["start"]) / 3600
     tph, e = n / sess if sess > 0 else 0, "💚" if pnl >= 0 else "🔴"
+    mode_label = "INVERSE — sinyal dibalik" if INVERSE_MODE else "NORMAL"
     
     sh = md = 0.0
     if len(_stats["hist"]) >= 5:
@@ -404,7 +416,7 @@ def print_full():
         md = float(np.min(eq - np.maximum.accumulate(eq)))
 
     print(f"\n  {'─'*62}")
-    print(f"   🧪 DRY RUN LOG v18.3.2 [NORMAL — TP:0.7% SL:0.2% R:R~2:1] — {sess*60:.0f}m | {tph:.1f}T/jam")
+    print(f"   🧪 DRY RUN LOG v18.3.3 [{mode_label} — TP:0.7% SL:0.2% R:R~2:1] — {sess*60:.0f}m | {tph:.1f}T/jam")
     print(f"   🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"   {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"   📐 Sharpe:{sh:.2f} MaxDD:{md:.5f}U")
@@ -452,10 +464,12 @@ def t_macro():
         time.sleep(5)
 
 def run_bot():
-    print("╔═══════════════════════════════════════════════════════╗")
-    print("║   🧪 DRY RUN MODE v18.3.2 — TP:0.7% SL:0.2% R:R~2:1 ║")
-    print("║   ⚠️  NO REAL ORDERS — SIMULATION LOGGING ONLY        ║")
-    print("╚═══════════════════════════════════════════════════════╝")
+    mode_label = "INVERSE (LONG→SHORT, SHORT→LONG)" if INVERSE_MODE else "NORMAL"
+    print("╔═══════════════════════════════════════════════════════════╗")
+    print(f"║   🧪 DRY RUN MODE v18.3.3 — TP:0.7% SL:0.2% R:R~2:1    ║")
+    print(f"║   🔄 MODE: {mode_label:<47}║")
+    print("║   ⚠️  NO REAL ORDERS — SIMULATION LOGGING ONLY           ║")
+    print("╚═══════════════════════════════════════════════════════════╝")
 
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
@@ -472,8 +486,9 @@ def run_bot():
 
     while True:
         cycle += 1; slots = MAX_POSITIONS - len(live_positions)
+        mode_tag = "INV" if INVERSE_MODE else "NRM"
         print(f"\n{'═'*57}")
-        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC:{_macro['btc']} F&G:{_macro['fng']} "
+        print(f"  #{cycle} {time.strftime('%H:%M:%S')} [{mode_tag}] BTC:{_macro['btc']} F&G:{_macro['fng']} "
               f"({len(live_positions)}/{MAX_POSITIONS}) PnL Net:{_stats['pnl']:+.4f}U")
 
         if (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}"); time.sleep(SCAN_INTERVAL); continue
