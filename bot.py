@@ -1,10 +1,10 @@
 """
-Bot Scalping v19.2.0 — DRY RUN LOG MODE (PAPER TRADING)
+Bot Scalping v19.3.0 — BRUTAL SCALPING (PAPER TRADING)
 ====================================================
-MODIFIKASI v19.2.0:
-- Persentase TP & SL dinaikkan ke 0.40% untuk mengecilkan dampak fee exchange
-- Jarak harga TP dan SL dikunci mati 1:1 murni pada persentase baru
-- Logika reverse tetap aktif, slot spam 3 posisi, size tetap 2 USD
+MODIFIKASI v19.3.0:
+- Implementasi rasio 1:3 (SL 0.10% | TP 0.30%)
+- Menyesuaikan fee taker (0.10% round-trip) sehingga Net PnL menjadi 1:1 (+0.20% / -0.20%)
+- Winrate target untuk BEP adalah 50%
 """
 
 import os, time, math, threading, queue
@@ -22,15 +22,16 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v19.2.0
+#  CONFIG v19.3.0
 # ═══════════════════════════════════════════════════════
 
 LEVERAGE       = 20
 ORDER_USDT     = 2.0
 MAX_POSITIONS  = 3 
 
-# ── TP/SL STRATEGY v19.2.0 (DITINGKATKAN KE 0.40%) ──────
-FIXED_TP_SL_PCT = 0.0040  # Dinaikkan ke 0.40% agar dampak fee mengecil terhadap net profit
+# ── TP/SL STRATEGY v19.3.0 (BRUTAL SCALPING 1:3) ──────
+FIXED_TP_PCT   = 0.0030  # TP 0.30%
+FIXED_SL_PCT   = 0.0010  # SL 0.10%
 FUTURES_FEE_PCT = 0.0005  # Taker fee 0.05% (Total masuk + keluar = 0.1%)
 
 SCAN_INTERVAL  = 0.2     
@@ -199,7 +200,7 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL v19.2.0 (REVERSE ENGINE)
+#  SIGNAL v19.3.0 (REVERSE ENGINE DENGAN SL/TP TERPISAH)
 # ═══════════════════════════════════════════════════════
 def signal(df, symbol=None):
     if df is None or len(df) < 55: return None, 0, [], 0.0, 0.0, 0.0
@@ -240,13 +241,13 @@ def signal(df, symbol=None):
     thresh = MIN_SCORE
     gap    = abs(lp - sp)
 
-    # REVERSE LOGIC
+    # REVERSE LOGIC WITH SEPARATE SL AND TP
     if lp > sp:
         if lp < thresh or gap < MIN_GAP: return None, lp, [], atr, 0.0, 0.0
-        return "SHORT", lp, sl[:4], atr, FIXED_TP_SL_PCT, FIXED_TP_SL_PCT
+        return "SHORT", lp, sl[:4], atr, FIXED_SL_PCT, FIXED_TP_PCT
     else:
         if sp < thresh or gap < MIN_GAP: return None, max(lp, sp), [], atr, 0.0, 0.0
-        return "LONG", sp, ss[:4], atr, FIXED_TP_SL_PCT, FIXED_TP_SL_PCT
+        return "LONG", sp, ss[:4], atr, FIXED_SL_PCT, FIXED_TP_PCT
 
 # ═══════════════════════════════════════════════════════
 #  DRY RUN OPEN
@@ -420,7 +421,7 @@ def print_inline():
     n  = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v19.2.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
+    print(f"       ┌ [v19.3.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
     print(f"       └ ExTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
 
 def print_full():
@@ -432,11 +433,11 @@ def print_full():
     e    = "💚" if pnl >= 0 else "🔴"
 
     print(f"\n  {'─'*68}")
-    print(f"    ✅ DRY RUN v19.2.0 [FIXED 0.40% TP/SL | REDUCE FEE IMPACT | SPAM MODE]")
+    print(f"    ✅ DRY RUN v19.3.0 [BRUTAL SCALPING 1:3 | TP 0.30% | SL 0.10%]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
-    print(f"    ⚙️  Config: Target TP/SL={FIXED_TP_SL_PCT*100:.2f}% MaxPos={MAX_POSITIONS} PerOrder={ORDER_USDT}U")
+    print(f"    ⚙️  Config: Target TP={FIXED_TP_PCT*100:.2f}% SL={FIXED_SL_PCT*100:.2f}% MaxPos={MAX_POSITIONS} PerOrder={ORDER_USDT}U")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
@@ -520,9 +521,9 @@ def t_macro():
 # ═══════════════════════════════════════════════════════
 def run_bot():
     print("╔═══════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v19.2.0 — TARGET MOVED TO 0.40%                   ║")
-    print("║  ✅ Menghindari asimetri loss akibat potongan taker fee       ║")
-    print("║  ✅ Jarak TP dan SL di chart dikunci SAMA PRESISI 1:1          ║")
+    print("║  ✅ DRY RUN v19.3.0 — BRUTAL SCALPING MODE 1:3                ║")
+    print("║  ✅ Target TP: 0.30% | SL: 0.10%                              ║")
+    print("║  ✅ Net PnL (Taker Fee 0.10%) = +0.20% (Win) / -0.20% (Loss)  ║")
     print("╚═══════════════════════════════════════════════════════════════╝")
 
     try:
@@ -536,7 +537,7 @@ def run_bot():
     threading.Thread(target=t_monitor,         daemon=True).start()
     threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
     threading.Thread(target=t_rescan,      args=(syms,), daemon=True).start()
-    threading.Thread(target=t_macro,                    daemon=True).start()
+    threading.Thread(target=t_macro,                     daemon=True).start()
 
     time.sleep(2)
     tickers_all()
