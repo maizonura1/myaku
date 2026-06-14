@@ -1,17 +1,16 @@
 """
-Bot Scalping v19.4.0 — MEAN REVERSION FADE ENGINE (PAPER TRADING)
+Bot Scalping v20.0.0 — MOMENTUM CONTINUATION + REGIME ADAPTIVE (PAPER TRADING)
 ====================================================
-PERUBAHAN v19.4.0 vs v19.3.0:
-- Filosofi TOTAL BERUBAH: dari momentum chaser → mean reversion fader
-- EMA bullish stack = sinyal SHORT (bukan LONG)
-- Momentum kuat ke atas = late entry = fade dengan SHORT
-- MACD crossover bullish = lagging = harga sudah naik = SHORT
-- Buy ratio tinggi = climactic buying = SHORT
-- RSI extremes diaktifkan sebagai filter konfirmasi
-- ADX filter: skip jika trending terlalu kuat tanpa RSI extreme
-- Body filter dinaikkan dari 0.15 → 0.30 (lebih selektif)
-- MIN_SCORE dinaikkan 50 → 60, MIN_GAP 5 → 8
-- TP 0.25% / SL 0.12% (adjusted untuk mean reversion)
+PERUBAHAN UTAMA vs v19.4.0:
+- Hapus total logika mean reversion fade → ganti dengan momentum continuation
+- SHORT hanya ketika trend bearish, LONG hanya ketika trend bullish
+- Deteksi regime pasar: TRENDING / RANGING / TRANSITION
+- TP/SL adaptif berdasarkan ATR dan regime
+- Hapus MACD (redundant), gunakan EMA stack + momentum + volume flow
+- Filter baru: volume minimum, body candle minimum, hindari BTC opposing trend
+- Leverage turun 20→10, order size naik 2→5 USDT, max positions 3→2
+- MinScore 60→55, hapus MIN_GAP
+- Daily loss limit -20U → -10U
 """
 
 import os, time, math, threading, queue
@@ -29,17 +28,15 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════
-#  CONFIG v19.4.0
+#  CONFIG v20.0.0
 # ═══════════════════════════════════════════════════════
 
-LEVERAGE        = 20
-ORDER_USDT      = 2.0
-MAX_POSITIONS   = 3
+LEVERAGE        = 10          # Turun dari 20
+ORDER_USDT      = 5.0         # Naik dari 2
+MAX_POSITIONS   = 2           # Turun dari 3
 
-# ── TP/SL STRATEGY v19.4.0 (MEAN REVERSION) ──────────
-FIXED_TP_PCT    = 0.0025   # TP 0.25% — lebih realistis untuk fade
-FIXED_SL_PCT    = 0.0012   # SL 0.12% — sedikit lebih lebar untuk noise
-FUTURES_FEE_PCT = 0.0005   # Taker fee 0.05% (total round-trip 0.10%)
+# ── TP/SL akan dihitung adaptif, tidak fixed ───────────
+FUTURES_FEE_PCT = 0.0005      # Taker fee 0.05% (total round-trip 0.10%)
 
 SCAN_INTERVAL   = 0.2
 MONITOR_INT     = 0.05
@@ -48,17 +45,16 @@ BATCH_SIZE      = 40
 MAX_WORKERS     = 20
 SLOT_FILL_INT   = 0.01
 
-MIN_SCORE       = 60       # Naik dari 50 — lebih selektif
-MIN_GAP         = 8        # Naik dari 5 — butuh keunggulan sinyal lebih jelas
+MIN_SCORE       = 55           # Turun dari 60
 SLIPPAGE_GUARD  = 0.0015
 TTL_5M          = 2
 
-DAILY_LOSS      = -20.0
+DAILY_LOSS      = -10.0        # Lebih ketat dari -20
 CONSEC_MAX      = 15
 CONSEC_PAUSE    = 10
 
 # ═══════════════════════════════════════════════════════
-#  SYMBOLS
+#  SYMBOLS (sama seperti sebelumnya)
 # ═══════════════════════════════════════════════════════
 SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
@@ -94,7 +90,7 @@ _stats = {
 }
 
 # ═══════════════════════════════════════════════════════
-#  BINANCE UTILS
+#  BINANCE UTILS (tidak berubah)
 # ═══════════════════════════════════════════════════════
 _precision_cache = {}
 def get_precision(symbol):
@@ -207,144 +203,154 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════
-#  SIGNAL v19.4.0 — MEAN REVERSION FADE ENGINE
-#
-#  LOGIKA BARU (berlawanan dari v19.3.0):
-#
-#  SHORT ketika momentum BULLISH terbentuk:
-#    → EMA stack bullish = harga sudah terlalu jauh naik = fade SHORT
-#    → Momentum m5 positif kuat = late entry = SHORT
-#    → MACD bullish cross = lagging, move sudah terjadi = SHORT
-#    → Buy ratio tinggi = climactic buying = SHORT
-#    → RSI overbought (>60) = konfirmasi SHORT
-#
-#  LONG ketika momentum BEARISH terbentuk:
-#    → EMA stack bearish = harga sudah terlalu jauh turun = fade LONG
-#    → Momentum m5 negatif kuat = late SHORT = LONG bounce
-#    → MACD bearish cross = lagging = LONG
-#    → Sell ratio tinggi = panic selling = LONG
-#    → RSI oversold (<40) = konfirmasi LONG
-#
-#  FILTER BARU:
-#    → body < 0.30: candle kecil = tidak ada momentum untuk di-fade, skip
-#    → ADX > 35 tanpa RSI extreme: trending terlalu kuat, skip
+#  NEW: REGIME DETECTION & ADAPTIVE TP/SL
 # ═══════════════════════════════════════════════════════
-def signal(df, symbol=None):
-    if df is None or len(df) < 55: return None, 0, [], 0.0, 0.0, 0.0
-
-    row   = df.iloc[-2]
-    prev  = df.iloc[-3]
-    prev2 = df.iloc[-4]
-
-    p, e5, e9, e21, e50 = row["close"], row["e5"], row["e9"], row["e21"], row["e50"]
-    rsi   = row["rsi"]
-    mh    = row["mh"];  mh_p = prev["mh"];  mh_p2 = prev2["mh"]
-    vr    = row["vr"];  br   = row["br"]
-    m5    = row["m5"]
-    body  = row["br2"]
-    atr   = row["atr"]
-    adx   = row["adx"]
-
-    # ── FILTER 1: Body harus signifikan — ada momentum untuk di-fade ──────
-    if body < 0.30: return None, 0, [], atr, 0.0, 0.0
-
-    # ── FILTER 2: ADX — skip jika trending terlalu kuat tanpa RSI extreme ─
-    # Trending kuat (ADX>35) tanpa overbought/oversold = tren bisa lanjut,
-    # mean reversion terlalu berbahaya
-    if adx > 35 and not (rsi > 68 or rsi < 32):
-        return None, 0, [], atr, 0.0, 0.0
-
-    # ──────────────────────────────────────────────────────────────────────
-    #  SHORT SCORING — kumpulkan sinyal bullish yang akan di-fade
-    # ──────────────────────────────────────────────────────────────────────
-    sp = 0
-    ss = []
-
-    # EMA bullish stack = overextension ke atas = SHORT
-    if p > e5 > e9 > e21 > e50:
-        sp += 35; ss.append("EMA5↑→Fade")
-    elif p > e5 > e9 > e21:
-        sp += 26; ss.append("EMA4↑→Fade")
-    elif p > e5 > e9:
-        sp += 14; ss.append("EMA3↑→Fade")
-
-    # Momentum 25 menit positif kuat = terlambat untuk LONG = SHORT
-    if m5 > 0.003:
-        sp += 30; ss.append(f"Mom+{m5*100:.1f}%→Fade")
-    elif m5 > 0.002:
-        sp += 20; ss.append(f"Mom+{m5*100:.1f}%→Fade")
-
-    # MACD bullish cross = lagging signal = move sudah terjadi = SHORT
-    if mh_p <= 0 and mh > 0:
-        sp += 22; ss.append("MACD_X↑→Fade")
-    elif mh > 0 and mh > mh_p > mh_p2:
-        sp += 15; ss.append("MACD↑↑→Fade")
-
-    # Buy ratio tinggi = climactic buying = reversal candidate = SHORT
-    if br > 0.56:
-        sp += 25; ss.append(f"BuyClimx{br:.0%}")
-    elif br > 0.52:
-        sp += 14; ss.append(f"Buy{br:.0%}")
-
-    # RSI overbought = konfirmasi SHORT
-    if rsi > 68:
-        sp += 25; ss.append(f"RSI{rsi:.0f}OB")
-    elif rsi > 60:
-        sp += 12; ss.append(f"RSI{rsi:.0f}Hi")
-
-    # ──────────────────────────────────────────────────────────────────────
-    #  LONG SCORING — kumpulkan sinyal bearish yang akan di-fade
-    # ──────────────────────────────────────────────────────────────────────
-    lp = 0
-    sl = []
-
-    # EMA bearish stack = oversold = bounce candidate = LONG
-    if p < e5 < e9 < e21 < e50:
-        lp += 35; sl.append("EMA5↓→Fade")
-    elif p < e5 < e9 < e21:
-        lp += 26; sl.append("EMA4↓→Fade")
-    elif p < e5 < e9:
-        lp += 14; sl.append("EMA3↓→Fade")
-
-    # Momentum 25 menit negatif kuat = terlambat untuk SHORT = LONG
-    if m5 < -0.003:
-        lp += 30; sl.append(f"Mom{m5*100:.1f}%→Fade")
-    elif m5 < -0.002:
-        lp += 20; sl.append(f"Mom{m5*100:.1f}%→Fade")
-
-    # MACD bearish cross = lagging = move sudah terjadi = LONG
-    if mh_p >= 0 and mh < 0:
-        lp += 22; sl.append("MACD_X↓→Fade")
-    elif mh < 0 and mh < mh_p < mh_p2:
-        lp += 15; sl.append("MACD↓↓→Fade")
-
-    # Sell ratio tinggi = panic selling = bounce candidate = LONG
-    if br < 0.44:
-        lp += 25; sl.append(f"SellClimx{1-br:.0%}")
-    elif br < 0.48:
-        lp += 14; sl.append(f"Sell{1-br:.0%}")
-
-    # RSI oversold = konfirmasi LONG
-    if rsi < 32:
-        lp += 25; sl.append(f"RSI{rsi:.0f}OS")
-    elif rsi < 40:
-        lp += 12; sl.append(f"RSI{rsi:.0f}Lo")
-
-    # ── KEPUTUSAN ──────────────────────────────────────────────────────────
-    thresh = MIN_SCORE
-    gap    = abs(lp - sp)
-
-    if sp > lp:
-        if sp < thresh or gap < MIN_GAP: return None, sp, [], atr, 0.0, 0.0
-        return "SHORT", sp, ss[:4], atr, FIXED_SL_PCT, FIXED_TP_PCT
+def get_regime(df):
+    """Tentukan regime pasar berdasarkan ADX dan ATR%"""
+    adx = df["adx"].iloc[-2]
+    atr_pct = df["atr"].iloc[-2] / df["close"].iloc[-2]
+    if adx > 25 and atr_pct > 0.002:
+        return "TRENDING"
+    elif adx < 20:
+        return "RANGING"
     else:
-        if lp < thresh or gap < MIN_GAP: return None, max(lp, sp), [], atr, 0.0, 0.0
-        return "LONG", lp, sl[:4], atr, FIXED_SL_PCT, FIXED_TP_PCT
+        return "TRANSITION"
+
+def get_tp_sl(regime, atr_pct, direction, btc_trend):
+    """
+    Hitung TP dan SL dalam persen berdasarkan regime dan ATR.
+    Mengembalikan (sl_pct, tp_pct)
+    """
+    if regime == "TRENDING":
+        sl = max(atr_pct * 1.5, 0.0025)   # minimal 0.25%
+        tp = sl * 2.5                      # reward:risk = 2.5:1
+        # Bonus jika searah dengan trend BTC
+        if (direction == "LONG" and btc_trend in ["BULL", "MILD_BULL"]) or \
+           (direction == "SHORT" and btc_trend in ["BEAR", "MILD_BEAR"]):
+            tp *= 1.2
+    else:  # RANGING or TRANSITION
+        sl = max(atr_pct * 1.2, 0.0020)   # minimal 0.20%
+        tp = sl * 2.0                      # reward:risk = 2:1
+    # Batasan keamanan
+    sl = min(sl, 0.01)    # maksimal SL 1%
+    tp = min(tp, 0.03)    # maksimal TP 3%
+    return sl, tp
 
 # ═══════════════════════════════════════════════════════
-#  DRY RUN OPEN
+#  SIGNAL v20.0.0 — MOMENTUM CONTINUATION
 # ═══════════════════════════════════════════════════════
-def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
+def signal(df, btc_trend):
+    if df is None or len(df) < 55:
+        return None, 0, [], 0.0, 0.0, 0.0
+
+    row = df.iloc[-2]
+    prev = df.iloc[-3]
+    p = row["close"]
+    e5, e9, e21 = row["e5"], row["e9"], row["e21"]
+    rsi = row["rsi"]
+    m5 = row["m5"]
+    vr = row["vr"]
+    br = row["br"]
+    atr_pct = row["atr"] / p
+    body_ratio = row["br2"]
+    adx = row["adx"]
+
+    # ── FILTER KUALITAS ──────────────────────────────
+    if vr < 0.7:                 # volume terlalu rendah
+        return None, 0, [], atr_pct, 0.0, 0.0
+    if body_ratio < 0.2:         # doji / candle terlalu kecil
+        return None, 0, [], atr_pct, 0.0, 0.0
+
+    # ── REGIME ───────────────────────────────────────
+    regime = get_regime(df)
+
+    score = 0
+    reasons = []
+    direction = None
+
+    # ========== TRENDING ==========
+    if regime == "TRENDING":
+        bullish_stack = (p > e5 > e9 > e21)
+        bearish_stack = (p < e5 < e9 < e21)
+
+        # Prioritaskan sinyal searah BTC
+        if bullish_stack and btc_trend in ["BULL", "MILD_BULL"]:
+            direction = "LONG"
+            score = 50
+            reasons.append("TrendUp+BTC")
+        elif bearish_stack and btc_trend in ["BEAR", "MILD_BEAR"]:
+            direction = "SHORT"
+            score = 50
+            reasons.append("TrendDown+BTC")
+        elif bullish_stack:
+            direction = "LONG"
+            score = 35
+            reasons.append("TrendUp")
+        elif bearish_stack:
+            direction = "SHORT"
+            score = 35
+            reasons.append("TrendDown")
+
+        if direction:
+            # Konfirmasi momentum
+            if direction == "LONG" and m5 > 0.002:
+                score += 20
+                reasons.append("MomUp")
+            elif direction == "SHORT" and m5 < -0.002:
+                score += 20
+                reasons.append("MomDown")
+            # Konfirmasi volume flow (buy/sell pressure)
+            if direction == "LONG" and br > 0.52:
+                score += 15
+                reasons.append("BuyVol")
+            elif direction == "SHORT" and br < 0.48:
+                score += 15
+                reasons.append("SellVol")
+
+    # ========== RANGING ==========
+    elif regime == "RANGING":
+        # Fade hanya di extreme RSI + tidak ada volume breakout
+        if rsi > 70 and vr < 1.5:
+            direction = "SHORT"
+            score = 40 + (rsi - 70) * 2
+            reasons.append(f"Overbought{rsi:.0f}")
+        elif rsi < 30 and vr < 1.5:
+            direction = "LONG"
+            score = 40 + (30 - rsi) * 2
+            reasons.append(f"Oversold{rsi:.0f}")
+
+        if direction:
+            # Sederhana divergence: harga turun tapi MACD naik = bullish divergence
+            if direction == "LONG" and row["mh"] > prev["mh"] and p < prev["close"]:
+                score += 15
+                reasons.append("BullDiv")
+            elif direction == "SHORT" and row["mh"] < prev["mh"] and p > prev["close"]:
+                score += 15
+                reasons.append("BearDiv")
+
+    # ========== TRANSITION ==========
+    else:
+        # Kombinasi RSI extreme + momentum berlawanan (potensi pembalikan awal)
+        if rsi > 65 and m5 < -0.001:
+            direction = "SHORT"
+            score = 45
+            reasons.append("RSIhigh+MomDown")
+        elif rsi < 35 and m5 > 0.001:
+            direction = "LONG"
+            score = 45
+            reasons.append("RSIlow+MomUp")
+
+    # ── FINAL CHECK ──────────────────────────────────
+    if direction is None or score < MIN_SCORE:
+        return None, 0, [], atr_pct, 0.0, 0.0
+
+    sl_pct, tp_pct = get_tp_sl(regime, atr_pct, direction, btc_trend)
+    return direction, score, reasons[:4], atr_pct, sl_pct, tp_pct
+
+# ═══════════════════════════════════════════════════════
+#  DRY RUN OPEN (minor change: now uses dynamic sl/tp)
+# ═══════════════════════════════════════════════════════
+def live_open(sym, direction, score, sigs, price, atr_pct, sl_pct, tp_pct):
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
             return
@@ -373,7 +379,7 @@ def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
 
     pos = {
         "side": direction, "entry": price, "qty": q_val,
-        "open_time": time.time(), "score": score, "sigs": sigs, "atr": atr,
+        "open_time": time.time(), "score": score, "sigs": sigs, "atr_pct": atr_pct,
         "sl_price": sl_price, "tp_price": tp_price,
         "sl_pct": sl_pct, "tp_pct": tp_pct
     }
@@ -384,7 +390,7 @@ def live_open(sym, direction, score, sigs, price, atr, sl_pct, tp_pct):
     _stats["trades"] += 1
 
 # ═══════════════════════════════════════════════════════
-#  DRY RUN CLOSE
+#  DRY RUN CLOSE (tidak berubah)
 # ═══════════════════════════════════════════════════════
 def live_close(sym, reason, price=None):
     with _lock:
@@ -432,7 +438,7 @@ def live_close(sym, reason, price=None):
     print_inline()
 
 # ═══════════════════════════════════════════════════════
-#  MONITOR POSITIONS
+#  MONITOR POSITIONS (tidak berubah)
 # ═══════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -456,8 +462,7 @@ def monitor_positions():
                 live_close(sym, "ExtremeTP", px); continue
             pnl_now = ((px - entry) * pos["qty"]) - ((entry * pos["qty"] + px * pos["qty"]) * FUTURES_FEE_PCT)
             print(f"    📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY]")
-
-        else:  # SHORT
+        else:
             prof_pct = (entry - px) / entry
             if px >= sl_px:
                 live_close(sym, "HardSL", px); continue
@@ -467,7 +472,7 @@ def monitor_positions():
             print(f"    📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY]")
 
 # ═══════════════════════════════════════════════════════
-#  SCANNER
+#  SCANNER (modified: pass btc_trend to signal)
 # ═══════════════════════════════════════════════════════
 def scan_one(sym):
     try:
@@ -476,17 +481,19 @@ def scan_one(sym):
         if df5 is None: return None
 
         px  = df5["close"].iloc[-2]
-        atr = df5["atr"].iloc[-2]
+        atr_pct = df5["atr"].iloc[-2] / px if px != 0 else 0
         if px == 0: return None
 
-        dir_, sc, sigs, atr_val, sl_pct, tp_pct = signal(df5, sym)
+        dir_, sc, sigs, atr_pct_val, sl_p, tp_p = signal(df5, _macro["btc"])
         if dir_ is None: return None
 
         px_live = price_live(sym)
         if px_live == 0: return None
 
-        return (sym, dir_, sc, sigs, px_live, atr_val, sl_pct, tp_pct)
-    except: return None
+        return (sym, dir_, sc, sigs, px_live, atr_pct_val, sl_p, tp_p)
+    except Exception as e:
+        # silent fail
+        return None
 
 def scan_batch(syms):
     res = []
@@ -505,13 +512,13 @@ def top_movers(syms, n=30):
     return [s for s, _ in sorted(mv, key=lambda x: x[1], reverse=True)[:n]]
 
 # ═══════════════════════════════════════════════════════
-#  PRINT UTILS
+#  PRINT UTILS (sedikit modifikasi untuk tampilan)
 # ═══════════════════════════════════════════════════════
 def print_inline():
     n  = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v19.4.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
+    print(f"       ┌ [v20.0.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
     print(f"       └ ExTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
 
 def print_full():
@@ -523,11 +530,11 @@ def print_full():
     e    = "💚" if pnl >= 0 else "🔴"
 
     print(f"\n  {'─'*70}")
-    print(f"    ✅ DRY RUN v19.4.0 [MEAN REVERSION FADE | TP 0.25% | SL 0.12%]")
+    print(f"    ✅ DRY RUN v20.0.0 [MOMENTUM CONTINUATION | ADAPTIVE TP/SL]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
-    print(f"    ⚙️  Config: TP={FIXED_TP_PCT*100:.2f}% SL={FIXED_SL_PCT*100:.2f}% MinScore={MIN_SCORE} MaxPos={MAX_POSITIONS} PerOrder={ORDER_USDT}U")
+    print(f"    ⚙️  Config: Leverage={LEVERAGE} Order={ORDER_USDT}U MaxPos={MAX_POSITIONS} MinScore={MIN_SCORE}")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
@@ -536,7 +543,7 @@ def print_full():
     print(f"  {'─'*70}")
 
 # ═══════════════════════════════════════════════════════
-#  THREADS
+#  THREADS (tidak berubah)
 # ═══════════════════════════════════════════════════════
 def t_monitor():
     while True:
@@ -611,10 +618,10 @@ def t_macro():
 # ═══════════════════════════════════════════════════════
 def run_bot():
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v19.4.0 — MEAN REVERSION FADE ENGINE                  ║")
-    print("║  ✅ Filosofi: Fade momentum, bukan kejar momentum                  ║")
-    print("║  ✅ Target TP: 0.25% | SL: 0.12% | MinScore: 60                   ║")
-    print("║  ✅ Filter: ADX>35 blocked (kecuali RSI extreme) | Body>0.30       ║")
+    print("║  ✅ DRY RUN v20.0.0 — MOMENTUM CONTINUATION ENGINE                 ║")
+    print("║  ✅ Ikut tren, tidak fade | Regime adaptive TP/SL                  ║")
+    print("║  ✅ Leverage 10 | Order 5 USDT | Max 2 posisi                      ║")
+    print("║  ✅ Filter: volume minimal, body candle, arah BTC                  ║")
     print("╚════════════════════════════════════════════════════════════════════╝")
 
     try:
@@ -645,7 +652,7 @@ def run_bot():
         elif slots == 0:
             print(f"  ✅ Slots full")
         else:
-            print(f"  🔍 {slots} slot kosong — Scanning for overextended moves...")
+            print(f"  🔍 {slots} slot kosong — Scanning for momentum...")
 
         if cycle % 30 == 0:
             print_full()
