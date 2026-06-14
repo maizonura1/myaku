@@ -1,22 +1,31 @@
 """
-Bot Scalping v20.0.0 — MOMENTUM CONTINUATION + REGIME ADAPTIVE (PAPER TRADING)
-====================================================
-PERUBAHAN UTAMA vs v19.4.0:
-- Hapus total logika mean reversion fade → ganti dengan momentum continuation
-- SHORT hanya ketika trend bearish, LONG hanya ketika trend bullish
-- Deteksi regime pasar: TRENDING / RANGING / TRANSITION
-- TP/SL adaptif berdasarkan ATR dan regime
-- Hapus MACD (redundant), gunakan EMA stack + momentum + volume flow
-- Filter baru: volume minimum, body candle minimum, hindari BTC opposing trend
-- Leverage turun 20→10, order size naik 2→5 USDT, max positions 3→2
-- MinScore 60→55, hapus MIN_GAP
-- Daily loss limit -20U → -10U
+Bot Scalping v21.0.0 — PULLBACK CONTINUATION + QUALITY SCORE + LOSS CLUSTER DETECTOR
+====================================================================================
+PERUBAHAN UTAMA vs v20.0.0:
+
+1. TIDAK chase candle breakout → WAJIB pullback & retest
+2. Quality Score 0-100 dengan penalty untuk kondisi loss-prone:
+   - RSI terlalu ekstrem (>75 atau <25) → -25
+   - Volume climax (>2.5x) → -30
+   - Candle marubozu (>0.85) → -20
+   - ADX over-extended (>45) → -15
+3. Loss Cluster Detector: 3 loss beruntun → pause 5 candle
+4. Multi-timeframe confirmation (15m trend + 5m setup + 1m trigger)
+5. Filter spread & volume mati
+6. Adaptive position ranking: dari 20 signal ambil TOP 3 berdasarkan score
+7. TP/SL dinamis berdasarkan ATR, ADX, regime, dan quality score
+8. Entry hanya jika: breakout → retest → continuation (bukan di candle breakout)
 """
 
-import os, time, math, threading, queue
-import requests
+import os
+import time
+import math
+import threading
+import queue
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Optional, Tuple, List, Dict, Any
 from dotenv import load_dotenv
 from binance.client import Client
 import ta
@@ -27,35 +36,56 @@ load_dotenv()
 client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
-# ═══════════════════════════════════════════════════════
-#  CONFIG v20.0.0
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+#  CONFIG v21.0.0
+# ═══════════════════════════════════════════════════════════════════════════
 
-LEVERAGE        = 10          # Turun dari 20
-ORDER_USDT      = 5.0         # Naik dari 2
-MAX_POSITIONS   = 2           # Turun dari 3
+LEVERAGE = 20                       # Kembali ke 20x dengan risk lebih ketat
+ORDER_USDT = 2.0                    # 2 USDT per posisi
+MAX_POSITIONS = 3                   # Maksimal 3 posisi
 
-# ── TP/SL akan dihitung adaptif, tidak fixed ───────────
-FUTURES_FEE_PCT = 0.0005      # Taker fee 0.05% (total round-trip 0.10%)
+FUTURES_FEE_PCT = 0.0005            # Taker fee 0.05% (round-trip 0.10%)
 
-SCAN_INTERVAL   = 0.2
-MONITOR_INT     = 0.05
-SCAN_DELAY      = 0.002
-BATCH_SIZE      = 40
-MAX_WORKERS     = 20
-SLOT_FILL_INT   = 0.01
+SCAN_INTERVAL = 0.2
+MONITOR_INT = 0.05
+SCAN_DELAY = 0.002
+BATCH_SIZE = 40
+MAX_WORKERS = 20
+SLOT_FILL_INT = 0.01
 
-MIN_SCORE       = 55           # Turun dari 60
-SLIPPAGE_GUARD  = 0.0015
-TTL_5M          = 2
+# ── QUALITY FILTERS ──────────────────────────────────────────────────────
+MIN_QUALITY_SCORE = 65              # Hanya sinyal dengan score >= 65
+MAX_SIGNALS_PER_CYCLE = 3           # Top 3 dari semua sinyal
 
-DAILY_LOSS      = -10.0        # Lebih ketat dari -20
-CONSEC_MAX      = 15
-CONSEC_PAUSE    = 10
+# ── LOSS CLUSTER ─────────────────────────────────────────────────────────
+MAX_CONSECUTIVE_LOSSES = 3          # Stop setelah 3 loss beruntun
+PAUSE_CANDLES = 5                   # Jeda 5 candle (5 menit di 1m)
+CLUSTER_WINDOW_SECONDS = 1800       # 3 loss dalam 30 menit = cluster
 
-# ═══════════════════════════════════════════════════════
-#  SYMBOLS (sama seperti sebelumnya)
-# ═══════════════════════════════════════════════════════
+# ── MARKET QUALITY ───────────────────────────────────────────────────────
+MAX_SPREAD_PCT = 0.0005             # 0.05% max spread
+MIN_VOLUME_24H = 5_000_000          # 5M USDT minimal volume 24h
+
+# ── TP/SL LIMITS ─────────────────────────────────────────────────────────
+MIN_SL_PCT = 0.0025                 # 0.25% minimal stop
+MAX_SL_PCT = 0.008                  # 0.8% maksimal stop
+MAX_TP_PCT = 0.025                  # 2.5% maksimal target
+
+# ── ENTRY TIMING ─────────────────────────────────────────────────────────
+MIN_PULLBACK_PCT = 0.001            # Minimal pullback 0.1%
+MAX_PULLBACK_PCT = 0.005            # Maksimal pullback 0.5%
+
+# ── DAILY LIMITS ─────────────────────────────────────────────────────────
+DAILY_LOSS_LIMIT = -8.0             # Stop loss harian
+CONSEC_MAX = 15
+CONSEC_PAUSE = 10
+
+TTL_5M = 2
+SLIPPAGE_GUARD = 0.0015
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SYMBOLS
+# ═══════════════════════════════════════════════════════════════════════════
 SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
     "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "TRXUSDT", "DOTUSDT",
@@ -68,33 +98,176 @@ SYMBOLS = [
 ]
 SYMBOLS = list(dict.fromkeys(SYMBOLS))
 
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
 #  STATE
-# ═══════════════════════════════════════════════════════
-live_positions  = {}
-trade_log       = []
-_ohlcv_cache    = {}
-_ticker_cache   = {}
-_ticker_ts      = 0
-_lock           = threading.Lock()
-_executor       = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-_rescan_q       = queue.Queue()
-_hot_syms       = deque(maxlen=30)
+# ═══════════════════════════════════════════════════════════════════════════
+live_positions = {}
+trade_log = []
+_ohlcv_cache = {}
+_ticker_cache = {}
+_ticker_ts = 0
+_lock = threading.Lock()
+_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+_rescan_q = queue.Queue()
+_hot_syms = deque(maxlen=30)
 
 _macro = {"fng": 50, "btc": "UNKNOWN", "last_fng": 0, "last_btc": 0}
-_ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
+_ks = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0,
-    "extreme_tp": 0, "hard_sl": 0, "force": 0, "btc_block": 0,
+    "extreme_tp": 0, "hard_sl": 0, "force": 0, "btc_block": 0, "quality_filter": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
-# ═══════════════════════════════════════════════════════
-#  BINANCE UTILS (tidak berubah)
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+#  LOSS CLUSTER DETECTOR
+# ═══════════════════════════════════════════════════════════════════════════
+class LossClusterDetector:
+    """Deteksi loss beruntun dan pause trading"""
+    
+    def __init__(self, max_consecutive_losses=3, pause_candles=5, cluster_window=1800):
+        self.consecutive_losses = 0
+        self.max_loss = max_consecutive_losses
+        self.pause_candles = pause_candles
+        self.cluster_window = cluster_window
+        self.pause_until = 0
+        self.loss_timestamps = deque(maxlen=10)
+        self.cluster_detected = False
+    
+    def record_loss(self, timestamp):
+        self.consecutive_losses += 1
+        self.loss_timestamps.append(timestamp)
+        
+        # Deteksi cluster: X loss dalam Y menit
+        if len(self.loss_timestamps) >= 3:
+            oldest = self.loss_timestamps[0]
+            if timestamp - oldest < self.cluster_window:
+                self.cluster_detected = True
+                self.pause_until = timestamp + (self.pause_candles * 60)
+                return True  # cluster detected
+        return False
+    
+    def record_win(self):
+        self.consecutive_losses = 0
+        # Cluster reset hanya jika sudah lewat pause window
+        if self.cluster_detected and time.time() > self.pause_until:
+            self.cluster_detected = False
+            self.loss_timestamps.clear()
+    
+    def can_trade(self, current_time) -> Tuple[bool, str]:
+        if self.consecutive_losses >= self.max_loss:
+            if current_time < self.pause_until:
+                return False, f"loss_streak_{self.consecutive_losses}"
+            else:
+                self.consecutive_losses = 0
+        
+        if self.cluster_detected and current_time < self.pause_until:
+            return False, "loss_cluster_pause"
+        
+        return True, ""
+    
+    def get_status(self) -> str:
+        if self.cluster_detected:
+            remaining = max(0, self.pause_until - time.time())
+            return f"CLUSTER_PAUSE:{remaining:.0f}s"
+        elif self.consecutive_losses > 0:
+            return f"STREAK:{self.consecutive_losses}"
+        return "ACTIVE"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SIGNAL RANKER (Ambil hanya top K dari banyak sinyal)
+# ═══════════════════════════════════════════════════════════════════════════
+class SignalRanker:
+    """Ranking sinyal dan filter top K saja"""
+    
+    def __init__(self, max_signals_per_cycle=3, min_score_threshold=65):
+        self.max_signals = max_signals_per_cycle
+        self.min_score = min_score_threshold
+        self.signal_history = deque(maxlen=50)
+    
+    def _get_sector(self, symbol: str) -> str:
+        sector_map = {
+            'layer1': ['BTC', 'ETH', 'BNB', 'SOL', 'ADA', 'AVAX', 'DOT', 'ATOM', 'TRX'],
+            'dex': ['UNI', 'CAKE', 'SUSHI', 'CRV'],
+            'defi': ['AAVE', 'COMP', 'MKR', 'SNX', 'LINK'],
+            'meme': ['DOGE', 'SHIB', 'PEPE', 'WIF', '1000PEPE', '1000SHIB'],
+            'gaming': ['SAND', 'MANA', 'GALA', 'APE', 'AXS'],
+            'ai': ['FET', 'AGIX', 'OCEAN', 'WLD'],
+            'l2': ['ARB', 'OP', 'MATIC']
+        }
+        for sector, tokens in sector_map.items():
+            if any(t in symbol.upper() for t in tokens):
+                return sector
+        return 'other'
+    
+    def rank_and_filter(self, raw_signals: List, current_time: float, recent_loss_symbols: List = None) -> List:
+        """
+        raw_signals: list of (symbol, direction, score, reasons, price, atr_pct, sl_pct, tp_pct)
+        Returns: top K signals
+        """
+        if not raw_signals:
+            return []
+        
+        # Filter score minimum
+        valid = [s for s in raw_signals if s[2] >= self.min_score]
+        
+        if not valid:
+            return []
+        
+        # Konversi ke list untuk modifikasi
+        valid_with_penalty = []
+        for sig in valid:
+            sym, direction, score, reasons, price, atr, sl, tp = sig
+            sector = self._get_sector(sym)
+            valid_with_penalty.append({
+                'symbol': sym, 'direction': direction, 'score': score,
+                'reasons': reasons, 'price': price, 'atr_pct': atr,
+                'sl_pct': sl, 'tp_pct': tp, 'sector': sector
+            })
+        
+        # Hitung sector penalty
+        sector_counts = {}
+        for v in valid_with_penalty:
+            sector_counts[v['sector']] = sector_counts.get(v['sector'], 0) + 1
+        
+        for v in valid_with_penalty:
+            if sector_counts[v['sector']] > 2:
+                v['score'] *= 0.7  # penalty 30% untuk sector yang terlalu ramai
+        
+        # Penalty untuk simbol yang baru loss
+        if recent_loss_symbols:
+            for v in valid_with_penalty:
+                if v['symbol'] in recent_loss_symbols:
+                    v['score'] *= 0.5  # penalty 50%
+        
+        # Sort by score descending
+        valid_with_penalty.sort(key=lambda x: x['score'], reverse=True)
+        
+        # Ambil top K
+        top = valid_with_penalty[:self.max_signals]
+        
+        # Record ke history
+        for v in top:
+            self.signal_history.append({
+                'symbol': v['symbol'],
+                'score': v['score'],
+                'timestamp': current_time
+            })
+        
+        # Kembalikan ke format tuple
+        return [(v['symbol'], v['direction'], v['score'], v['reasons'],
+                 v['price'], v['atr_pct'], v['sl_pct'], v['tp_pct']) for v in top]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  BINANCE UTILS
+# ═══════════════════════════════════════════════════════════════════════════
 _precision_cache = {}
+
 def get_precision(symbol):
-    if symbol in _precision_cache: return _precision_cache[symbol]
+    if symbol in _precision_cache:
+        return _precision_cache[symbol]
     try:
         info = client.futures_exchange_info()
         for s in info['symbols']:
@@ -102,7 +275,8 @@ def get_precision(symbol):
                 prec = int(s['quantityPrecision'])
                 _precision_cache[symbol] = prec
                 return prec
-    except: pass
+    except:
+        pass
     return 2
 
 def qty(symbol, price):
@@ -111,13 +285,16 @@ def qty(symbol, price):
     return round(raw_qty, prec)
 
 def price_live(symbol):
-    try: return float(client.futures_symbol_ticker(symbol=symbol)["price"])
-    except: return 0.0
+    try:
+        return float(client.futures_symbol_ticker(symbol=symbol)["price"])
+    except:
+        return 0.0
 
 def tickers_all():
     global _ticker_cache, _ticker_ts
     now = time.time()
-    if now - _ticker_ts < 2 and _ticker_cache: return _ticker_cache
+    if now - _ticker_ts < 2 and _ticker_cache:
+        return _ticker_cache
     try:
         raw = client.futures_ticker()
         _ticker_cache = {
@@ -129,7 +306,8 @@ def tickers_all():
         }
         _ticker_ts = now
         return _ticker_cache
-    except: return _ticker_cache
+    except:
+        return _ticker_cache
 
 def ohlcv(symbol, interval, limit=100):
     key, now = (symbol, interval), time.time()
@@ -138,9 +316,9 @@ def ohlcv(symbol, interval, limit=100):
         return _ohlcv_cache[key][1]
     try:
         kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(kl, columns=["time","open","high","low","close","volume",
-                                        "ct","qv","trades","tbbase","tbquote","ignore"])
-        for c in ["open","high","low","close","volume","tbbase","tbquote"]:
+        df = pd.DataFrame(kl, columns=["time", "open", "high", "low", "close", "volume",
+                                       "ct", "qv", "trades", "tbbase", "tbquote", "ignore"])
+        for c in ["open", "high", "low", "close", "volume", "tbbase", "tbquote"]:
             df[c] = df[c].astype(float)
         _ohlcv_cache[key] = (now, df)
         return df
@@ -149,22 +327,22 @@ def ohlcv(symbol, interval, limit=100):
 
 def run_ta(df):
     c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
-    df["rsi"]  = ta.momentum.RSIIndicator(c, 14).rsi()
-    df["mh"]   = ta.trend.MACD(c, 12, 26, 9).macd_diff()
-    df["e5"]   = ta.trend.EMAIndicator(c, 5).ema_indicator()
-    df["e9"]   = ta.trend.EMAIndicator(c, 9).ema_indicator()
-    df["e21"]  = ta.trend.EMAIndicator(c, 21).ema_indicator()
-    df["e50"]  = ta.trend.EMAIndicator(c, 50).ema_indicator()
-    df["atr"]  = ta.volatility.AverageTrueRange(h, l, c, 14).average_true_range()
-    df["adx"]  = ta.trend.ADXIndicator(h, l, c, 14).adx()
-    df["vm"]   = v.rolling(20).mean()
-    df["vr"]   = v / df["vm"].replace(0, 1)
-    df["br"]   = df["tbbase"] / df["volume"].replace(0, 1)
+    df["rsi"] = ta.momentum.RSIIndicator(c, 14).rsi()
+    df["mh"] = ta.trend.MACD(c, 12, 26, 9).macd_diff()
+    df["e5"] = ta.trend.EMAIndicator(c, 5).ema_indicator()
+    df["e9"] = ta.trend.EMAIndicator(c, 9).ema_indicator()
+    df["e21"] = ta.trend.EMAIndicator(c, 21).ema_indicator()
+    df["e50"] = ta.trend.EMAIndicator(c, 50).ema_indicator()
+    df["atr"] = ta.volatility.AverageTrueRange(h, l, c, 14).average_true_range()
+    df["adx"] = ta.trend.ADXIndicator(h, l, c, 14).adx()
+    df["vm"] = v.rolling(20).mean()
+    df["vr"] = v / df["vm"].replace(0, 1)
+    df["br"] = df["tbbase"] / df["volume"].replace(0, 1)
     df["body"] = abs(c - df["open"])
-    df["rng"]  = h - l
-    df["br2"]  = df["body"] / df["rng"].replace(0, 1)
-    df["m5"]   = (c - c.shift(5)) / c.shift(5)
-    df["m3"]   = (c - c.shift(3)) / c.shift(3)
+    df["rng"] = h - l
+    df["br2"] = df["body"] / df["rng"].replace(0, 1)
+    df["m5"] = (c - c.shift(5)) / c.shift(5)
+    df["m3"] = (c - c.shift(3)) / c.shift(3)
     return df
 
 def btc_trend():
@@ -172,21 +350,30 @@ def btc_trend():
         df = run_ta(ohlcv("BTCUSDT", Client.KLINE_INTERVAL_5MINUTE, 80).copy())
         row = df.iloc[-2]
         p, e5, e9, e21, m5 = row["close"], row["e5"], row["e9"], row["e21"], row["m5"]
-        if p > e5 > e9 > e21 and m5 > 0.001: return "BULL"
-        if p < e5 < e9 < e21 and m5 < -0.001: return "BEAR"
-        if p > e9 > e21: return "MILD_BULL"
-        if p < e9 < e21: return "MILD_BEAR"
+        if p > e5 > e9 > e21 and m5 > 0.001:
+            return "BULL"
+        if p < e5 < e9 < e21 and m5 < -0.001:
+            return "BEAR"
+        if p > e9 > e21:
+            return "MILD_BULL"
+        if p < e9 < e21:
+            return "MILD_BEAR"
         return "SIDEWAYS"
-    except: return "UNKNOWN"
+    except:
+        return "UNKNOWN"
 
 def ks_check():
     k, now = _ks, time.time()
     if k["active"] and now >= k["resume"]:
-        k["active"] = False; k["consec"] = 0
-    if k["active"]: return True, k["reason"]
+        k["active"] = False
+        k["consec"] = 0
+    if k["active"]:
+        return True, k["reason"]
     day = now - (now % 86400)
-    if day > k["day_reset"]: k["daily"] = 0.0; k["day_reset"] = day
-    if k["daily"] <= DAILY_LOSS:
+    if day > k["day_reset"]:
+        k["daily"] = 0.0
+        k["day_reset"] = day
+    if k["daily"] <= DAILY_LOSS_LIMIT:
         k["active"] = True
         k["reason"] = f"daily({k['daily']:.2f})"
         k["resume"] = day + 86400
@@ -202,9 +389,10 @@ def ks_upd(pnl):
     _ks["daily"] += pnl
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
-# ═══════════════════════════════════════════════════════
-#  NEW: REGIME DETECTION & ADAPTIVE TP/SL
-# ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  REGIME DETECTION & ADAPTIVE TP/SL
+# ═══════════════════════════════════════════════════════════════════════════
 def get_regime(df):
     """Tentukan regime pasar berdasarkan ADX dan ATR%"""
     adx = df["adx"].iloc[-2]
@@ -216,219 +404,531 @@ def get_regime(df):
     else:
         return "TRANSITION"
 
-def get_tp_sl(regime, atr_pct, direction, btc_trend):
+def calculate_adaptive_tp_sl(df, direction, btc_trend, regime, quality_score):
     """
-    Hitung TP dan SL dalam persen berdasarkan regime dan ATR.
-    Mengembalikan (sl_pct, tp_pct)
+    TP/SL dinamis berdasarkan:
+    - ATR (volatilitas)
+    - ADX (kekuatan tren)
+    - Quality Score (0-100)
+    - Regime pasar
     """
-    if regime == "TRENDING":
-        sl = max(atr_pct * 1.5, 0.0025)   # minimal 0.25%
-        tp = sl * 2.5                      # reward:risk = 2.5:1
-        # Bonus jika searah dengan trend BTC
-        if (direction == "LONG" and btc_trend in ["BULL", "MILD_BULL"]) or \
-           (direction == "SHORT" and btc_trend in ["BEAR", "MILD_BEAR"]):
-            tp *= 1.2
-    else:  # RANGING or TRANSITION
-        sl = max(atr_pct * 1.2, 0.0020)   # minimal 0.20%
-        tp = sl * 2.0                      # reward:risk = 2:1
-    # Batasan keamanan
-    sl = min(sl, 0.01)    # maksimal SL 1%
-    tp = min(tp, 0.03)    # maksimal TP 3%
-    return sl, tp
+    atr_pct = df['atr'].iloc[-2] / df['close'].iloc[-2]
+    adx = df['adx'].iloc[-2]
+    
+    # Base SL = ATR × multiplier
+    if regime == "TRENDING" and adx > 30:
+        sl_mult = 0.8  # tren kuat, stop lebih ketat
+    elif regime == "TRENDING":
+        sl_mult = 1.0
+    elif regime == "RANGING":
+        sl_mult = 1.5  # ranging perlu stop lebih lebar
+    else:  # TRANSITION
+        sl_mult = 1.2
+    
+    sl_pct = atr_pct * sl_mult
+    sl_pct = max(sl_pct, MIN_SL_PCT)
+    sl_pct = min(sl_pct, MAX_SL_PCT)
+    
+    # Risk:Reward berdasarkan quality score
+    if quality_score >= 80:
+        rr = 3.0  # super signal
+    elif quality_score >= 65:
+        rr = 2.5
+    elif quality_score >= 50:
+        rr = 2.0
+    else:
+        return None, None  # skip trade
+    
+    tp_pct = sl_pct * rr
+    tp_pct = min(tp_pct, MAX_TP_PCT)
+    
+    # Bonus jika searah BTC trend
+    if (direction == "LONG" and btc_trend in ["BULL", "MILD_BULL"]) or \
+       (direction == "SHORT" and btc_trend in ["BEAR", "MILD_BEAR"]):
+        tp_pct *= 1.15
+    
+    return sl_pct, tp_pct
 
-# ═══════════════════════════════════════════════════════
-#  SIGNAL v20.0.0 — MOMENTUM CONTINUATION
-# ═══════════════════════════════════════════════════════
-def signal(df, btc_trend):
-    if df is None or len(df) < 55:
-        return None, 0, [], 0.0, 0.0, 0.0
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  QUALITY SCORE (0-100)
+# ═══════════════════════════════════════════════════════════════════════════
+def calculate_quality_score(df, direction, btc_trend):
+    """0-100: kualitas sinyal untuk position sizing dan filter"""
     row = df.iloc[-2]
     prev = df.iloc[-3]
-    p = row["close"]
-    e5, e9, e21 = row["e5"], row["e9"], row["e21"]
-    rsi = row["rsi"]
-    m5 = row["m5"]
-    vr = row["vr"]
-    br = row["br"]
-    atr_pct = row["atr"] / p
-    body_ratio = row["br2"]
-    adx = row["adx"]
-
-    # ── FILTER KUALITAS ──────────────────────────────
-    if vr < 0.7:                 # volume terlalu rendah
-        return None, 0, [], atr_pct, 0.0, 0.0
-    if body_ratio < 0.2:         # doji / candle terlalu kecil
-        return None, 0, [], atr_pct, 0.0, 0.0
-
-    # ── REGIME ───────────────────────────────────────
-    regime = get_regime(df)
-
-    score = 0
-    reasons = []
-    direction = None
-
-    # ========== TRENDING ==========
-    if regime == "TRENDING":
-        bullish_stack = (p > e5 > e9 > e21)
-        bearish_stack = (p < e5 < e9 < e21)
-
-        # Prioritaskan sinyal searah BTC
-        if bullish_stack and btc_trend in ["BULL", "MILD_BULL"]:
-            direction = "LONG"
-            score = 50
-            reasons.append("TrendUp+BTC")
-        elif bearish_stack and btc_trend in ["BEAR", "MILD_BEAR"]:
-            direction = "SHORT"
-            score = 50
-            reasons.append("TrendDown+BTC")
-        elif bullish_stack:
-            direction = "LONG"
-            score = 35
-            reasons.append("TrendUp")
-        elif bearish_stack:
-            direction = "SHORT"
-            score = 35
-            reasons.append("TrendDown")
-
-        if direction:
-            # Konfirmasi momentum
-            if direction == "LONG" and m5 > 0.002:
-                score += 20
-                reasons.append("MomUp")
-            elif direction == "SHORT" and m5 < -0.002:
-                score += 20
-                reasons.append("MomDown")
-            # Konfirmasi volume flow (buy/sell pressure)
-            if direction == "LONG" and br > 0.52:
-                score += 15
-                reasons.append("BuyVol")
-            elif direction == "SHORT" and br < 0.48:
-                score += 15
-                reasons.append("SellVol")
-
-    # ========== RANGING ==========
-    elif regime == "RANGING":
-        # Fade hanya di extreme RSI + tidak ada volume breakout
-        if rsi > 70 and vr < 1.5:
-            direction = "SHORT"
-            score = 40 + (rsi - 70) * 2
-            reasons.append(f"Overbought{rsi:.0f}")
-        elif rsi < 30 and vr < 1.5:
-            direction = "LONG"
-            score = 40 + (30 - rsi) * 2
-            reasons.append(f"Oversold{rsi:.0f}")
-
-        if direction:
-            # Sederhana divergence: harga turun tapi MACD naik = bullish divergence
-            if direction == "LONG" and row["mh"] > prev["mh"] and p < prev["close"]:
-                score += 15
-                reasons.append("BullDiv")
-            elif direction == "SHORT" and row["mh"] < prev["mh"] and p > prev["close"]:
-                score += 15
-                reasons.append("BearDiv")
-
-    # ========== TRANSITION ==========
+    
+    score = 50  # base score
+    bonus = []
+    
+    # === KONTRINDIKATOR (PENALTY) ===
+    # 1. Terlalu ekstrem (momentum trap)
+    if direction == "LONG":
+        if row['rsi'] > 75:
+            score -= 25
+            bonus.append("RSI_too_high")
+        elif row['rsi'] > 70:
+            score -= 10
+            bonus.append("RSI_high")
+        
+        if row['m5'] > 0.008:
+            score -= 20
+            bonus.append("momentum_too_high")
+        elif row['m5'] > 0.006:
+            score -= 10
+            bonus.append("momentum_high")
+    else:  # SHORT
+        if row['rsi'] < 25:
+            score -= 25
+            bonus.append("RSI_too_low")
+        elif row['rsi'] < 30:
+            score -= 10
+            bonus.append("RSI_low")
+        
+        if row['m5'] < -0.008:
+            score -= 20
+            bonus.append("momentum_too_low")
+        elif row['m5'] < -0.006:
+            score -= 10
+            bonus.append("momentum_low")
+    
+    # 2. Volume climax (exhaustion)
+    if row['vr'] > 2.5:
+        score -= 30
+        bonus.append("volume_climax")
+    elif row['vr'] > 2.0:
+        score -= 15
+        bonus.append("high_volume")
+    
+    # 3. Candle terlalu panjang (late entry)
+    if row['br2'] > 0.85:
+        score -= 20
+        bonus.append("marubozu_chase")
+    elif row['br2'] > 0.75:
+        score -= 10
+        bonus.append("long_candle")
+    
+    # 4. ADX terlalu tinggi (over-extended)
+    if row['adx'] > 45:
+        score -= 15
+        bonus.append("adx_over_extended")
+    elif row['adx'] > 40:
+        score -= 8
+        bonus.append("adx_high")
+    
+    # === KONFIRMATOR (BONUS) ===
+    # 1. Pullback/retrace confirmation
+    if direction == "LONG":
+        high_3 = df['high'].iloc[-5:-2].max()
+        pullback_pct = (high_3 - row['close']) / high_3 if high_3 > 0 else 0
+        if MIN_PULLBACK_PCT < pullback_pct < MAX_PULLBACK_PCT:
+            score += 25
+            bonus.append(f"pullback_{pullback_pct:.3f}")
     else:
-        # Kombinasi RSI extreme + momentum berlawanan (potensi pembalikan awal)
-        if rsi > 65 and m5 < -0.001:
-            direction = "SHORT"
-            score = 45
-            reasons.append("RSIhigh+MomDown")
-        elif rsi < 35 and m5 > 0.001:
+        low_3 = df['low'].iloc[-5:-2].min()
+        pullback_pct = (row['close'] - low_3) / low_3 if low_3 > 0 else 0
+        if MIN_PULLBACK_PCT < pullback_pct < MAX_PULLBACK_PCT:
+            score += 25
+            bonus.append(f"pullback_{pullback_pct:.3f}")
+    
+    # 2. EMA stack alignment
+    if direction == "LONG" and row['close'] > row['e9'] > row['e21']:
+        score += 15
+        bonus.append("ema_aligned")
+    elif direction == "SHORT" and row['close'] < row['e9'] < row['e21']:
+        score += 15
+        bonus.append("ema_aligned")
+    
+    # 3. BTC alignment
+    if (direction == "LONG" and btc_trend in ["BULL", "MILD_BULL"]) or \
+       (direction == "SHORT" and btc_trend in ["BEAR", "MILD_BEAR"]):
+        score += 20
+        bonus.append("btc_aligned")
+    elif btc_trend in ["SIDEWAYS", "UNKNOWN"]:
+        pass  # no bonus
+    else:
+        score -= 30  # opposite direction = reject
+        bonus.append("btc_opposing")
+    
+    # 4. Volume confirmation (bukan climax)
+    if 1.2 < row['vr'] < 2.0:
+        score += 15
+        bonus.append("healthy_volume")
+    
+    # 5. Momentum moderate (bukan trap)
+    if direction == "LONG" and 0.002 < row['m5'] < 0.006:
+        score += 10
+        bonus.append("momentum_moderate")
+    elif direction == "SHORT" and -0.006 < row['m5'] < -0.002:
+        score += 10
+        bonus.append("momentum_moderate")
+    
+    # Clamp score
+    score = max(0, min(100, score))
+    
+    return score, bonus
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  ENTRY CONFIRMATION (Jangan entry di candle breakout)
+# ═══════════════════════════════════════════════════════════════════════════
+def confirm_entry(df, direction):
+    """
+    Jangan entry pada candle breakout.
+    Hanya entry jika: breakout -> retest -> continuation
+    """
+    if df is None or len(df) < 10:
+        return False, "insufficient_data"
+    
+    current = df.iloc[-2]
+    prev = df.iloc[-3]
+    prev2 = df.iloc[-4]
+    
+    if direction == "LONG":
+        # Breakout candle: close > resistance (high tertinggi 2 candle sebelumnya)
+        resistance = max(prev2['high'], prev['high'])
+        is_breakout_candle = current['close'] > resistance and current['close'] > current['open'] * 1.003
+        
+        # Retest candle: harga kembali menyentuh resistance
+        is_retest = prev['close'] > resistance and current['low'] <= resistance + (resistance * 0.001)
+        
+        # Continuation: bounce dari resistance
+        is_continuation = current['close'] > current['open'] and current['low'] <= resistance + (resistance * 0.001)
+        
+        if is_breakout_candle:
+            return False, "breakout_candle_no_entry"
+        
+        if is_retest and is_continuation:
+            return True, "confirmed_retest_continuation"
+        
+        return False, "waiting_retest"
+    
+    else:  # SHORT
+        support = min(prev2['low'], prev['low'])
+        is_breakout_candle = current['close'] < support and current['close'] < current['open'] * 0.997
+        
+        is_retest = prev['close'] < support and current['high'] >= support - (support * 0.001)
+        
+        is_continuation = current['close'] < current['open'] and current['high'] >= support - (support * 0.001)
+        
+        if is_breakout_candle:
+            return False, "breakout_candle_no_entry"
+        
+        if is_retest and is_continuation:
+            return True, "confirmed_retest_continuation"
+        
+        return False, "waiting_retest"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MULTI-TIMEFRAME CONFIRMATION
+# ═══════════════════════════════════════════════════════════════════════════
+def multi_timeframe_confirmation(symbol, direction, btc_trend):
+    """
+    Konfirmasi 3 timeframe:
+    - 15m: trend utama
+    - 5m: setup
+    - 1m: trigger
+    """
+    try:
+        df_15m = run_ta(ohlcv(symbol, Client.KLINE_INTERVAL_15MINUTE, 50).copy())
+        df_5m = run_ta(ohlcv(symbol, Client.KLINE_INTERVAL_5MINUTE, 100).copy())
+        df_1m = run_ta(ohlcv(symbol, Client.KLINE_INTERVAL_1MINUTE, 50).copy())
+        
+        if any(df is None for df in [df_15m, df_5m, df_1m]):
+            return False, "data_missing"
+        
+        row_15m = df_15m.iloc[-2]
+        row_5m = df_5m.iloc[-2]
+        row_1m = df_1m.iloc[-2]
+        
+        conf_score = 0
+        reasons = []
+        
+        # === 15m TREND ===
+        if direction == "LONG":
+            if row_15m['close'] > row_15m['e21']:
+                conf_score += 25
+                reasons.append("15m_trend_up")
+            # Check bearish divergence di 15m? skip trade
+            if row_15m['rsi'] > 70 and row_15m['adx'] > 35:
+                return False, "15m_overbought"
+        else:
+            if row_15m['close'] < row_15m['e21']:
+                conf_score += 25
+                reasons.append("15m_trend_down")
+            if row_15m['rsi'] < 30 and row_15m['adx'] > 35:
+                return False, "15m_oversold"
+        
+        # === 5m SETUP ===
+        if direction == "LONG":
+            if row_5m['close'] > row_5m['e9'] and row_5m['m5'] > 0:
+                conf_score += 20
+                reasons.append("5m_setup")
+        else:
+            if row_5m['close'] < row_5m['e9'] and row_5m['m5'] < 0:
+                conf_score += 20
+                reasons.append("5m_setup")
+        
+        # === 1m TRIGGER (pullback/retest) ===
+        if direction == "LONG":
+            # Cari pullback di 1m
+            low_5 = df_1m['low'].iloc[-6:-1].min()
+            current = row_1m['close']
+            pullback = (current - low_5) / low_5 if low_5 > 0 else 0
+            
+            if MIN_PULLBACK_PCT < pullback < MAX_PULLBACK_PCT:
+                conf_score += 30
+                reasons.append(f"1m_pullback_{pullback:.3f}")
+        else:
+            high_5 = df_1m['high'].iloc[-6:-1].max()
+            current = row_1m['close']
+            pullback = (high_5 - current) / high_5 if high_5 > 0 else 0
+            if MIN_PULLBACK_PCT < pullback < MAX_PULLBACK_PCT:
+                conf_score += 30
+                reasons.append(f"1m_pullback_{pullback:.3f}")
+        
+        # Threshold minimal konfirmasi
+        if conf_score >= 50:
+            return True, "|".join(reasons)
+        return False, f"low_conf_{conf_score}"
+        
+    except Exception as e:
+        return False, f"mtf_error"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MARKET QUALITY FILTER
+# ═══════════════════════════════════════════════════════════════════════════
+def check_market_quality(symbol):
+    """Filter spread besar dan volume mati"""
+    try:
+        orderbook = client.futures_order_book(symbol=symbol, limit=10)
+        best_bid = float(orderbook['bids'][0][0])
+        best_ask = float(orderbook['asks'][0][0])
+        spread_pct = (best_ask - best_bid) / best_bid
+        
+        # Spread > 0.05%? skip
+        if spread_pct > MAX_SPREAD_PCT:
+            return False, f"wide_spread_{spread_pct:.4f}"
+        
+        # Volume 24h
+        ticker = tickers_all().get(symbol, {})
+        vol_24h = ticker.get('vol', 0)
+        if vol_24h < MIN_VOLUME_24H:
+            return False, f"low_volume_{vol_24h/1e6:.1f}M"
+        
+        return True, "good"
+    except Exception as e:
+        return False, f"orderbook_error"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SIGNAL v21.0.0 — PULLBACK CONTINUATION + QUALITY SCORE
+# ═══════════════════════════════════════════════════════════════════════════
+def signal_v21(df, btc_trend, loss_detector: LossClusterDetector = None):
+    """Versi baru dengan semua filter"""
+    
+    if df is None or len(df) < 55:
+        return None, 0, [], 0.0, 0.0, 0.0
+    
+    row = df.iloc[-2]
+    
+    # === HARD FILTERS (langsung reject) ===
+    # 1. Volume mati
+    if row['vr'] < 0.8:
+        return None, 0, ["low_volume"], 0, 0, 0
+    
+    # 2. Candle terlalu pendek
+    if row['br2'] < 0.3:
+        return None, 0, ["doji"], 0, 0, 0
+    
+    # === REGIME ===
+    regime = get_regime(df)
+    
+    # === DETEKSI PULLBACK VALID ===
+    direction = None
+    base_score = 0
+    reasons = []
+    pullback_pct = 0
+    
+    # Cari pullback dari high/terakhir
+    high_10 = df['high'].iloc[-12:-2].max()
+    low_10 = df['low'].iloc[-12:-2].min()
+    
+    # Long: harga turun dari high (pullback)
+    pullback_from_high = (high_10 - row['close']) / high_10 if high_10 > 0 else 0
+    
+    # Short: harga naik dari low (pullback)
+    pullback_from_low = (row['close'] - low_10) / low_10 if low_10 > 0 else 0
+    
+    # LONG condition: pullback dari high dan masih di atas EMA21
+    if MIN_PULLBACK_PCT < pullback_from_high < MAX_PULLBACK_PCT:
+        if row['close'] > row['e21']:
             direction = "LONG"
-            score = 45
-            reasons.append("RSIlow+MomUp")
+            base_score = 60
+            reasons.append(f"pullback_{pullback_from_high:.3f}")
+            pullback_pct = pullback_from_high
+    
+    # SHORT condition: pullback dari low dan masih di bawah EMA21
+    if MIN_PULLBACK_PCT < pullback_from_low < MAX_PULLBACK_PCT:
+        if row['close'] < row['e21']:
+            direction = "SHORT"
+            base_score = 60
+            reasons.append(f"pullback_{pullback_from_low:.3f}")
+            pullback_pct = pullback_from_low
+    
+    if not direction:
+        return None, 0, ["no_pullback"], 0, 0, 0
+    
+    # === QUALITY SCORE ===
+    quality_score, quality_reasons = calculate_quality_score(df, direction, btc_trend)
+    reasons.extend(quality_reasons)
+    
+    # Jika BTC opposing, langsung reject (quality_score sudah -30, cek threshold)
+    if "btc_opposing" in quality_reasons:
+        return None, 0, ["btc_opposing"], 0, 0, 0
+    
+    # Final score
+    final_score = base_score + (quality_score - 50)
+    final_score = max(0, min(100, final_score))
+    
+    # Threshold
+    if final_score < MIN_QUALITY_SCORE:
+        return None, 0, [f"low_score_{final_score}"], 0, 0, 0
+    
+    # === ENTRY CONFIRMATION (jangan di breakout candle) ===
+    confirmed, confirm_reason = confirm_entry(df, direction)
+    if not confirmed:
+        return None, 0, [confirm_reason], 0, 0, 0
+    reasons.append(confirm_reason)
+    
+    atr_pct = row['atr'] / row['close']
+    sl_pct, tp_pct = calculate_adaptive_tp_sl(df, direction, btc_trend, regime, final_score)
+    
+    if sl_pct is None or tp_pct is None:
+        return None, 0, ["invalid_risk"], 0, 0, 0
+    
+    return direction, final_score, reasons, atr_pct, sl_pct, tp_pct
 
-    # ── FINAL CHECK ──────────────────────────────────
-    if direction is None or score < MIN_SCORE:
-        return None, 0, [], atr_pct, 0.0, 0.0
 
-    sl_pct, tp_pct = get_tp_sl(regime, atr_pct, direction, btc_trend)
-    return direction, score, reasons[:4], atr_pct, sl_pct, tp_pct
-
-# ═══════════════════════════════════════════════════════
-#  DRY RUN OPEN (minor change: now uses dynamic sl/tp)
-# ═══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+#  DRY RUN OPEN
+# ═══════════════════════════════════════════════════════════════════════════
 def live_open(sym, direction, score, sigs, price, atr_pct, sl_pct, tp_pct):
     with _lock:
         if sym in live_positions or len(live_positions) >= MAX_POSITIONS:
             return
         live_positions[sym] = {"_r": True}
-
+    
+    # Check market quality sebelum open
+    quality_ok, quality_msg = check_market_quality(sym)
+    if not quality_ok:
+        with _lock:
+            live_positions.pop(sym, None)
+        print(f"  ⚠️ [SKIP] {sym} market quality: {quality_msg}")
+        return
+    
+    # MTF confirmation
+    mtf_ok, mtf_reason = multi_timeframe_confirmation(sym, direction, _macro["btc"])
+    if not mtf_ok:
+        with _lock:
+            live_positions.pop(sym, None)
+        print(f"  ⚠️ [SKIP] {sym} MTF: {mtf_reason}")
+        return
+    
     px_now = price_live(sym)
-    if px_now > 0:
-        slip = abs(px_now - price) / price
-        if slip > SLIPPAGE_GUARD:
-            with _lock: live_positions.pop(sym, None)
-            return
-        price = px_now
-
+    if px_now <= 0:
+        with _lock:
+            live_positions.pop(sym, None)
+        return
+    
+    slip = abs(px_now - price) / price
+    if slip > SLIPPAGE_GUARD:
+        with _lock:
+            live_positions.pop(sym, None)
+        print(f"  ⚠️ [SKIP] {sym} slippage: {slip:.4f}")
+        return
+    price = px_now
+    
     try:
         q_val = qty(sym, price)
+        if q_val <= 0:
+            raise ValueError("invalid qty")
     except:
-        with _lock: live_positions.pop(sym, None)
+        with _lock:
+            live_positions.pop(sym, None)
         return
-
+    
     if direction == "LONG":
         sl_price = price * (1 - sl_pct)
         tp_price = price * (1 + tp_pct)
     else:
         sl_price = price * (1 + sl_pct)
         tp_price = price * (1 - tp_pct)
-
+    
     pos = {
         "side": direction, "entry": price, "qty": q_val,
         "open_time": time.time(), "score": score, "sigs": sigs, "atr_pct": atr_pct,
         "sl_price": sl_price, "tp_price": tp_price,
         "sl_pct": sl_pct, "tp_pct": tp_pct
     }
-    with _lock: live_positions[sym] = pos
-
+    with _lock:
+        live_positions[sym] = pos
+    
     d = "🟢" if direction == "LONG" else "🔴"
-    print(f"\n  {d} [DRY] {sym} {direction} @{price:.6g} SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% [{' | '.join(sigs)}]")
+    print(f"\n  {d} [DRY v21] {sym} {direction} @{price:.6g} SL:{sl_pct*100:.2f}% TP:{tp_pct*100:.2f}% [{' | '.join(sigs[:5])}]")
+    print(f"       Quality Score: {score}, MTF: {mtf_reason}")
     _stats["trades"] += 1
 
-# ═══════════════════════════════════════════════════════
-#  DRY RUN CLOSE (tidak berubah)
-# ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DRY RUN CLOSE
+# ═══════════════════════════════════════════════════════════════════════════
 def live_close(sym, reason, price=None):
     with _lock:
         pos = live_positions.pop(sym, None)
-    if pos is None or pos.get("_r"): return
-
-    if price is None: price = price_live(sym)
-    if price == 0: return
-
+    if pos is None or pos.get("_r"):
+        return
+    
+    if price is None:
+        price = price_live(sym)
+    if price == 0:
+        return
+    
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
-
+    
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
-    open_fee  = (entry * q_val) * FUTURES_FEE_PCT
+    open_fee = (entry * q_val) * FUTURES_FEE_PCT
     close_fee = (price * q_val) * FUTURES_FEE_PCT
     total_fee = open_fee + close_fee
     pnl = gross_pnl - total_fee
-
-    pct  = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
+    
+    pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
     hold = time.time() - pos["open_time"]
-    e    = "🟢" if pnl >= 0 else "🔴"
-
-    print(f"  {e} [DRY] {sym} {side} CLOSE — {reason}")
+    e = "🟢" if pnl >= 0 else "🔴"
+    
+    print(f"  {e} [DRY v21] {sym} {side} CLOSE — {reason}")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL Net:{pnl:+.5f}U (Fee:{total_fee:.5f}U)")
-
-    _stats["pnl"]  += pnl
+    
+    _stats["pnl"] += pnl
     _stats["hist"].append(pnl)
     ks_upd(pnl)
-
+    
     if pnl >= 0:
         _stats["wins"] += 1
-        if pnl > _stats["best"]: _stats["best"] = pnl
+        if pnl > _stats["best"]:
+            _stats["best"] = pnl
     else:
         _stats["losses"] += 1
-        if pnl < _stats["worst"]: _stats["worst"] = pnl
-
-    if "ExtremeTP" in reason:   _stats["extreme_tp"] += 1
-    elif "HardSL"  in reason:   _stats["hard_sl"]    += 1
-
+        if pnl < _stats["worst"]:
+            _stats["worst"] = pnl
+    
+    if "ExtremeTP" in reason:
+        _stats["extreme_tp"] += 1
+    elif "HardSL" in reason:
+        _stats["hard_sl"] += 1
+    
     trade_log.append({
         "sym": sym, "side": side, "entry": round(entry, 7), "exit": round(price, 7),
         "pnl": round(pnl, 5), "reason": reason, "hold": int(hold),
@@ -437,104 +937,121 @@ def live_close(sym, reason, price=None):
     _rescan_q.put(1)
     print_inline()
 
-# ═══════════════════════════════════════════════════════
-#  MONITOR POSITIONS (tidak berubah)
-# ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MONITOR POSITIONS
+# ═══════════════════════════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
         pos = live_positions.get(sym)
-        if pos is None or pos.get("_r"): continue
-
+        if pos is None or pos.get("_r"):
+            continue
+        
         px = price_live(sym)
-        if px == 0: continue
-
-        side  = pos["side"]
+        if px == 0:
+            continue
+        
+        side = pos["side"]
         entry = pos["entry"]
         sl_px = pos["sl_price"]
         tp_px = pos["tp_price"]
-        hold  = time.time() - pos["open_time"]
-
+        hold = time.time() - pos["open_time"]
+        
         if side == "LONG":
             prof_pct = (px - entry) / entry
             if px <= sl_px:
-                live_close(sym, "HardSL", px); continue
+                live_close(sym, "HardSL", px)
+                continue
             if px >= tp_px:
-                live_close(sym, "ExtremeTP", px); continue
+                live_close(sym, "ExtremeTP", px)
+                continue
             pnl_now = ((px - entry) * pos["qty"]) - ((entry * pos["qty"] + px * pos["qty"]) * FUTURES_FEE_PCT)
             print(f"    📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY]")
         else:
             prof_pct = (entry - px) / entry
             if px >= sl_px:
-                live_close(sym, "HardSL", px); continue
+                live_close(sym, "HardSL", px)
+                continue
             if px <= tp_px:
-                live_close(sym, "ExtremeTP", px); continue
+                live_close(sym, "ExtremeTP", px)
+                continue
             pnl_now = ((entry - px) * pos["qty"]) - ((entry * pos["qty"] + px * pos["qty"]) * FUTURES_FEE_PCT)
             print(f"    📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY]")
 
-# ═══════════════════════════════════════════════════════
-#  SCANNER (modified: pass btc_trend to signal)
-# ═══════════════════════════════════════════════════════
-def scan_one(sym):
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SCANNER
+# ═══════════════════════════════════════════════════════════════════════════
+def scan_one(sym, loss_detector: LossClusterDetector):
     try:
         time.sleep(SCAN_DELAY)
         df5 = run_ta(ohlcv(sym, Client.KLINE_INTERVAL_5MINUTE, 100).copy())
-        if df5 is None: return None
-
-        px  = df5["close"].iloc[-2]
-        atr_pct = df5["atr"].iloc[-2] / px if px != 0 else 0
-        if px == 0: return None
-
-        dir_, sc, sigs, atr_pct_val, sl_p, tp_p = signal(df5, _macro["btc"])
-        if dir_ is None: return None
-
+        if df5 is None:
+            return None
+        
+        px = df5["close"].iloc[-2]
+        if px == 0:
+            return None
+        
+        dir_, sc, sigs, atr_pct_val, sl_p, tp_p = signal_v21(df5, _macro["btc"], loss_detector)
+        if dir_ is None:
+            return None
+        
         px_live = price_live(sym)
-        if px_live == 0: return None
-
+        if px_live == 0:
+            return None
+        
         return (sym, dir_, sc, sigs, px_live, atr_pct_val, sl_p, tp_p)
     except Exception as e:
-        # silent fail
         return None
 
-def scan_batch(syms):
+
+def scan_batch(syms, loss_detector: LossClusterDetector):
     res = []
-    fut = {_executor.submit(scan_one, s): s for s in syms[:BATCH_SIZE]}
+    fut = {_executor.submit(scan_one, s, loss_detector): s for s in syms[:BATCH_SIZE]}
     try:
         for f in as_completed(fut, timeout=5):
             try:
-                if r := f.result(timeout=1): res.append(r)
-            except: pass
-    except: pass
+                if r := f.result(timeout=1):
+                    res.append(r)
+            except:
+                pass
+    except:
+        pass
     return res
+
 
 def top_movers(syms, n=30):
     tk, ss = tickers_all(), set(syms)
     mv = [(s, abs(d["pct"])) for s, d in tk.items() if s in ss]
     return [s for s, _ in sorted(mv, key=lambda x: x[1], reverse=True)[:n]]
 
-# ═══════════════════════════════════════════════════════
-#  PRINT UTILS (sedikit modifikasi untuk tampilan)
-# ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PRINT UTILS
+# ═══════════════════════════════════════════════════════════════════════════
 def print_inline():
-    n  = _stats["wins"] + _stats["losses"]
+    n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v20.0.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
+    print(f"       ┌ [v21.0.0 DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} {e}PnL Net:{pnl:+.4f}U")
     print(f"       └ ExTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
 
-def print_full():
-    n    = _stats["wins"] + _stats["losses"]
-    wr   = _stats["wins"] / n * 100 if n else 0
-    pnl  = _stats["pnl"]
-    sess = (time.time() - _stats["start"]) / 3600
-    tph  = n / sess if sess > 0 else 0
-    e    = "💚" if pnl >= 0 else "🔴"
 
+def print_full():
+    n = _stats["wins"] + _stats["losses"]
+    wr = _stats["wins"] / n * 100 if n else 0
+    pnl = _stats["pnl"]
+    sess = (time.time() - _stats["start"]) / 3600
+    tph = n / sess if sess > 0 else 0
+    e = "💚" if pnl >= 0 else "🔴"
+    
     print(f"\n  {'─'*70}")
-    print(f"    ✅ DRY RUN v20.0.0 [MOMENTUM CONTINUATION | ADAPTIVE TP/SL]")
+    print(f"    ✅ DRY RUN v21.0.0 [PULLBACK CONTINUATION | QUALITY SCORE]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
     print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
-    print(f"    ⚙️  Config: Leverage={LEVERAGE} Order={ORDER_USDT}U MaxPos={MAX_POSITIONS} MinScore={MIN_SCORE}")
+    print(f"    ⚙️  Config: Leverage={LEVERAGE} Order={ORDER_USDT}U MaxPos={MAX_POSITIONS} MinScore={MIN_QUALITY_SCORE}")
     if trade_log:
         print(f"    📋 Last 5:")
         for t in trade_log[-5:]:
@@ -542,122 +1059,164 @@ def print_full():
             print(f"       {em} {t['sym']:<16} {t['side']} {t['pnl']:+.5f}U {t['hold']}s — {t['reason']}")
     print(f"  {'─'*70}")
 
-# ═══════════════════════════════════════════════════════
-#  THREADS (tidak berubah)
-# ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  THREADS
+# ═══════════════════════════════════════════════════════════════════════════
 def t_monitor():
     while True:
         try:
             if live_positions:
                 monitor_positions()
-        except: pass
+        except:
+            pass
         time.sleep(MONITOR_INT)
 
-def t_slot_filler(syms):
-    scan_idx = 0
-    n_bat    = math.ceil(len(syms) / BATCH_SIZE)
 
+def t_slot_filler(syms, loss_detector: LossClusterDetector, signal_ranker: SignalRanker):
+    scan_idx = 0
+    n_bat = math.ceil(len(syms) / BATCH_SIZE)
+    
     while True:
         try:
+            # Cek loss cluster dulu
+            can_trade, reason = loss_detector.can_trade(time.time())
+            if not can_trade:
+                time.sleep(SLOT_FILL_INT)
+                continue
+            
             slots = MAX_POSITIONS - len(live_positions)
             if slots <= 0 or ks_check()[0]:
                 time.sleep(SLOT_FILL_INT)
                 continue
-
-            hot  = [s for s in _hot_syms if s not in live_positions]
-            mv   = top_movers(syms, 30)
-            mv   = [s for s in mv if s not in live_positions]
-
-            bs   = scan_idx * BATCH_SIZE
-            reg  = [s for s in syms[bs:bs+BATCH_SIZE] if s not in live_positions and s not in mv]
+            
+            hot = [s for s in _hot_syms if s not in live_positions]
+            mv = top_movers(syms, 30)
+            mv = [s for s in mv if s not in live_positions]
+            
+            bs = scan_idx * BATCH_SIZE
+            reg = [s for s in syms[bs:bs+BATCH_SIZE] if s not in live_positions and s not in mv]
             scan_idx = (scan_idx + 1) % n_bat
-
+            
             scan_list = list(dict.fromkeys(hot[:5] + mv[:20] + reg[:15]))[:BATCH_SIZE]
             if not scan_list:
                 time.sleep(SLOT_FILL_INT)
                 continue
-
-            res = scan_batch(scan_list)
+            
+            res = scan_batch(scan_list, loss_detector)
             if res:
-                res.sort(key=lambda x: x[2], reverse=True)
-                for r in res[:slots]:
-                    if len(live_positions) >= MAX_POSITIONS: break
+                # Ambil recent loss symbols untuk penalty
+                recent_loss = [t['sym'] for t in trade_log[-5:] if t['pnl'] < 0]
+                ranked = signal_ranker.rank_and_filter(res, time.time(), recent_loss)
+                
+                for r in ranked[:slots]:
+                    if len(live_positions) >= MAX_POSITIONS:
+                        break
                     sym, d, sc, sg, px, atr, sl_p, tp_p = r
                     live_open(sym, d, sc, sg, px, atr, sl_p, tp_p)
-
-        except: pass
+                    
+        except Exception as e:
+            pass
         time.sleep(SLOT_FILL_INT)
 
-def t_rescan(syms):
+
+def t_rescan(syms, loss_detector: LossClusterDetector, signal_ranker: SignalRanker):
     while True:
         try:
             _rescan_q.get(timeout=5)
             time.sleep(0.05)
+            
+            can_trade, reason = loss_detector.can_trade(time.time())
+            if not can_trade:
+                continue
+                
             slots = MAX_POSITIONS - len(live_positions)
-            if slots <= 0 or ks_check()[0]: continue
-
-            hot  = [s for s in _hot_syms if s not in live_positions]
+            if slots <= 0 or ks_check()[0]:
+                continue
+            
+            hot = [s for s in _hot_syms if s not in live_positions]
             rest = [s for s in syms if s not in live_positions and s not in hot]
-            res  = scan_batch((hot + rest)[:30])
+            res = scan_batch((hot + rest)[:30], loss_detector)
             if res:
-                res.sort(key=lambda x: x[2], reverse=True)
-                for r in res[:slots]:
-                    if len(live_positions) >= MAX_POSITIONS: break
+                recent_loss = [t['sym'] for t in trade_log[-5:] if t['pnl'] < 0]
+                ranked = signal_ranker.rank_and_filter(res, time.time(), recent_loss)
+                for r in ranked[:slots]:
+                    if len(live_positions) >= MAX_POSITIONS:
+                        break
                     sym, d, sc, sg, px, atr, sl_p, tp_p = r
                     live_open(sym, d, sc, sg, px, atr, sl_p, tp_p)
-        except: pass
+        except:
+            pass
+
 
 def t_macro():
     while True:
-        try: _macro["btc"] = btc_trend()
-        except: pass
+        try:
+            _macro["btc"] = btc_trend()
+        except:
+            pass
         time.sleep(10)
 
-# ═══════════════════════════════════════════════════════
-#  MAIN
-# ═══════════════════════════════════════════════════════
-def run_bot():
-    print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v20.0.0 — MOMENTUM CONTINUATION ENGINE                 ║")
-    print("║  ✅ Ikut tren, tidak fade | Regime adaptive TP/SL                  ║")
-    print("║  ✅ Leverage 10 | Order 5 USDT | Max 2 posisi                      ║")
-    print("║  ✅ Filter: volume minimal, body candle, arah BTC                  ║")
-    print("╚════════════════════════════════════════════════════════════════════╝")
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+def run_bot():
+    print("╔══════════════════════════════════════════════════════════════════════════╗")
+    print("║  ✅ DRY RUN v21.0.0 — PULLBACK CONTINUATION ENGINE                       ║")
+    print("║  ✅ TIDAK CHASE CANDLE | WAJIB PULLBACK + RETEST                          ║")
+    print("║  ✅ Quality Score 0-100 | Loss Cluster Detector                          ║")
+    print("║  ✅ Leverage 20 | Order 2 USDT | Max 3 posisi | Top 3 signals only       ║")
+    print("╚══════════════════════════════════════════════════════════════════════════╝")
+    
     try:
         valid = {s["symbol"] for s in client.futures_exchange_info()["symbols"] if s["status"] == "TRADING"}
-        syms  = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
+        syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
     except:
-        syms  = list(dict.fromkeys(SYMBOLS))
-
+        syms = list(dict.fromkeys(SYMBOLS))
+    
     print(f"  📋 {len(syms)} simbol aktif terpantau")
-
-    threading.Thread(target=t_monitor,              daemon=True).start()
-    threading.Thread(target=t_slot_filler, args=(syms,), daemon=True).start()
-    threading.Thread(target=t_rescan,      args=(syms,), daemon=True).start()
-    threading.Thread(target=t_macro,               daemon=True).start()
-
+    
+    # Init detectors
+    loss_detector = LossClusterDetector(
+        max_consecutive_losses=MAX_CONSECUTIVE_LOSSES,
+        pause_candles=PAUSE_CANDLES,
+        cluster_window=CLUSTER_WINDOW_SECONDS
+    )
+    signal_ranker = SignalRanker(
+        max_signals_per_cycle=MAX_SIGNALS_PER_CYCLE,
+        min_score_threshold=MIN_QUALITY_SCORE
+    )
+    
+    threading.Thread(target=t_monitor, daemon=True).start()
+    threading.Thread(target=t_slot_filler, args=(syms, loss_detector, signal_ranker), daemon=True).start()
+    threading.Thread(target=t_rescan, args=(syms, loss_detector, signal_ranker), daemon=True).start()
+    threading.Thread(target=t_macro, daemon=True).start()
+    
     time.sleep(2)
     tickers_all()
-
+    
     cycle = 0
     while True:
         cycle += 1
         slots = MAX_POSITIONS - len(live_positions)
+        cluster_status = loss_detector.get_status()
+        
         print(f"\n{'═'*62}")
-        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC:{_macro['btc']} ({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U")
-
+        print(f"  #{cycle} {time.strftime('%H:%M:%S')} BTC:{_macro['btc']} ({len(live_positions)}/{MAX_POSITIONS}) PnL:{_stats['pnl']:+.4f}U | {cluster_status}")
+        
         if (k := ks_check())[0]:
             print(f"  🚨 KS:{k[1]}")
         elif slots == 0:
             print(f"  ✅ Slots full")
         else:
-            print(f"  🔍 {slots} slot kosong — Scanning for momentum...")
-
+            print(f"  🔍 {slots} slot kosong — Scanning for pullback continuation...")
+        
         if cycle % 30 == 0:
             print_full()
-
+        
         time.sleep(SCAN_INTERVAL)
+
 
 if __name__ == "__main__":
     run_bot()
