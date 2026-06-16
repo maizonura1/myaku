@@ -1,11 +1,16 @@
 """
-Bot Scalping v21.1.0 — REVERSED LOGIC (PULLBACK CONTINUATION + QUALITY SCORE + LOSS CLUSTER)
+Bot Scalping v21.1.0 — PULLBACK CONTINUATION + QUALITY SCORE + LOSS CLUSTER (INVERSE STRATEGY)
 ================================================================================
-PERUBAHAN vs v21.1.0 original:
-1. Sinyal entry DIBALIK: LONG -> SHORT, SHORT -> LONG
-2. HardSL (stop loss) menjadi Take Profit
-3. ExtremeTP (take profit) menjadi Stop Loss
-4. Trailing & partial disesuaikan dengan logika baru
+PERUBAHAN vs v21.0.0:
+1. MIN_QUALITY_SCORE turun 50 → lebih banyak sinyal
+2. Pullback range diperlebar 0.05% - 1.0%
+3. PAUSE_CANDLES 3 menit (dari 5)
+4. MAX_TP_PCT 1.5% (dari 2.5%) → profit lebih sering
+5. confirm_entry lebih fleksibel (izinkan retest dalam 2 candle)
+6. BTC opposing jadi PENALTY 20%, bukan total reject
+7. Trailing stop aktif setelah profit >0.4%
+8. Partial take profit 50% di 0.5R
+9. INVERSE STRATEGY: Membalik arah hasil analisa (LONG jadi SHORT, SHORT jadi LONG) dan menukar SL/TP.
 """
 
 import os
@@ -28,7 +33,7 @@ client = Client(os.getenv("API_KEY"), os.getenv("API_SECRET"))
 client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  CONFIG v21.1.0 (REVERSED)
+#  CONFIG v21.1.0
 # ═══════════════════════════════════════════════════════════════════════════
 
 LEVERAGE = 20
@@ -71,7 +76,7 @@ TRAIL_ACTIVATE_PCT = 0.004          # Aktif setelah profit 0.4%
 TRAIL_DISTANCE_PCT = 0.002          # Jarak trailing 0.2%
 
 # ── PARTIAL TAKE PROFIT ───────────────────────────────────────────────────
-PARTIAL_RR_RATIO = 0.5              # Partial di 0.5R (dari target TP baru)
+PARTIAL_RR_RATIO = 0.5              # Partial di 0.5R
 PARTIAL_CLOSE_PCT = 0.5             # Tutup 50% posisi
 
 # ── DAILY LIMITS ─────────────────────────────────────────────────────────
@@ -667,7 +672,7 @@ def check_market_quality(symbol):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SIGNAL v21.1.0 (REVERSED)
+#  SIGNAL v21.1.0
 # ═══════════════════════════════════════════════════════════════════════════
 def signal_v21(df, btc_trend, loss_detector: LossClusterDetector = None):
     
@@ -695,7 +700,6 @@ def signal_v21(df, btc_trend, loss_detector: LossClusterDetector = None):
     pullback_from_high = (high_10 - row['close']) / high_10 if high_10 > 0 else 0
     pullback_from_low = (row['close'] - low_10) / low_10 if low_10 > 0 else 0
     
-    # Deteksi sinyal asli (tanpa dibalik)
     if MIN_PULLBACK_PCT < pullback_from_high < MAX_PULLBACK_PCT:
         if row['close'] > row['e21']:
             direction = "LONG"
@@ -716,6 +720,8 @@ def signal_v21(df, btc_trend, loss_detector: LossClusterDetector = None):
     quality_score, quality_reasons = calculate_quality_score(df, direction, btc_trend)
     reasons.extend(quality_reasons)
     
+    # TIDAK REJECT jika btc_opposing, hanya sudah dipenalty di quality_score
+    
     final_score = base_score + (quality_score - 50)
     final_score = max(0, min(100, final_score))
     
@@ -733,17 +739,11 @@ def signal_v21(df, btc_trend, loss_detector: LossClusterDetector = None):
     if sl_pct is None or tp_pct is None:
         return None, 0, ["invalid_risk"], 0, 0, 0
     
-    # === REVERSED LOGIC: balik arah sinyal ===
-    reversed_direction = "SHORT" if direction == "LONG" else "LONG"
-    reasons.append(f"REVERSED({direction}->{reversed_direction})")
-    
-    # sl_pct dan tp_pct tetap dihitung berdasarkan arah asli,
-    # nanti di live_open akan ditukar perannya (HardSL jadi TP, ExtremeTP jadi SL)
-    return reversed_direction, final_score, reasons, atr_pct, sl_pct, tp_pct
+    return direction, final_score, reasons, atr_pct, sl_pct, tp_pct
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  DRY RUN OPEN (dengan TP/SL ditukar)
+#  DRY RUN OPEN (MODIFIED: INVERSE STRATEGY)
 # ═══════════════════════════════════════════════════════════════════════════
 def live_open(sym, direction, score, sigs, price, atr_pct, sl_pct, tp_pct):
     with _lock:
@@ -758,6 +758,7 @@ def live_open(sym, direction, score, sigs, price, atr_pct, sl_pct, tp_pct):
         print(f"  ⚠️ [SKIP] {sym} market quality: {quality_msg}")
         return
     
+    # Filter MTF tetap memvalidasi arah original agar filter tidak rusak
     mtf_ok, mtf_reason = multi_timeframe_confirmation(sym, direction, _macro["btc"])
     if not mtf_ok:
         with _lock:
@@ -788,35 +789,48 @@ def live_open(sym, direction, score, sigs, price, atr_pct, sl_pct, tp_pct):
             live_positions.pop(sym, None)
         return
     
-    # Hitung harga berdasarkan arah yang sudah dibalik
-    if direction == "LONG":
-        # HardSL (stop loss asli) dihitung dari sl_pct, ExtremeTP (take profit asli) dari tp_pct
-        hard_sl_price = price * (1 - sl_pct)      # level stop loss asli (bawah)
-        extreme_tp_price = price * (1 + tp_pct)   # level take profit asli (atas)
-    else:  # SHORT
-        hard_sl_price = price * (1 + sl_pct)      # level stop loss asli (atas)
-        extreme_tp_price = price * (1 - tp_pct)   # level take profit asli (bawah)
+    # =======================================================
+    # INVERSE STRATEGY (Diterapkan setelah semua filter lolos)
+    # =======================================================
+    # 1. Balik arah entry
+    inv_direction = "SHORT" if direction == "LONG" else "LONG"
     
-    # TUKAR PERAN: HardSL jadi Take Profit, ExtremeTP jadi Stop Loss
-    tp_price = hard_sl_price      # Take profit baru = HardSL asli
-    sl_price = extreme_tp_price   # Stop loss baru = ExtremeTP asli
+    # 2. Tukar persentase/jarak TP dan SL
+    inv_sl_pct = tp_pct  # ExtremeTP lama menjadi HardSL baru
+    inv_tp_pct = sl_pct  # HardSL lama menjadi target TP baru
     
+    # 3. Hitung harga berdasarkan arah inverse yang baru
+    if inv_direction == "LONG":
+        sl_price = price * (1 - inv_sl_pct)
+        tp_price = price * (1 + inv_tp_pct)
+    else:
+        sl_price = price * (1 + inv_sl_pct)
+        tp_price = price * (1 - inv_tp_pct)
+    
+    # Daftarkan posisi dengan properti yang sudah di-inverse
     pos = {
-        "side": direction, "entry": price, "qty": q_val,
-        "open_time": time.time(), "score": score, "sigs": sigs, "atr_pct": atr_pct,
-        "sl_price": sl_price, "tp_price": tp_price,
-        "sl_pct": tp_pct,          # sl_pct untuk referensi (sekarang adalah jarak ke stop loss baru = tp_pct asli)
-        "tp_pct": sl_pct,          # tp_pct untuk referensi (jarak ke take profit baru = sl_pct asli)
+        "side": inv_direction, 
+        "entry": price, 
+        "qty": q_val,
+        "open_time": time.time(), 
+        "score": score, 
+        "sigs": sigs, 
+        "atr_pct": atr_pct,
+        "sl_price": sl_price, 
+        "tp_price": tp_price,
+        "sl_pct": inv_sl_pct, 
+        "tp_pct": inv_tp_pct,
         "partial_hit": False,
-        "peak": price,
-        "trough": price
+        "peak": price,          # Setup trailing stop valid untuk arah baru
+        "trough": price         # Setup trailing stop valid untuk arah baru
     }
+    
     with _lock:
         live_positions[sym] = pos
     
-    d = "🟢" if direction == "LONG" else "🔴"
-    print(f"\n  {d} [DRY v21.1 REVERSED] {sym} {direction} @{price:.6g} SL:{pos['sl_pct']*100:.2f}% TP:{pos['tp_pct']*100:.2f}% [{' | '.join(sigs[:5])}]")
-    print(f"       Quality Score: {score}, MTF: {mtf_reason}")
+    d = "🟢" if inv_direction == "LONG" else "🔴"
+    print(f"\n  {d} [DRY INVERSE] {sym} {inv_direction} @{price:.6g} SL:{inv_sl_pct*100:.2f}% TP:{inv_tp_pct*100:.2f}% [{' | '.join(sigs[:5])}]")
+    print(f"        Quality Score: {score}, MTF: {mtf_reason} (Orig Signal: {direction})")
     _stats["trades"] += 1
 
 
@@ -837,6 +851,7 @@ def live_close(sym, reason, price=None, partial_qty=None):
     side, entry, q_val = pos["side"], pos["entry"], pos["qty"]
     if partial_qty is not None:
         q_val = partial_qty
+        # Update posisi sisa
         with _lock:
             if sym in live_positions:
                 live_positions[sym]["qty"] -= partial_qty
@@ -858,12 +873,12 @@ def live_close(sym, reason, price=None, partial_qty=None):
         _stats["hist"].append(pnl)
         ks_upd(pnl)
         if pnl >= 0:
-            _stats["wins"] += 0.5
+            _stats["wins"] += 0.5  # partial count setengah
         else:
             _stats["losses"] += 0.5
         return
     
-    print(f"  {e} [DRY v21.1 REVERSED] {sym} {side} CLOSE — {reason}")
+    print(f"  {e} [DRY INVERSE] {sym} {side} CLOSE — {reason}")
     print(f"     {entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL Net:{pnl:+.5f}U (Fee:{total_fee:.5f}U)")
     
     _stats["pnl"] += pnl
@@ -879,7 +894,6 @@ def live_close(sym, reason, price=None, partial_qty=None):
         if pnl < _stats["worst"]:
             _stats["worst"] = pnl
     
-    # Statistik: ExtremeTP sekarang adalah stop loss, HardSL adalah take profit
     if "ExtremeTP" in reason:
         _stats["extreme_tp"] += 1
     elif "HardSL" in reason:
@@ -895,7 +909,7 @@ def live_close(sym, reason, price=None, partial_qty=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MONITOR POSITIONS (dengan TRAILING STOP & PARTIAL TP disesuaikan)
+#  MONITOR POSITIONS (dengan TRAILING STOP & PARTIAL TP)
 # ═══════════════════════════════════════════════════════════════════════════
 def monitor_positions():
     for sym in list(live_positions.keys()):
@@ -913,13 +927,13 @@ def monitor_positions():
         tp_px = pos["tp_price"]
         hold = time.time() - pos["open_time"]
         
-        # Profit persen berdasarkan arah posisi
+        # === HITUNG PROFIT PERSEN ===
         if side == "LONG":
             prof_pct = (px - entry) / entry
         else:
             prof_pct = (entry - px) / entry
         
-        # === TRAILING STOP (berdasarkan stop loss baru = extreme_tp) ===
+        # === TRAILING STOP (setelah profit > TRAIL_ACTIVATE_PCT) ===
         if prof_pct > TRAIL_ACTIVATE_PCT:
             if side == "LONG":
                 if px > pos.get("peak", entry):
@@ -938,34 +952,35 @@ def monitor_positions():
                     sl_px = new_sl
                     print(f"    🏃 Trailing SL {sym} -> {new_sl:.6g} (profit {prof_pct*100:.2f}%)")
         
-        # === PARTIAL TAKE PROFIT (target TP baru adalah HardSL = sl_pct asli) ===
-        # tp_pct di pos sekarang adalah sl_pct asli (jarak ke HardSL)
-        target_tp_pct = pos["tp_pct"]   # ini adalah sl_pct asli
-        if not pos.get("partial_hit", False) and prof_pct > (target_tp_pct * PARTIAL_RR_RATIO):
+        # === PARTIAL TAKE PROFIT (50% di 0.5R) ===
+        if not pos.get("partial_hit", False) and prof_pct > (pos["tp_pct"] * PARTIAL_RR_RATIO):
+            # Hitung partial qty
             partial_qty = pos["qty"] * PARTIAL_CLOSE_PCT
             if partial_qty > 0:
                 live_close(sym, "PartialTP", px, partial_qty)
-                continue
+                # Setelah partial, posisi sudah diupdate qty-nya, lanjutkan loop untuk cek lagi
+                continue  # re-evaluate posisi setelah partial
         
-        # === CEK SL/TP (SL = extreme_tp, TP = hard_sl) ===
+        # === CEK SL/TP ===
         if side == "LONG":
             if px <= sl_px:
-                live_close(sym, "ExtremeTP", px)   # kena stop loss (ExtremeTP asli)
-                continue
-            if px >= tp_px:
-                live_close(sym, "HardSL", px)      # kena take profit (HardSL asli)
-                continue
-            pnl_now = ((px - entry) * pos["qty"]) - ((entry * pos["qty"] + px * pos["qty"]) * FUTURES_FEE_PCT)
-            print(f"    📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY REV]")
-        else:
-            if px >= sl_px:
-                live_close(sym, "ExtremeTP", px)
-                continue
-            if px <= tp_px:
                 live_close(sym, "HardSL", px)
                 continue
+            if px >= tp_px:
+                live_close(sym, "ExtremeTP", px)
+                continue
+            # Print monitoring
+            pnl_now = ((px - entry) * pos["qty"]) - ((entry * pos["qty"] + px * pos["qty"]) * FUTURES_FEE_PCT)
+            print(f"    📌 {sym} L@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY]")
+        else:
+            if px >= sl_px:
+                live_close(sym, "HardSL", px)
+                continue
+            if px <= tp_px:
+                live_close(sym, "ExtremeTP", px)
+                continue
             pnl_now = ((entry - px) * pos["qty"]) - ((entry * pos["qty"] + px * pos["qty"]) * FUTURES_FEE_PCT)
-            print(f"    📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY REV]")
+            print(f"    📌 {sym} S@{entry:.5g}→{px:.5g}({prof_pct*100:+.2f}%) {pnl_now:+.4f}U {hold:.0f}s [DRY]")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1023,8 +1038,8 @@ def print_inline():
     n = _stats["wins"] + _stats["losses"]
     wr = _stats["wins"] / n * 100 if n else 0
     pnl, e = _stats["pnl"], "💚" if _stats["pnl"] >= 0 else "🔴"
-    print(f"       ┌ [v21.1 REVERSED DRY] {n}T WR:{wr:.0f}% W:{_stats['wins']:.1f} L:{_stats['losses']:.1f} {e}PnL Net:{pnl:+.4f}U")
-    print(f"       └ ExTP(nowSL):{_stats['extreme_tp']} HardSL(nowTP):{_stats['hard_sl']}")
+    print(f"       ┌ [v21.1.0 DRY INVERSE] {n}T WR:{wr:.0f}% W:{_stats['wins']:.1f} L:{_stats['losses']:.1f} {e}PnL Net:{pnl:+.4f}U")
+    print(f"       └ ExTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
 
 
 def print_full():
@@ -1036,10 +1051,10 @@ def print_full():
     e = "💚" if pnl >= 0 else "🔴"
     
     print(f"\n  {'─'*70}")
-    print(f"    ✅ DRY RUN v21.1 REVERSED [PULLBACK + REVERSED ENTRY + SWAPPED TP/SL]")
+    print(f"    ✅ DRY RUN v21.1.0 [INVERSE STRATEGY + TRAILING + PARTIAL]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']:.1f} L:{_stats['losses']:.1f} ({tph:.1f}T/hr)")
     print(f"    {e} PnL Net:{pnl:+.5f}U Best:{_stats['best']:+.5f} Worst:{_stats['worst']:+.5f}")
-    print(f"    💰 ExtremeTP(nowSL):{_stats['extreme_tp']} HardSL(nowTP):{_stats['hard_sl']}")
+    print(f"    💰 ExtremeTP:{_stats['extreme_tp']} HardSL:{_stats['hard_sl']}")
     print(f"    ⚙️  Config: Leverage={LEVERAGE} Order={ORDER_USDT}U MaxPos={MAX_POSITIONS} MinScore={MIN_QUALITY_SCORE}")
     if trade_log:
         print(f"    📋 Last 5:")
@@ -1150,10 +1165,8 @@ def t_macro():
 # ═══════════════════════════════════════════════════════════════════════════
 def run_bot():
     print("╔══════════════════════════════════════════════════════════════════════════╗")
-    print("║  ✅ DRY RUN v21.1.0 REVERSED — ENTRY DIBALIK, TP/SL DITUKAR             ║")
-    print("║  ✅ Pullback continuation → sinyal dibalik (LONG jadi SHORT, dst)        ║")
-    print("║  ✅ HardSL (SL) sekarang jadi Take Profit                                ║")
-    print("║  ✅ ExtremeTP (TP) sekarang jadi Stop Loss                               ║")
+    print("║  ✅ DRY RUN v21.1.0 — INVERSE STRATEGY + TRAILING + PARTIAL              ║")
+    print("║  ✅ LOGIKA ENTRY & TP/SL DIBALIK (LONG->SHORT, SHORT->LONG)              ║")
     print("║  ✅ Quality Score 50+ | Loss Cluster 3 menit                             ║")
     print("║  ✅ Leverage 20 | Order 2 USDT | Max 3 posisi | Top 3 signals only       ║")
     print("╚══════════════════════════════════════════════════════════════════════════╝")
@@ -1198,7 +1211,7 @@ def run_bot():
         elif slots == 0:
             print(f"  ✅ Slots full")
         else:
-            print(f"  🔍 {slots} slot kosong — Scanning for pullback continuation (REVERSED)...")
+            print(f"  🔍 {slots} slot kosong — Scanning for pullback continuation...")
         
         if cycle % 30 == 0:
             print_full()
